@@ -19,8 +19,10 @@ Options:
         Verbosity level. Default is 0.
 
   --algorithm=<string>, -a <string>
-        Solving algorithm to use. Required. Only "hc" (a basic
-        hill-climbing local search) is currently supported.
+        Solving algorithm to use. Required. Supported values:
+          hc  A basic hill-climb local search (STAGE2.md).
+          ws  WalkSAT (STAGE4.md), a more advanced local search that
+              can escape local optima that trap "hc".
 
   --output=<filename>, -o <filename>
         Where to write a satisfying solution, in DIMACS solution
@@ -32,10 +34,19 @@ Options:
         Optional time limit, in seconds, for the search.
 
   --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
-        Algorithm-specific parameters (1 to 3 integer values). For
-        --algorithm=hc, at most one value is accepted: the number of
-        random restarts to perform. At least one of --alg-params or
-        --time-limit-secs is required when --algorithm=hc.
+        Algorithm-specific parameters (1 to 3 integer values); at
+        least one of --alg-params or --time-limit-secs is required.
+        The meaning of each value depends on --algorithm:
+          hc  val1 = number of random restarts to perform.
+          ws  val1 = number of random restarts ("tries") to perform.
+              val2 = max flips per try before giving up and starting a
+                     new try (default 10000 if omitted).
+              val3 = noise percent, 0-100: the chance of flipping a
+                     uniformly random variable of the chosen
+                     unsatisfied clause instead of the one that breaks
+                     the fewest other clauses (default 50 if omitted).
+              Values are positional: to set val2 or val3 you must also
+              supply every value before it.
 
   --help, -h
         Print this help message and exit.

@@ -1,7 +1,7 @@
-// Command vibe_sat is a command line SAT solver. This stage of the
-// program reads a DIMACS CNF file into memory and attempts to solve
-// it with the selected algorithm (currently only a basic hill-climb
-// local search), optionally printing progress and writing out a
+// Command vibe_sat is a command line SAT solver. The program reads a
+// DIMACS CNF file into memory and attempts to solve it with the
+// selected algorithm (a basic hill-climb local search, "hc", or
+// WalkSAT, "ws"), optionally printing progress and writing out a
 // satisfying assignment if one is found.
 package main
 
@@ -50,6 +50,8 @@ func main() {
 	switch args.Algorithm {
 	case "hc":
 		runHillClimb(problem, args)
+	case "ws":
+		runWalkSat(problem, args)
 	}
 
 	os.Exit(0)
@@ -73,6 +75,41 @@ func runHillClimb(problem *cnf.Problem, args *cliargs.Args) {
 	}
 
 	result := hillclimb.Run(problem, lists, params, rng, args.Verbose)
+
+	if result.Satisfiable {
+		writeSolution(result, problem.NumVars, args)
+	}
+}
+
+// runWalkSat runs the WalkSAT algorithm against problem using the
+// tries/max-flips/noise/time-limit settings and verbosity level given
+// in args, then reports and/or writes out the result. See
+// internal/cliargs/help.go for how args.AlgParams maps onto WalkSAT's
+// parameters.
+func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
+	lists := occurrence.Build(problem)
+	rng := newSeededRand()
+
+	params := hillclimb.WalkSatParams{
+		MaxFlipsPerTry: hillclimb.DefaultMaxFlipsPerTry,
+		NoisePercent:   hillclimb.DefaultNoisePercent,
+	}
+	if len(args.AlgParams) >= 1 {
+		numTries := int(args.AlgParams[0])
+		params.NumTries = &numTries
+	}
+	if len(args.AlgParams) >= 2 {
+		params.MaxFlipsPerTry = int(args.AlgParams[1])
+	}
+	if len(args.AlgParams) >= 3 {
+		params.NoisePercent = int(args.AlgParams[2])
+	}
+	if args.TimeLimitSecs != nil {
+		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		params.TimeLimit = &limit
+	}
+
+	result := hillclimb.RunWalkSat(problem, lists, params, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(result, problem.NumVars, args)

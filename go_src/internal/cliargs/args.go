@@ -248,8 +248,26 @@ func validate(args *Args, rawValues map[string][]string) error {
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
 			return fmt.Errorf("--time-limit-secs must be a positive integer")
 		}
+
+	case "ws":
+		if args.TimeLimitSecs == nil && len(args.AlgParams) == 0 {
+			return fmt.Errorf("for --algorithm=ws, either --time-limit-secs or --alg-params (number of tries) must be given")
+		}
+		if len(args.AlgParams) >= 1 && args.AlgParams[0] < 1 {
+			return fmt.Errorf("for --algorithm=ws, the number of tries given via --alg-params must be a positive integer")
+		}
+		if len(args.AlgParams) >= 2 && args.AlgParams[1] < 1 {
+			return fmt.Errorf("for --algorithm=ws, the max-flips-per-try value given via --alg-params must be a positive integer")
+		}
+		if len(args.AlgParams) >= 3 && (args.AlgParams[2] < 0 || args.AlgParams[2] > 100) {
+			return fmt.Errorf("for --algorithm=ws, the noise-percent value given via --alg-params must be between 0 and 100")
+		}
+		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
+			return fmt.Errorf("--time-limit-secs must be a positive integer")
+		}
+
 	default:
-		return fmt.Errorf("unsupported --algorithm value %q; only \"hc\" is currently supported", args.Algorithm)
+		return fmt.Errorf("unsupported --algorithm value %q; only \"hc\" and \"ws\" are currently supported", args.Algorithm)
 	}
 
 	return nil

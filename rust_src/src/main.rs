@@ -1,7 +1,7 @@
-//! vibe_sat is a command line SAT solver. This stage of the program
-//! reads a DIMACS CNF file into memory and attempts to solve it with
-//! the selected algorithm (currently only a basic hill-climb local
-//! search), optionally printing progress and writing out a satisfying
+//! vibe_sat is a command line SAT solver. The program reads a DIMACS
+//! CNF file into memory and attempts to solve it with the selected
+//! algorithm (a basic hill-climb local search, "hc", or WalkSAT,
+//! "ws"), optionally printing progress and writing out a satisfying
 //! assignment if one is found.
 
 mod assignment;
@@ -52,9 +52,12 @@ fn main() -> ExitCode {
         cnf::print_summary(&problem);
     }
 
-    if args.algorithm == "hc"
-        && let Err(message) = run_hill_climb(&problem, &args)
-    {
+    let run_result = match args.algorithm.as_str() {
+        "hc" => run_hill_climb(&problem, &args),
+        "ws" => run_walksat(&problem, &args),
+        _ => Ok(()),
+    };
+    if let Err(message) = run_result {
         println!("{message}");
         return ExitCode::from(1);
     }
@@ -80,6 +83,40 @@ fn run_hill_climb(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     };
 
     let result = hillclimb::run(problem, &lists, params, &mut rng, args.verbose);
+
+    if result.satisfiable {
+        write_solution(&result, problem.num_vars, args)?;
+    }
+
+    Ok(())
+}
+
+/// Runs the WalkSAT algorithm against `problem` using the
+/// tries/max-flips/noise/time-limit settings and verbosity level
+/// given in `args`, then reports and/or writes out the result. See
+/// `cliargs::help_text` for how `args.alg_params` maps onto WalkSAT's
+/// parameters.
+fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
+    let lists = occurrence::build(problem);
+    let mut rng = StdRng::from_rng(&mut rand::rng());
+
+    let mut params = hillclimb::walksat::WalkSatParams::default();
+    if let Some(values) = &args.alg_params {
+        if let Some(&tries) = values.first() {
+            params.num_tries = Some(tries as usize);
+        }
+        if let Some(&max_flips) = values.get(1) {
+            params.max_flips_per_try = max_flips as usize;
+        }
+        if let Some(&noise) = values.get(2) {
+            params.noise_percent = noise as u32;
+        }
+    }
+    params.time_limit = args
+        .time_limit_secs
+        .map(|secs| Duration::from_secs(secs as u64));
+
+    let result = hillclimb::walksat::run_walksat(problem, &lists, params, &mut rng, args.verbose);
 
     if result.satisfiable {
         write_solution(&result, problem.num_vars, args)?;

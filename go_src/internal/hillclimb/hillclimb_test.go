@@ -224,6 +224,236 @@ func TestRunReportsUnknownForUnsatisfiableFormula(t *testing.T) {
 	}
 }
 
+// TestNewClimbStateTracksUnsatisfiedClauses verifies that the initial
+// unsatClauses set exactly matches the clauses whose count is zero.
+func TestNewClimbStateTracksUnsatisfiedClauses(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},  // satisfied
+			{cnf.Literal(-1)}, // unsatisfied
+			{cnf.Literal(2)},  // unsatisfied
+		},
+	}
+	lists := occurrence.Build(problem)
+	a := assign.New(2)
+	a[1] = assign.True
+	a[2] = assign.False
+
+	state := newClimbState(problem, lists, a)
+
+	wantUnsat := map[int]bool{1: true, 2: true}
+	if len(state.unsatClauses) != len(wantUnsat) {
+		t.Fatalf("unsatClauses = %v, want clauses %v", state.unsatClauses, wantUnsat)
+	}
+	for _, c := range state.unsatClauses {
+		if !wantUnsat[c] {
+			t.Errorf("unsatClauses contains unexpected clause %d", c)
+		}
+		if state.unsatPos[c] < 0 {
+			t.Errorf("unsatPos[%d] = %d, want >= 0", c, state.unsatPos[c])
+		}
+	}
+	if state.unsatPos[0] != -1 {
+		t.Errorf("unsatPos[0] = %d, want -1 (clause 0 is satisfied)", state.unsatPos[0])
+	}
+}
+
+// TestFlipKeepsUnsatClausesConsistent verifies that after a flip, the
+// unsatClauses/unsatPos bookkeeping agrees with a from-scratch
+// recomputation of which clauses have a zero true-literal count.
+func TestFlipKeepsUnsatClausesConsistent(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1), cnf.Literal(2)},
+			{cnf.Literal(-1), cnf.Literal(3)},
+			{cnf.Literal(-2), cnf.Literal(-3)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	a := assign.New(3)
+	a[1], a[2], a[3] = assign.False, assign.False, assign.False
+
+	state := newClimbState(problem, lists, a)
+	state.flip(1)
+	state.flip(2)
+
+	wantCounts, _ := clauseTrueCounts(problem, state.assignment)
+	wantUnsat := map[int]bool{}
+	for c, count := range wantCounts {
+		if count == 0 {
+			wantUnsat[c] = true
+		}
+	}
+
+	if len(state.unsatClauses) != len(wantUnsat) {
+		t.Fatalf("unsatClauses = %v, want clauses %v", state.unsatClauses, wantUnsat)
+	}
+	for _, c := range state.unsatClauses {
+		if !wantUnsat[c] {
+			t.Errorf("unsatClauses contains unexpected clause %d", c)
+		}
+		if state.unsatPos[c] != indexOf(state.unsatClauses, c) {
+			t.Errorf("unsatPos[%d] = %d, does not match its actual position", c, state.unsatPos[c])
+		}
+	}
+	for c := range wantCounts {
+		if !wantUnsat[c] && state.unsatPos[c] != -1 {
+			t.Errorf("unsatPos[%d] = %d, want -1 (clause is satisfied)", c, state.unsatPos[c])
+		}
+	}
+}
+
+// indexOf returns the index of target within haystack, or -1 if not
+// present.
+func indexOf(haystack []int, target int) int {
+	for i, v := range haystack {
+		if v == target {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestBreakCount verifies that breakCount reports how many currently
+// satisfied clauses would become unsatisfied by flipping a variable,
+// without actually flipping it.
+func TestBreakCount(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},                 // only satisfied because 1 is True; breaks if 1 flips
+			{cnf.Literal(1), cnf.Literal(2)}, // satisfied by both 1 and 2; does not break if 1 flips
+		},
+	}
+	lists := occurrence.Build(problem)
+	a := assign.New(2)
+	a[1] = assign.True
+	a[2] = assign.True
+
+	state := newClimbState(problem, lists, a)
+	if got := state.breakCount(1); got != 1 {
+		t.Errorf("breakCount(1) = %d, want 1", got)
+	}
+	if got := state.breakCount(2); got != 0 {
+		t.Errorf("breakCount(2) = %d, want 0", got)
+	}
+
+	// breakCount must not have mutated the state.
+	if state.assignment[1] != assign.True || state.assignment[2] != assign.True {
+		t.Errorf("breakCount mutated the assignment: %v", state.assignment)
+	}
+}
+
+// TestChooseFlipVariableGreedyPicksMinimalBreakCount verifies that,
+// with zero noise, chooseFlipVariable always returns the variable of
+// the clause with the smallest break count.
+func TestChooseFlipVariableGreedyPicksMinimalBreakCount(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(-1), cnf.Literal(-2)}, // unsatisfied: both 1 and 2 are True
+			{cnf.Literal(1)},                   // satisfied only via variable 1
+		},
+	}
+	lists := occurrence.Build(problem)
+	a := assign.New(2)
+	a[1] = assign.True
+	a[2] = assign.True
+
+	state := newClimbState(problem, lists, a)
+	// Clause 0 is unsatisfied. Flipping 1 would break clause 1
+	// (break count 1); flipping 2 breaks nothing (break count 0).
+	rng := rand.New(rand.NewPCG(1, 1))
+	for i := 0; i < 10; i++ {
+		if got := chooseFlipVariable(state, 0, 0, rng); got != 2 {
+			t.Fatalf("chooseFlipVariable() = %d, want 2 (the minimal break-count variable)", got)
+		}
+	}
+}
+
+// TestChooseFlipVariableNoiseStaysWithinClause verifies that, even at
+// 100% noise, chooseFlipVariable only ever returns a variable that
+// actually appears in the given clause.
+func TestChooseFlipVariableNoiseStaysWithinClause(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(-1), cnf.Literal(-2), cnf.Literal(-3)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	a := assign.NewRandom(3, rand.New(rand.NewPCG(4, 4)))
+	state := newClimbState(problem, lists, a)
+
+	rng := rand.New(rand.NewPCG(5, 5))
+	allowed := map[int]bool{1: true, 2: true, 3: true}
+	for i := 0; i < 20; i++ {
+		v := chooseFlipVariable(state, 0, 100, rng)
+		if !allowed[v] {
+			t.Fatalf("chooseFlipVariable() = %d, want one of 1, 2, 3", v)
+		}
+	}
+}
+
+// TestRunWalkSatFindsSatisfiableFormula verifies that RunWalkSat
+// reports Satisfiable for an easily satisfiable formula (every clause
+// is a single positive literal, so flipping any false variable from
+// an unsatisfied clause never breaks any other clause).
+func TestRunWalkSatFindsSatisfiableFormula(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 5,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},
+			{cnf.Literal(2)},
+			{cnf.Literal(3)},
+			{cnf.Literal(4)},
+			{cnf.Literal(5)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	numTries := 1
+	params := WalkSatParams{NumTries: &numTries, MaxFlipsPerTry: DefaultMaxFlipsPerTry, NoisePercent: DefaultNoisePercent}
+	rng := rand.New(rand.NewPCG(1, 1))
+
+	result := RunWalkSat(problem, lists, params, rng, 0)
+
+	if !result.Satisfiable {
+		t.Fatalf("expected Satisfiable = true, got false (score %d/%d)", result.Score, problem.NumClauses())
+	}
+	if result.Score != problem.NumClauses() {
+		t.Errorf("Score = %d, want %d", result.Score, problem.NumClauses())
+	}
+}
+
+// TestRunWalkSatReportsUnknownForUnsatisfiableFormula verifies that
+// RunWalkSat never claims satisfiability for a trivially
+// unsatisfiable formula (x1 AND NOT x1), regardless of how many tries
+// it is given.
+func TestRunWalkSatReportsUnknownForUnsatisfiableFormula(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 1,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},
+			{cnf.Literal(-1)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	numTries := 5
+	params := WalkSatParams{NumTries: &numTries, MaxFlipsPerTry: 50, NoisePercent: DefaultNoisePercent}
+	rng := rand.New(rand.NewPCG(2, 2))
+
+	result := RunWalkSat(problem, lists, params, rng, 0)
+
+	if result.Satisfiable {
+		t.Fatalf("expected Satisfiable = false for an unsatisfiable formula")
+	}
+	if result.Starts != numTries {
+		t.Errorf("Starts = %d, want %d", result.Starts, numTries)
+	}
+}
+
 // TestRandomPermutationIsAPermutation verifies that randomPermutation
 // returns each of 1..numVars exactly once.
 func TestRandomPermutationIsAPermutation(t *testing.T) {

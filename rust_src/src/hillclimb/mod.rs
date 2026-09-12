@@ -1,8 +1,28 @@
-//! Implements the simplest local-search SAT solving method used by
-//! vibe_sat: repeatedly start from a random complete assignment and
-//! greedily flip single variables as long as doing so increases the
-//! number of satisfied clauses, restarting from a new random
-//! assignment whenever no single flip can improve further.
+//! Implements the hill-climb-like local-search SAT solving methods
+//! used by vibe_sat:
+//!
+//! - [`run`] implements the simple hill-climb from STAGE2.md:
+//!   repeatedly start from a random complete assignment and greedily
+//!   flip single variables as long as doing so increases the number
+//!   of satisfied clauses, restarting whenever no single flip can
+//!   improve further.
+//! - [`walksat::run_walksat`] implements WalkSAT (STAGE4.md's more
+//!   advanced hill-climb), which always flips a variable from some
+//!   currently unsatisfied clause -- usually the one that breaks the
+//!   fewest other clauses, but occasionally a random one -- which
+//!   lets it escape the local optima that can trap the simple
+//!   hill-climb.
+//!
+//! Both algorithms are built on the same [`ClimbState`], which tracks
+//! a complete assignment together with enough per-clause bookkeeping
+//! to evaluate and apply a single-variable flip in time proportional
+//! to that variable's occurrence count. `walksat` is a private
+//! submodule (not a sibling file) specifically so it can share
+//! `ClimbState`'s private fields and methods, the same way both
+//! algorithms share one `climbState` type in the Go version's
+//! `hillclimb` package.
+
+pub mod walksat;
 
 use std::time::{Duration, Instant};
 
@@ -86,33 +106,70 @@ fn clause_true_counts(problem: &Problem, assignment: &Assignment) -> (Vec<usize>
 /// Holds the mutable bookkeeping needed to evaluate and apply
 /// single-variable flips in time proportional to that variable's
 /// occurrence count, rather than rescanning every clause on every
-/// flip.
+/// flip. Shared by every local-search algorithm in this module (the
+/// simple hill-climb in [`run`], and WalkSAT in
+/// [`walksat::run_walksat`]), since both are built on the same
+/// incremental satisfied-clause tracking.
 struct ClimbState<'a> {
+    problem: &'a Problem,
     lists: &'a Lists,
     assignment: Assignment,
-    counts: Vec<usize>, // counts[c] = number of true literals in clause c
-    score: usize,       // number of clauses with counts[c] > 0
+    counts: Vec<usize>,        // counts[c] = number of true literals in clause c
+    score: usize,              // number of clauses with counts[c] > 0
+    unsat_clauses: Vec<usize>, // indices of every clause currently unsatisfied, in no particular order
+    unsat_pos: Vec<Option<usize>>, // unsat_pos[c] = index of c within unsat_clauses, or None if c is satisfied
 }
 
 impl<'a> ClimbState<'a> {
     /// Builds a `ClimbState` from a complete starting assignment,
-    /// computing the initial per-clause true-literal counts and score
-    /// from scratch.
-    fn new(problem: &Problem, lists: &'a Lists, assignment: Assignment) -> Self {
+    /// computing the initial per-clause true-literal counts, score,
+    /// and unsatisfied-clause set from scratch.
+    fn new(problem: &'a Problem, lists: &'a Lists, assignment: Assignment) -> Self {
         let (counts, score) = clause_true_counts(problem, &assignment);
+        let mut unsat_clauses = Vec::new();
+        let mut unsat_pos = vec![None; problem.clauses.len()];
+        for (c, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                unsat_pos[c] = Some(unsat_clauses.len());
+                unsat_clauses.push(c);
+            }
+        }
         ClimbState {
+            problem,
             lists,
             assignment,
             counts,
             score,
+            unsat_clauses,
+            unsat_pos,
         }
     }
 
+    /// Records that clause `c` has just become unsatisfied, in O(1).
+    fn mark_unsatisfied(&mut self, c: usize) {
+        self.unsat_pos[c] = Some(self.unsat_clauses.len());
+        self.unsat_clauses.push(c);
+    }
+
+    /// Records that clause `c` has just become satisfied, in O(1), by
+    /// swapping it with the last entry of `unsat_clauses` before
+    /// shrinking the vector.
+    fn mark_satisfied(&mut self, c: usize) {
+        let pos = self.unsat_pos[c].expect("clause must be tracked as unsatisfied");
+        let last = self.unsat_clauses.len() - 1;
+        let moved_clause = self.unsat_clauses[last];
+        self.unsat_clauses[pos] = moved_clause;
+        self.unsat_pos[moved_clause] = Some(pos);
+        self.unsat_clauses.pop();
+        self.unsat_pos[c] = None;
+    }
+
     /// Flips the value of variable `v` in place, updates the
-    /// per-clause true-literal counts and the overall score to match,
-    /// and returns the resulting change in score. Calling `flip` a
-    /// second time with the same `v` exactly reverses the first call,
-    /// since flipping is its own inverse.
+    /// per-clause true-literal counts, the overall score, and the
+    /// unsatisfied-clause set to match, and returns the resulting
+    /// change in score. Calling `flip` a second time with the same
+    /// `v` exactly reverses the first call, since flipping is its own
+    /// inverse.
     fn flip(&mut self, v: usize) -> i64 {
         let was_true = self.assignment[v] == Value::True;
         let (losing, gaining) = if was_true {
@@ -122,22 +179,47 @@ impl<'a> ClimbState<'a> {
         };
 
         let mut delta: i64 = 0;
+        let mut newly_unsatisfied = Vec::new();
+        let mut newly_satisfied = Vec::new();
         for &c in losing {
             self.counts[c] -= 1;
             if self.counts[c] == 0 {
                 delta -= 1;
+                newly_unsatisfied.push(c);
             }
         }
         for &c in gaining {
             self.counts[c] += 1;
             if self.counts[c] == 1 {
                 delta += 1;
+                newly_satisfied.push(c);
             }
+        }
+        for c in newly_unsatisfied {
+            self.mark_unsatisfied(c);
+        }
+        for c in newly_satisfied {
+            self.mark_satisfied(c);
         }
 
         self.assignment[v] = if was_true { Value::False } else { Value::True };
         self.score = (self.score as i64 + delta) as usize;
         delta
+    }
+
+    /// Returns the number of currently satisfied clauses that would
+    /// become unsatisfied if variable `v` were flipped right now,
+    /// without actually flipping it. WalkSAT (see [`walksat`]) uses
+    /// this to prefer flips that break as few other clauses as
+    /// possible.
+    fn break_count(&self, v: usize) -> usize {
+        let was_true = self.assignment[v] == Value::True;
+        let losing = if was_true {
+            &self.lists.positive[v]
+        } else {
+            &self.lists.negative[v]
+        };
+        losing.iter().filter(|&&c| self.counts[c] == 1).count()
     }
 
     /// Performs one pass over the variables in the order given by
@@ -362,6 +444,74 @@ mod tests {
         assert_eq!(state.assignment, original_assignment);
         assert_eq!(state.counts, original_counts);
         assert_eq!(state.score, original_score);
+    }
+
+    #[test]
+    fn test_new_climb_state_tracks_unsatisfied_clauses() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1], vec![-1], vec![2]],
+        };
+        let lists = occurrence::build(&problem);
+        let mut a = assignment::new(2);
+        a[1] = Value::True;
+        a[2] = Value::False;
+
+        let state = ClimbState::new(&problem, &lists, a);
+
+        let want_unsat: std::collections::HashSet<usize> = [1, 2].into_iter().collect();
+        let got_unsat: std::collections::HashSet<usize> =
+            state.unsat_clauses.iter().copied().collect();
+        assert_eq!(got_unsat, want_unsat);
+        for &c in &state.unsat_clauses {
+            assert_eq!(state.unsat_pos[c], Some(index_of(&state.unsat_clauses, c)));
+        }
+        assert_eq!(state.unsat_pos[0], None);
+    }
+
+    #[test]
+    fn test_flip_keeps_unsat_clauses_consistent() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
+        };
+        let lists = occurrence::build(&problem);
+        let mut a = assignment::new(3);
+        a[1] = Value::False;
+        a[2] = Value::False;
+        a[3] = Value::False;
+
+        let mut state = ClimbState::new(&problem, &lists, a);
+        state.flip(1);
+        state.flip(2);
+
+        let (want_counts, _) = clause_true_counts(&problem, &state.assignment);
+        let want_unsat: std::collections::HashSet<usize> = want_counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count == 0)
+            .map(|(c, _)| c)
+            .collect();
+        let got_unsat: std::collections::HashSet<usize> =
+            state.unsat_clauses.iter().copied().collect();
+        assert_eq!(got_unsat, want_unsat);
+
+        for (c, _) in want_counts.iter().enumerate() {
+            if want_unsat.contains(&c) {
+                assert_eq!(state.unsat_pos[c], Some(index_of(&state.unsat_clauses, c)));
+            } else {
+                assert_eq!(state.unsat_pos[c], None);
+            }
+        }
+    }
+
+    /// Returns the index of `target` within `haystack`, panicking if
+    /// absent; a small test helper for checking `unsat_pos` entries.
+    fn index_of(haystack: &[usize], target: usize) -> usize {
+        haystack
+            .iter()
+            .position(|&v| v == target)
+            .expect("target must be present in haystack")
     }
 
     #[test]

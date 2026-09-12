@@ -195,6 +195,63 @@ func TestParseHCRejectsMultipleAlgParams(t *testing.T) {
 	}
 }
 
+// TestParseWSRequiresTriesOrTimeLimit verifies that --algorithm=ws
+// requires at least one of --alg-params or --time-limit-secs, just
+// like --algorithm=hc.
+func TestParseWSRequiresTriesOrTimeLimit(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=ws"})
+	if err == nil {
+		t.Fatalf("expected error when neither --alg-params nor --time-limit-secs is given")
+	}
+}
+
+// TestParseWSWithTimeLimitOnly verifies that --algorithm=ws accepts
+// --time-limit-secs alone, without --alg-params, and that
+// MaxFlips/NoisePercent defaults are left for the caller to fill in
+// (AlgParams stays empty).
+func TestParseWSWithTimeLimitOnly(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=ws", "--time-limit-secs=30"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if len(args.AlgParams) != 0 {
+		t.Errorf("AlgParams = %v, want empty", args.AlgParams)
+	}
+}
+
+// TestParseWSAcceptsThreeAlgParams verifies that --algorithm=ws
+// accepts all three positional values: tries, max-flips-per-try, and
+// noise-percent.
+func TestParseWSAcceptsThreeAlgParams(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=ws", "--alg-params", "5", "2000", "40"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if len(args.AlgParams) != 3 || args.AlgParams[0] != 5 || args.AlgParams[1] != 2000 || args.AlgParams[2] != 40 {
+		t.Errorf("AlgParams = %v, want [5 2000 40]", args.AlgParams)
+	}
+}
+
+// TestParseWSRejectsNonPositiveMaxFlips verifies that a non-positive
+// second --alg-params value (max flips per try) is rejected for
+// --algorithm=ws.
+func TestParseWSRejectsNonPositiveMaxFlips(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=ws", "--alg-params", "5", "0"})
+	if err == nil {
+		t.Fatalf("expected error for non-positive max-flips-per-try value")
+	}
+}
+
+// TestParseWSRejectsOutOfRangeNoisePercent verifies that a third
+// --alg-params value (noise percent) outside [0, 100] is rejected for
+// --algorithm=ws.
+func TestParseWSRejectsOutOfRangeNoisePercent(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=ws", "--alg-params", "5", "1000", "101"})
+	if err == nil {
+		t.Fatalf("expected error for out-of-range noise-percent value")
+	}
+}
+
 // TestTokenizeAlgParamsSpaceSeparatedMultipleValues verifies that the
 // space-separated form of --alg-params collects multiple following
 // tokens, up to the flag's maximum of three. This is tested against

@@ -31,7 +31,7 @@ pub struct Args {
     #[arg(long = "verbose", short = 'v', default_value_t = 0)]
     pub verbose: i32,
 
-    /// Solving algorithm to use (required; only "hc" is supported).
+    /// Solving algorithm to use (required; "hc" or "ws").
     #[arg(long = "algorithm", short = 'a')]
     pub algorithm: String,
 
@@ -43,9 +43,8 @@ pub struct Args {
     #[arg(long = "time-limit-secs", short = 't')]
     pub time_limit_secs: Option<i64>,
 
-    /// Algorithm-specific integer parameters (1 to 3 values). For
-    /// --algorithm=hc, at most one parameter is accepted: the number
-    /// of random restarts to perform.
+    /// Algorithm-specific integer parameters (1 to 3 values); see
+    /// [`help_text`] for what each value means per algorithm.
     #[arg(long = "alg-params", short = 'p', num_args = 1..=3, allow_negative_numbers = true)]
     pub alg_params: Option<Vec<i64>>,
 }
@@ -78,8 +77,10 @@ Options:
         Verbosity level. Default is 0.
 
   --algorithm=<string>, -a <string>
-        Solving algorithm to use. Required. Only "hc" (a basic
-        hill-climbing local search) is currently supported.
+        Solving algorithm to use. Required. Supported values:
+          hc  A basic hill-climb local search (STAGE2.md).
+          ws  WalkSAT (STAGE4.md), a more advanced local search that
+              can escape local optima that trap "hc".
 
   --output=<filename>, -o <filename>
         Where to write a satisfying solution, in DIMACS solution
@@ -91,10 +92,19 @@ Options:
         Optional time limit, in seconds, for the search.
 
   --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
-        Algorithm-specific parameters (1 to 3 integer values). For
-        --algorithm=hc, at most one value is accepted: the number of
-        random restarts to perform. At least one of --alg-params or
-        --time-limit-secs is required when --algorithm=hc.
+        Algorithm-specific parameters (1 to 3 integer values); at
+        least one of --alg-params or --time-limit-secs is required.
+        The meaning of each value depends on --algorithm:
+          hc  val1 = number of random restarts to perform.
+          ws  val1 = number of random restarts ("tries") to perform.
+              val2 = max flips per try before giving up and starting a
+                     new try (default 10000 if omitted).
+              val3 = noise percent, 0-100: the chance of flipping a
+                     uniformly random variable of the chosen
+                     unsatisfied clause instead of the one that breaks
+                     the fewest other clauses (default 50 if omitted).
+              Values are positional: to set val2 or val3 you must also
+              supply every value before it.
 
   --help, -h
         Print this help message and exit.
@@ -156,8 +166,48 @@ fn validate(args: &Args) -> Result<(), String> {
             }
             Ok(())
         }
+
+        "ws" => {
+            if let Some(params) = &args.alg_params {
+                if params[0] < 1 {
+                    return Err(
+                        "for --algorithm=ws, the number of tries given via --alg-params must be a positive integer"
+                            .to_string(),
+                    );
+                }
+                if let Some(&max_flips) = params.get(1)
+                    && max_flips < 1
+                {
+                    return Err(
+                        "for --algorithm=ws, the max-flips-per-try value given via --alg-params must be a positive integer"
+                            .to_string(),
+                    );
+                }
+                if let Some(&noise) = params.get(2)
+                    && !(0..=100).contains(&noise)
+                {
+                    return Err(
+                        "for --algorithm=ws, the noise-percent value given via --alg-params must be between 0 and 100"
+                            .to_string(),
+                    );
+                }
+            }
+            if args.time_limit_secs.is_none() && args.alg_params.is_none() {
+                return Err(
+                    "for --algorithm=ws, either --time-limit-secs or --alg-params (number of tries) must be given"
+                        .to_string(),
+                );
+            }
+            if let Some(limit) = args.time_limit_secs
+                && limit < 1
+            {
+                return Err("--time-limit-secs must be a positive integer".to_string());
+            }
+            Ok(())
+        }
+
         other => Err(format!(
-            "unsupported --algorithm value \"{other}\"; only \"hc\" is currently supported"
+            "unsupported --algorithm value \"{other}\"; only \"hc\" and \"ws\" are currently supported"
         )),
     }
 }
@@ -289,6 +339,66 @@ mod tests {
             "--alg-params",
             "5",
             "10",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_requires_tries_or_time_limit() {
+        let result = Args::parse_from_args(["vibe_sat", "--input=problem.cnf", "--algorithm=ws"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_with_time_limit_only() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=ws",
+            "--time-limit-secs=30",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.alg_params, None);
+    }
+
+    #[test]
+    fn test_parse_ws_accepts_three_alg_params() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=ws",
+            "--alg-params",
+            "5",
+            "2000",
+            "40",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.alg_params, Some(vec![5, 2000, 40]));
+    }
+
+    #[test]
+    fn test_parse_ws_rejects_non_positive_max_flips() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=ws",
+            "--alg-params",
+            "5",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_rejects_out_of_range_noise_percent() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=ws",
+            "--alg-params",
+            "5",
+            "1000",
+            "101",
         ]);
         assert!(result.is_err());
     }

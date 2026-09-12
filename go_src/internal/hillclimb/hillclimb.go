@@ -1,8 +1,20 @@
-// Package hillclimb implements the simplest local-search SAT solving
-// method used by vibe_sat: repeatedly start from a random complete
-// assignment and greedily flip single variables as long as doing so
-// increases the number of satisfied clauses, restarting from a new
-// random assignment whenever no single flip can improve further.
+// Package hillclimb implements the hill-climb-like local-search SAT
+// solving methods used by vibe_sat:
+//
+//   - Run implements the simple hill-climb from STAGE2.md: repeatedly
+//     start from a random complete assignment and greedily flip single
+//     variables as long as doing so increases the number of satisfied
+//     clauses, restarting whenever no single flip can improve further.
+//   - RunWalkSat implements WalkSAT (STAGE4.md's more advanced
+//     hill-climb), which always flips a variable from some currently
+//     unsatisfied clause -- usually the one that breaks the fewest
+//     other clauses, but occasionally a random one -- which lets it
+//     escape the local optima that can trap the simple hill-climb.
+//
+// Both algorithms are built on the same climbState, which tracks a
+// complete assignment together with enough per-clause bookkeeping to
+// evaluate and apply a single-variable flip in time proportional to
+// that variable's occurrence count.
 package hillclimb
 
 import (
@@ -77,27 +89,68 @@ func clauseTrueCounts(problem *cnf.Problem, assignment assign.Assignment) (count
 // climbState holds the mutable bookkeeping needed to evaluate and
 // apply single-variable flips in time proportional to that variable's
 // occurrence count, rather than rescanning every clause on every
-// flip.
+// flip. It is shared by every local-search algorithm in this package
+// (the simple hill-climb in Run, and WalkSAT in RunWalkSat), since
+// both are built on the same incremental satisfied-clause tracking.
 type climbState struct {
-	lists      *occurrence.Lists
-	assignment assign.Assignment
-	counts     []int // counts[c] = number of true literals in clause c
-	score      int   // number of clauses with counts[c] > 0
+	problem      *cnf.Problem
+	lists        *occurrence.Lists
+	assignment   assign.Assignment
+	counts       []int // counts[c] = number of true literals in clause c
+	score        int   // number of clauses with counts[c] > 0
+	unsatClauses []int // indices of every clause currently unsatisfied, in no particular order
+	unsatPos     []int // unsatPos[c] = index of c within unsatClauses, or -1 if c is satisfied
 }
 
 // newClimbState builds a climbState from a complete starting
-// assignment, computing the initial per-clause true-literal counts
-// and score from scratch.
+// assignment, computing the initial per-clause true-literal counts,
+// score, and unsatisfied-clause set from scratch.
 func newClimbState(problem *cnf.Problem, lists *occurrence.Lists, assignment assign.Assignment) *climbState {
 	counts, score := clauseTrueCounts(problem, assignment)
-	return &climbState{lists: lists, assignment: assignment, counts: counts, score: score}
+	s := &climbState{
+		problem:    problem,
+		lists:      lists,
+		assignment: assignment,
+		counts:     counts,
+		score:      score,
+		unsatPos:   make([]int, len(problem.Clauses)),
+	}
+	for c, count := range counts {
+		if count == 0 {
+			s.unsatPos[c] = len(s.unsatClauses)
+			s.unsatClauses = append(s.unsatClauses, c)
+		} else {
+			s.unsatPos[c] = -1
+		}
+	}
+	return s
+}
+
+// markUnsatisfied records that clause c has just become unsatisfied,
+// in O(1).
+func (s *climbState) markUnsatisfied(c int) {
+	s.unsatPos[c] = len(s.unsatClauses)
+	s.unsatClauses = append(s.unsatClauses, c)
+}
+
+// markSatisfied records that clause c has just become satisfied, in
+// O(1), by swapping it with the last entry of unsatClauses before
+// shrinking the slice.
+func (s *climbState) markSatisfied(c int) {
+	pos := s.unsatPos[c]
+	last := len(s.unsatClauses) - 1
+	movedClause := s.unsatClauses[last]
+	s.unsatClauses[pos] = movedClause
+	s.unsatPos[movedClause] = pos
+	s.unsatClauses = s.unsatClauses[:last]
+	s.unsatPos[c] = -1
 }
 
 // flip flips the value of variable v in place, updates the per-clause
-// true-literal counts and the overall score to match, and returns the
-// resulting change in score. Calling flip a second time with the same
-// v exactly reverses the first call, since flipping is its own
-// inverse.
+// true-literal counts, the overall score, and the unsatisfied-clause
+// set to match, and returns the resulting change in score. Calling
+// flip a second time with the same v exactly reverses the first call,
+// since flipping is its own inverse.
 func (s *climbState) flip(v int) int {
 	wasTrue := s.assignment[v] == assign.True
 
@@ -113,12 +166,14 @@ func (s *climbState) flip(v int) int {
 		s.counts[c]--
 		if s.counts[c] == 0 {
 			delta--
+			s.markUnsatisfied(c)
 		}
 	}
 	for _, c := range gaining {
 		s.counts[c]++
 		if s.counts[c] == 1 {
 			delta++
+			s.markSatisfied(c)
 		}
 	}
 
@@ -129,6 +184,29 @@ func (s *climbState) flip(v int) int {
 	}
 	s.score += delta
 	return delta
+}
+
+// breakCount returns the number of currently satisfied clauses that
+// would become unsatisfied if variable v were flipped right now,
+// without actually flipping it. WalkSAT (see walksat.go) uses this to
+// prefer flips that break as few other clauses as possible.
+func (s *climbState) breakCount(v int) int {
+	wasTrue := s.assignment[v] == assign.True
+
+	var losing []int
+	if wasTrue {
+		losing = s.lists.Positive[v]
+	} else {
+		losing = s.lists.Negative[v]
+	}
+
+	count := 0
+	for _, c := range losing {
+		if s.counts[c] == 1 {
+			count++
+		}
+	}
+	return count
 }
 
 // sweep performs one pass over the variables in the order given by
