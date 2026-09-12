@@ -1,15 +1,18 @@
 //! vibe_sat is a command line SAT solver. The program reads a DIMACS
 //! CNF file into memory and attempts to solve it with the selected
-//! algorithm (a basic hill-climb local search, "hc", or WalkSAT,
-//! "ws"), optionally printing progress and writing out a satisfying
-//! assignment if one is found.
+//! algorithm (a basic hill-climb local search, "hc"; WalkSAT, "ws";
+//! or a complete depth-first search, "dfs"), optionally printing
+//! progress and writing out a satisfying assignment if one is found.
 
 mod assignment;
 mod cliargs;
 mod cnf;
+mod dfs;
 mod hillclimb;
 mod occurrence;
 mod solution;
+
+use assignment::Assignment;
 
 use std::fs::File;
 use std::io;
@@ -55,6 +58,7 @@ fn main() -> ExitCode {
     let run_result = match args.algorithm.as_str() {
         "hc" => run_hill_climb(&problem, &args),
         "ws" => run_walksat(&problem, &args),
+        "dfs" => run_dfs(&problem, &args),
         _ => Ok(()),
     };
     if let Err(message) = run_result {
@@ -85,7 +89,7 @@ fn run_hill_climb(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     let result = hillclimb::run(problem, &lists, params, &mut rng, args.verbose);
 
     if result.satisfiable {
-        write_solution(&result, problem.num_vars, args)?;
+        write_solution(&result.assignment, problem.num_vars, args)?;
     }
 
     Ok(())
@@ -119,7 +123,30 @@ fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     let result = hillclimb::walksat::run_walksat(problem, &lists, params, &mut rng, args.verbose);
 
     if result.satisfiable {
-        write_solution(&result, problem.num_vars, args)?;
+        write_solution(&result.assignment, problem.num_vars, args)?;
+    }
+
+    Ok(())
+}
+
+/// Runs the depth-first search algorithm against `problem` using the
+/// optional time limit and verbosity level given in `args`, then
+/// writes out the result if a satisfying assignment was found. Unlike
+/// `run_hill_climb`/`run_walksat`, a search that exhausts its space
+/// without a time limit produces a proven UNSAT verdict, not just
+/// "not found".
+fn run_dfs(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
+    let lists = occurrence::build(problem);
+    let mut rng = StdRng::from_rng(&mut rand::rng());
+
+    let time_limit = args
+        .time_limit_secs
+        .map(|secs| Duration::from_secs(secs as u64));
+
+    let result = dfs::run(problem, &lists, time_limit, &mut rng, args.verbose);
+
+    if result.satisfiable {
+        write_solution(&result.assignment, problem.num_vars, args)?;
     }
 
     Ok(())
@@ -129,22 +156,18 @@ fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
 /// `args.output` if one was given, otherwise to stdout when
 /// `args.verbose` is at least 1 (and nowhere, per STAGE2.md, if
 /// neither condition holds).
-fn write_solution(
-    result: &hillclimb::SolveResult,
-    num_vars: usize,
-    args: &Args,
-) -> Result<(), String> {
+fn write_solution(assignment: &Assignment, num_vars: usize, args: &Args) -> Result<(), String> {
     if let Some(output_path) = &args.output {
         let mut file = File::create(output_path)
             .map_err(|e| format!("could not create output file \"{output_path}\": {e}"))?;
-        solution::write(&mut file, &result.assignment, num_vars)
+        solution::write(&mut file, assignment, num_vars)
             .map_err(|e| format!("could not write output file \"{output_path}\": {e}"))?;
         return Ok(());
     }
 
     if args.verbose >= 1 {
         let mut stdout = io::stdout();
-        let _ = solution::write(&mut stdout, &result.assignment, num_vars);
+        let _ = solution::write(&mut stdout, assignment, num_vars);
     }
 
     Ok(())

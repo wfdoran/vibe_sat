@@ -1,8 +1,8 @@
 // Command vibe_sat is a command line SAT solver. The program reads a
 // DIMACS CNF file into memory and attempts to solve it with the
-// selected algorithm (a basic hill-climb local search, "hc", or
-// WalkSAT, "ws"), optionally printing progress and writing out a
-// satisfying assignment if one is found.
+// selected algorithm (a basic hill-climb local search, "hc"; WalkSAT,
+// "ws"; or a complete depth-first search, "dfs"), optionally printing
+// progress and writing out a satisfying assignment if one is found.
 package main
 
 import (
@@ -13,8 +13,10 @@ import (
 	"os"
 	"time"
 
+	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cliargs"
 	"vibe_sat/internal/cnf"
+	"vibe_sat/internal/dfs"
 	"vibe_sat/internal/hillclimb"
 	"vibe_sat/internal/occurrence"
 	"vibe_sat/internal/solution"
@@ -52,6 +54,8 @@ func main() {
 		runHillClimb(problem, args)
 	case "ws":
 		runWalkSat(problem, args)
+	case "dfs":
+		runDFS(problem, args)
 	}
 
 	os.Exit(0)
@@ -77,7 +81,7 @@ func runHillClimb(problem *cnf.Problem, args *cliargs.Args) {
 	result := hillclimb.Run(problem, lists, params, rng, args.Verbose)
 
 	if result.Satisfiable {
-		writeSolution(result, problem.NumVars, args)
+		writeSolution(result.Assignment, problem.NumVars, args)
 	}
 }
 
@@ -112,7 +116,29 @@ func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
 	result := hillclimb.RunWalkSat(problem, lists, params, rng, args.Verbose)
 
 	if result.Satisfiable {
-		writeSolution(result, problem.NumVars, args)
+		writeSolution(result.Assignment, problem.NumVars, args)
+	}
+}
+
+// runDFS runs the depth-first search algorithm against problem using
+// the optional time limit and verbosity level given in args, then
+// writes out the result if a satisfying assignment was found. Unlike
+// runHillClimb/runWalkSat, a search that exhausts its space without a
+// time limit produces a proven UNSAT verdict, not just "not found".
+func runDFS(problem *cnf.Problem, args *cliargs.Args) {
+	lists := occurrence.Build(problem)
+	rng := newSeededRand()
+
+	var timeLimit *time.Duration
+	if args.TimeLimitSecs != nil {
+		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		timeLimit = &limit
+	}
+
+	result := dfs.Run(problem, lists, timeLimit, rng, args.Verbose)
+
+	if result.Satisfiable {
+		writeSolution(result.Assignment, problem.NumVars, args)
 	}
 }
 
@@ -120,7 +146,7 @@ func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
 // format: to args.OutputFile if one was given, otherwise to stdout
 // when args.Verbose is at least 1 (and nowhere, per STAGE2.md, if
 // neither condition holds).
-func writeSolution(result hillclimb.Result, numVars int, args *cliargs.Args) {
+func writeSolution(assignment assign.Assignment, numVars int, args *cliargs.Args) {
 	if args.OutputFile != "" {
 		file, err := os.Create(args.OutputFile)
 		if err != nil {
@@ -128,7 +154,7 @@ func writeSolution(result hillclimb.Result, numVars int, args *cliargs.Args) {
 			os.Exit(1)
 		}
 		defer file.Close()
-		if err := solution.Write(file, result.Assignment, numVars); err != nil {
+		if err := solution.Write(file, assignment, numVars); err != nil {
 			fmt.Println(fmt.Errorf("could not write output file %q: %w", args.OutputFile, err))
 			os.Exit(1)
 		}
@@ -136,7 +162,7 @@ func writeSolution(result hillclimb.Result, numVars int, args *cliargs.Args) {
 	}
 
 	if args.Verbose >= 1 {
-		_ = solution.Write(os.Stdout, result.Assignment, numVars)
+		_ = solution.Write(os.Stdout, assignment, numVars)
 	}
 }
 

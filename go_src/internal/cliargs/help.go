@@ -20,9 +20,13 @@ Options:
 
   --algorithm=<string>, -a <string>
         Solving algorithm to use. Required. Supported values:
-          hc  A basic hill-climb local search (STAGE2.md).
-          ws  WalkSAT (STAGE4.md), a more advanced local search that
-              can escape local optima that trap "hc".
+          hc   A basic hill-climb local search (STAGE2.md).
+          ws   WalkSAT (STAGE4.md), a more advanced local search that
+               can escape local optima that trap "hc".
+          dfs  A complete depth-first search using unit propagation
+               (STAGE5.md). Unlike "hc"/"ws", dfs can prove UNSAT: it
+               reports "UNSAT" (not "UNKNOWN") when the search space
+               is exhausted without finding a solution.
 
   --output=<filename>, -o <filename>
         Where to write a satisfying solution, in DIMACS solution
@@ -31,12 +35,16 @@ Options:
         anywhere.
 
   --time-limit-secs=<integer>, -t <integer>
-        Optional time limit, in seconds, for the search.
+        Optional time limit, in seconds, for the search. Required by
+        "hc"/"ws" unless --alg-params is given instead; optional for
+        "dfs" (which will otherwise run until it finds a solution or
+        exhausts the search space, however long that takes).
 
   --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
         Algorithm-specific parameters (1 to 3 integer values); at
-        least one of --alg-params or --time-limit-secs is required.
-        The meaning of each value depends on --algorithm:
+        least one of --alg-params or --time-limit-secs is required for
+        "hc"/"ws" (not used at all by "dfs", which takes no
+        parameters). The meaning of each value depends on --algorithm:
           hc  val1 = number of random restarts to perform.
           ws  val1 = number of random restarts ("tries") to perform.
               val2 = max flips per try before giving up and starting a

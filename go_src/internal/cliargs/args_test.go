@@ -252,6 +252,40 @@ func TestParseWSRejectsOutOfRangeNoisePercent(t *testing.T) {
 	}
 }
 
+// TestParseDFSNeedsNoStoppingCriterion verifies that --algorithm=dfs
+// is accepted with neither --alg-params nor --time-limit-secs, unlike
+// --algorithm=hc/ws.
+func TestParseDFSNeedsNoStoppingCriterion(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if args.TimeLimitSecs != nil {
+		t.Errorf("TimeLimitSecs = %v, want nil", args.TimeLimitSecs)
+	}
+}
+
+// TestParseDFSAcceptsTimeLimit verifies that --algorithm=dfs accepts
+// an optional --time-limit-secs.
+func TestParseDFSAcceptsTimeLimit(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs", "--time-limit-secs=10"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if args.TimeLimitSecs == nil || *args.TimeLimitSecs != 10 {
+		t.Errorf("TimeLimitSecs = %v, want 10", args.TimeLimitSecs)
+	}
+}
+
+// TestParseDFSRejectsAlgParams verifies that --algorithm=dfs rejects
+// --alg-params, since dfs takes no parameters at this stage.
+func TestParseDFSRejectsAlgParams(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs", "--alg-params=5"})
+	if err == nil {
+		t.Fatalf("expected error for --alg-params with --algorithm=dfs")
+	}
+}
+
 // TestTokenizeAlgParamsSpaceSeparatedMultipleValues verifies that the
 // space-separated form of --alg-params collects multiple following
 // tokens, up to the flag's maximum of three. This is tested against

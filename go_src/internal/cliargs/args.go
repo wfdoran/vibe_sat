@@ -266,8 +266,16 @@ func validate(args *Args, rawValues map[string][]string) error {
 			return fmt.Errorf("--time-limit-secs must be a positive integer")
 		}
 
+	case "dfs":
+		if len(args.AlgParams) > 0 {
+			return fmt.Errorf("for --algorithm=dfs, --alg-params is not used (this algorithm takes no parameters)")
+		}
+		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
+			return fmt.Errorf("--time-limit-secs must be a positive integer")
+		}
+
 	default:
-		return fmt.Errorf("unsupported --algorithm value %q; only \"hc\" and \"ws\" are currently supported", args.Algorithm)
+		return fmt.Errorf("unsupported --algorithm value %q; only \"hc\", \"ws\", and \"dfs\" are currently supported", args.Algorithm)
 	}
 
 	return nil

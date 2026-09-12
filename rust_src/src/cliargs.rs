@@ -31,7 +31,7 @@ pub struct Args {
     #[arg(long = "verbose", short = 'v', default_value_t = 0)]
     pub verbose: i32,
 
-    /// Solving algorithm to use (required; "hc" or "ws").
+    /// Solving algorithm to use (required; "hc", "ws", or "dfs").
     #[arg(long = "algorithm", short = 'a')]
     pub algorithm: String,
 
@@ -78,9 +78,13 @@ Options:
 
   --algorithm=<string>, -a <string>
         Solving algorithm to use. Required. Supported values:
-          hc  A basic hill-climb local search (STAGE2.md).
-          ws  WalkSAT (STAGE4.md), a more advanced local search that
-              can escape local optima that trap "hc".
+          hc   A basic hill-climb local search (STAGE2.md).
+          ws   WalkSAT (STAGE4.md), a more advanced local search that
+               can escape local optima that trap "hc".
+          dfs  A complete depth-first search using unit propagation
+               (STAGE5.md). Unlike "hc"/"ws", dfs can prove UNSAT: it
+               reports "UNSAT" (not "UNKNOWN") when the search space
+               is exhausted without finding a solution.
 
   --output=<filename>, -o <filename>
         Where to write a satisfying solution, in DIMACS solution
@@ -89,12 +93,16 @@ Options:
         anywhere.
 
   --time-limit-secs=<integer>, -t <integer>
-        Optional time limit, in seconds, for the search.
+        Optional time limit, in seconds, for the search. Required by
+        "hc"/"ws" unless --alg-params is given instead; optional for
+        "dfs" (which will otherwise run until it finds a solution or
+        exhausts the search space, however long that takes).
 
   --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
         Algorithm-specific parameters (1 to 3 integer values); at
-        least one of --alg-params or --time-limit-secs is required.
-        The meaning of each value depends on --algorithm:
+        least one of --alg-params or --time-limit-secs is required for
+        "hc"/"ws" (not used at all by "dfs", which takes no
+        parameters). The meaning of each value depends on --algorithm:
           hc  val1 = number of random restarts to perform.
           ws  val1 = number of random restarts ("tries") to perform.
               val2 = max flips per try before giving up and starting a
@@ -206,8 +214,23 @@ fn validate(args: &Args) -> Result<(), String> {
             Ok(())
         }
 
+        "dfs" => {
+            if args.alg_params.is_some() {
+                return Err(
+                    "for --algorithm=dfs, --alg-params is not used (this algorithm takes no parameters)"
+                        .to_string(),
+                );
+            }
+            if let Some(limit) = args.time_limit_secs
+                && limit < 1
+            {
+                return Err("--time-limit-secs must be a positive integer".to_string());
+            }
+            Ok(())
+        }
+
         other => Err(format!(
-            "unsupported --algorithm value \"{other}\"; only \"hc\" and \"ws\" are currently supported"
+            "unsupported --algorithm value \"{other}\"; only \"hc\", \"ws\", and \"dfs\" are currently supported"
         )),
     }
 }
@@ -399,6 +422,36 @@ mod tests {
             "5",
             "1000",
             "101",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_dfs_needs_no_stopping_criterion() {
+        let args = Args::parse_from_args(["vibe_sat", "--input=problem.cnf", "--algorithm=dfs"])
+            .expect("expected successful parse");
+        assert_eq!(args.time_limit_secs, None);
+    }
+
+    #[test]
+    fn test_parse_dfs_accepts_time_limit() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=dfs",
+            "--time-limit-secs=10",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.time_limit_secs, Some(10));
+    }
+
+    #[test]
+    fn test_parse_dfs_rejects_alg_params() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=dfs",
+            "--alg-params=5",
         ]);
         assert!(result.is_err());
     }
