@@ -21,9 +21,6 @@ pub fn literal_var(literal: Literal) -> usize {
 
 /// Returns whether `literal` is the negation of its underlying
 /// variable (i.e. whether the original DIMACS value was negative).
-// Not yet called outside of tests in this stage; kept as part of the
-// Literal API for use once the solver itself needs literal polarity.
-#[allow(dead_code)]
 pub fn literal_is_negative(literal: Literal) -> bool {
     literal < 0
 }
