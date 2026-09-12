@@ -10,8 +10,18 @@
 use clap::Parser;
 
 /// Command line arguments accepted by vibe_sat.
+///
+/// clap's own auto-generated `--help`/`-h` flag is disabled here
+/// (`disable_help_flag`) because `--help`/`-h` is instead detected by
+/// [`wants_help`] and handled by `main` before [`Args::parse_from_args`]
+/// is ever called, so that it always works even when other required
+/// arguments are missing.
 #[derive(Parser, Debug)]
-#[command(name = "vibe_sat", about = "A command line SAT solver")]
+#[command(
+    name = "vibe_sat",
+    about = "A command line SAT solver",
+    disable_help_flag = true
+)]
 pub struct Args {
     /// SAT CNF file to read in (required).
     #[arg(long = "input", short = 'i')]
@@ -38,6 +48,58 @@ pub struct Args {
     /// of random restarts to perform.
     #[arg(long = "alg-params", short = 'p', num_args = 1..=3, allow_negative_numbers = true)]
     pub alg_params: Option<Vec<i64>>,
+}
+
+/// Returns true if `argv` contains a `--help` or `-h` token anywhere.
+/// This is checked by `main` before attempting to parse the rest of
+/// the command line with [`Args::parse_from_args`], so that
+/// `--help`/`-h` always works even when other required arguments are
+/// missing or invalid.
+pub fn wants_help(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "--help" || a == "-h")
+}
+
+/// Returns the full usage text printed when vibe_sat is invoked with
+/// `--help`/`-h`: a short synopsis followed by a description of every
+/// command line parameter vibe_sat currently understands.
+///
+/// NOTE for future stages: whenever a new command line parameter is
+/// added, update this text to describe it too (per STAGE3.md).
+pub fn help_text() -> String {
+    r#"Usage: vibe_sat --input=<filename> --algorithm=<string> [OPTIONS]
+
+vibe_sat is a command line SAT solver.
+
+Options:
+  --input=<filename>, -i <filename>
+        SAT CNF file to read in. Required.
+
+  --verbose=<integer>, -v <integer>
+        Verbosity level. Default is 0.
+
+  --algorithm=<string>, -a <string>
+        Solving algorithm to use. Required. Only "hc" (a basic
+        hill-climbing local search) is currently supported.
+
+  --output=<filename>, -o <filename>
+        Where to write a satisfying solution, in DIMACS solution
+        format. If not given, the solution is printed to the screen
+        when --verbose is at least 1; otherwise it is not written
+        anywhere.
+
+  --time-limit-secs=<integer>, -t <integer>
+        Optional time limit, in seconds, for the search.
+
+  --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
+        Algorithm-specific parameters (1 to 3 integer values). For
+        --algorithm=hc, at most one value is accepted: the number of
+        random restarts to perform. At least one of --alg-params or
+        --time-limit-secs is required when --algorithm=hc.
+
+  --help, -h
+        Print this help message and exit.
+"#
+    .to_string()
 }
 
 impl Args {
@@ -301,5 +363,55 @@ mod tests {
             "--time-limit-secs=0",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wants_help_long_form() {
+        assert!(wants_help(&["vibe_sat".to_string(), "--help".to_string()]));
+    }
+
+    #[test]
+    fn test_wants_help_short_form() {
+        assert!(wants_help(&["vibe_sat".to_string(), "-h".to_string()]));
+    }
+
+    #[test]
+    fn test_wants_help_overrides_other_errors() {
+        assert!(wants_help(&[
+            "vibe_sat".to_string(),
+            "--bogus=1".to_string(),
+            "--help".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_wants_help_false_without_flag() {
+        assert!(!wants_help(&[
+            "vibe_sat".to_string(),
+            "--input=problem.cnf".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_help_text_mentions_every_flag() {
+        let text = help_text();
+        for flag in [
+            "--input",
+            "-i",
+            "--verbose",
+            "-v",
+            "--algorithm",
+            "-a",
+            "--output",
+            "-o",
+            "--time-limit-secs",
+            "-t",
+            "--alg-params",
+            "-p",
+            "--help",
+            "-h",
+        ] {
+            assert!(text.contains(flag), "help_text() does not mention {flag}");
+        }
     }
 }

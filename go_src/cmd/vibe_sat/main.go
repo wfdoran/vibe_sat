@@ -32,6 +32,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if args.Help {
+		fmt.Print(cliargs.HelpText())
+		os.Exit(0)
+	}
+
 	problem, err := cnf.ReadDIMACS(args.InputFile, args.Verbose)
 	if err != nil {
 		fmt.Println(err)

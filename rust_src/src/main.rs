@@ -26,7 +26,13 @@ use rand::rngs::StdRng;
 /// 0 on success (whether or not a solution was found) or non-zero if
 /// any error occurs.
 fn main() -> ExitCode {
-    let args = match Args::parse_from_args(std::env::args()) {
+    let argv: Vec<String> = std::env::args().collect();
+    if cliargs::wants_help(&argv) {
+        print!("{}", cliargs::help_text());
+        return ExitCode::from(0);
+    }
+
+    let args = match Args::parse_from_args(argv) {
         Ok(args) => args,
         Err(message) => {
             println!("{message}");

@@ -1,12 +1,66 @@
 package cliargs
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // baseHCArgs returns a minimal valid argument list for algorithm
 // "hc" that tests can append additional flags to.
 func baseHCArgs(extra ...string) []string {
 	args := []string{"--input=problem.cnf", "--algorithm=hc", "--alg-params=10"}
 	return append(args, extra...)
+}
+
+// TestParseHelpLongForm verifies that --help alone sets Args.Help,
+// without requiring any other argument.
+func TestParseHelpLongForm(t *testing.T) {
+	args, err := Parse([]string{"--help"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if !args.Help {
+		t.Errorf("Help = false, want true")
+	}
+}
+
+// TestParseHelpShortForm verifies that -h alone sets Args.Help.
+func TestParseHelpShortForm(t *testing.T) {
+	args, err := Parse([]string{"-h"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if !args.Help {
+		t.Errorf("Help = false, want true")
+	}
+}
+
+// TestParseHelpOverridesOtherErrors verifies that --help/-h takes
+// precedence even when the rest of the command line is incomplete or
+// invalid.
+func TestParseHelpOverridesOtherErrors(t *testing.T) {
+	args, err := Parse([]string{"--bogus=1", "--help"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if !args.Help {
+		t.Errorf("Help = false, want true")
+	}
+}
+
+// TestHelpTextMentionsEveryFlag verifies that HelpText documents
+// every flag vibe_sat currently understands.
+func TestHelpTextMentionsEveryFlag(t *testing.T) {
+	text := HelpText()
+	for _, flag := range []string{
+		"--input", "-i", "--verbose", "-v", "--algorithm", "-a",
+		"--output", "-o", "--time-limit-secs", "-t", "--alg-params", "-p",
+		"--help", "-h",
+	} {
+		if !strings.Contains(text, flag) {
+			t.Errorf("HelpText() does not mention %q", flag)
+		}
+	}
 }
 
 // TestParseLongForm verifies that the long form flags are parsed

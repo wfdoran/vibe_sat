@@ -19,6 +19,7 @@ import (
 
 // Args holds the parsed command line arguments for vibe_sat.
 type Args struct {
+	Help          bool    // --help / -h : print usage information and exit
 	InputFile     string  // --input / -i : path to the DIMACS CNF file to read (required)
 	Verbose       int     // --verbose / -v : verbosity level, default 0
 	Algorithm     string  // --algorithm / -a : solving algorithm to use (required; only "hc" is supported)
@@ -105,7 +106,20 @@ func looksLikeNegativeNumber(token string) bool {
 // cannot be parsed, if a required argument is missing, or if the
 // arguments given are inconsistent with each other (for example,
 // neither --time-limit-secs nor --alg-params given for --algorithm=hc).
+//
+// --help/-h is special-cased ahead of everything else: if either is
+// present anywhere in argv, Parse immediately returns an Args with
+// only Help set to true, skipping every other token (including ones
+// that would otherwise be errors, such as a missing --input). This
+// matches the usual expectation that --help always works, even when
+// the rest of the command line is incomplete or wrong.
 func Parse(argv []string) (*Args, error) {
+	for _, token := range argv {
+		if token == "--help" || token == "-h" {
+			return &Args{Help: true}, nil
+		}
+	}
+
 	rawValues, err := tokenize(argv)
 	if err != nil {
 		return nil, err
