@@ -18,7 +18,7 @@ func allClausesSatisfied(t *testing.T, problem *cnf.Problem, full assign.Assignm
 	}
 }
 
-// TestUnitPropagateChain verifies that unitPropagate follows a chain
+// TestUnitPropagateChain verifies that UnitPropagate follows a chain
 // of forced unit propagations and shrinks/removes clauses as it goes.
 func TestUnitPropagateChain(t *testing.T) {
 	clauses := []cnf.Clause{
@@ -28,7 +28,7 @@ func TestUnitPropagateChain(t *testing.T) {
 	}
 	assignment := assign.New(3)
 
-	unsat, numFixed := unitPropagate(&clauses, assignment)
+	unsat, numFixed := UnitPropagate(&clauses, assignment)
 	if unsat {
 		t.Fatalf("expected no contradiction")
 	}
@@ -43,7 +43,7 @@ func TestUnitPropagateChain(t *testing.T) {
 	}
 }
 
-// TestUnitPropagateDetectsContradiction verifies that unitPropagate
+// TestUnitPropagateDetectsContradiction verifies that UnitPropagate
 // reports unsat for a formula with conflicting unit clauses.
 func TestUnitPropagateDetectsContradiction(t *testing.T) {
 	clauses := []cnf.Clause{
@@ -52,7 +52,7 @@ func TestUnitPropagateDetectsContradiction(t *testing.T) {
 	}
 	assignment := assign.New(1)
 
-	unsat, _ := unitPropagate(&clauses, assignment)
+	unsat, _ := UnitPropagate(&clauses, assignment)
 	if !unsat {
 		t.Fatalf("expected unsat = true")
 	}

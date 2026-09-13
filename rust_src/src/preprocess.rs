@@ -354,7 +354,11 @@ fn simplify_with_assignment(clauses: &mut Vec<Clause>, assignment: &Assignment) 
 /// until no clause is a unit clause or a contradiction is found.
 /// Returns whether a contradiction was found, and how many variables
 /// were newly fixed.
-fn unit_propagate(clauses: &mut Vec<Clause>, assignment: &mut Assignment) -> (bool, usize) {
+///
+/// Exposed beyond this module (see [`crate::dfs::run`]'s bootstrap
+/// step, STAGE9.md) since watched literals require every clause to
+/// have at least two literals, which this guarantees.
+pub fn unit_propagate(clauses: &mut Vec<Clause>, assignment: &mut Assignment) -> (bool, usize) {
     let mut num_fixed = 0;
     loop {
         if simplify_with_assignment(clauses, assignment) {

@@ -1,11 +1,11 @@
 //! Implements the depth-first search SAT solving algorithm used by
 //! vibe_sat's "dfs" algorithm: a complete DPLL-style search using
-//! boolean constraint propagation (BCP) and a choice of
-//! variable-selection heuristics (see [`SelectVarVariant`]). Unlike
-//! the hill-climb-family algorithms ([`crate::hillclimb`]), this
-//! search is complete: if it exhausts its search space without
-//! finding a satisfying assignment, the problem is proven UNSAT, not
-//! merely "not found yet".
+//! boolean constraint propagation (BCP, via watched literals -- see
+//! [`WatchState`] and STAGE9.md) and a choice of variable-selection
+//! heuristics (see [`SelectVarVariant`]). Unlike the hill-climb-family
+//! algorithms ([`crate::hillclimb`]), this search is complete: if it
+//! exhausts its search space without finding a satisfying assignment,
+//! the problem is proven UNSAT, not merely "not found yet".
 
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,7 @@ use rand::{Rng, RngExt};
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
 use crate::occurrence::Lists;
+use crate::preprocess;
 
 /// The outcome of a single call to [`bcp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,88 @@ pub enum SelectVarVariant {
 /// checked often enough to respond to a time limit reasonably
 /// promptly.
 const TIME_CHECK_INTERVAL: usize = 0xfff;
+
+/// Holds, for every clause, the two literals it is currently watching
+/// (see Chaff: Moskewicz, Madigan, Zhao, Zhang & Malik, "Chaff:
+/// Engineering an Efficient SAT Solver," DAC 2001). [`bcp`] only ever
+/// has to look closely at a clause when one of these two literals
+/// becomes false, instead of every clause containing that literal: a
+/// clause "sheds" a watch away from an about-to-be-false literal onto
+/// some other not-yet-false literal whenever it can, which is what
+/// makes propagation cheap in the steady state.
+///
+/// A `WatchState` belongs to exactly one node of the search: each
+/// branch gets its own clone (it derives [`Clone`]), since sibling
+/// branches make different assignments and so may need different
+/// literals watched. This keeps the search's existing "explicit stack
+/// of self-contained nodes" structure from STAGE5.md intact, rather
+/// than requiring the single shared, incrementally backtracked trail
+/// a from-scratch CDCL implementation would normally use.
+///
+/// `watch[c]` is always exactly 2 distinct literals, which requires
+/// every clause to have at least 2 literals; callers must guarantee
+/// this (via an initial round of unit propagation removing any unit
+/// or empty clauses) before calling [`new_watch_state`].
+#[derive(Clone)]
+struct WatchState {
+    watch: Vec<[Literal; 2]>,
+}
+
+/// Builds a [`WatchState`] for `clauses`, choosing for every clause
+/// two literals that are not false under `assignment`. Returns `None`
+/// if some clause has fewer than two such literals (a contradiction,
+/// given the precondition above; checked defensively rather than
+/// assumed).
+fn new_watch_state(clauses: &[Clause], assignment: &Assignment) -> Option<WatchState> {
+    let mut watch = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let first = choose_watch(clause, assignment, None)?;
+        let second = choose_watch(clause, assignment, Some(first))?;
+        watch.push([first, second]);
+    }
+    Some(WatchState { watch })
+}
+
+/// Scans `clause` for a literal that is not false under `assignment`
+/// and is not equal to `avoid` (used when picking a clause's second
+/// watch, to avoid re-picking the first).
+fn choose_watch(
+    clause: &Clause,
+    assignment: &Assignment,
+    avoid: Option<Literal>,
+) -> Option<Literal> {
+    clause
+        .iter()
+        .copied()
+        .find(|&lit| Some(lit) != avoid && !is_false(lit, assignment))
+}
+
+/// Returns whether `literal` currently evaluates to false under
+/// `assignment` (an `Unassigned` variable makes every literal on it
+/// neither true nor false yet, so this returns false for those).
+fn is_false(literal: Literal, assignment: &Assignment) -> bool {
+    let value = assignment[cnf::literal_var(literal)];
+    if value == Value::Unassigned {
+        return false;
+    }
+    if cnf::literal_is_negative(literal) {
+        value == Value::True
+    } else {
+        value == Value::False
+    }
+}
+
+/// One entry of [`run`]'s explicit search stack: a partial assignment
+/// together with the watched-literal state describing it. Every
+/// branch gets its own independent `SearchNode` (via `WatchState`'s
+/// `Clone`), matching STAGE5.md's original "stack of full
+/// assignments" design -- STAGE9.md's watched literals speed up the
+/// [`bcp`] call made when creating each node, not the overall search
+/// structure.
+struct SearchNode {
+    assignment: Assignment,
+    watch: WatchState,
+}
 
 /// Describes the outcome of a depth-first search.
 pub struct SolveResult {
@@ -131,11 +214,64 @@ pub fn run<R: Rng>(
         };
     }
 
+    // The watched-literal scheme (see WatchState) requires every
+    // clause to have at least two literals: a unit clause has nothing
+    // to "shed" its second watch onto. Bootstrap by unit-propagating
+    // the root once, with the same routine crate::preprocess already
+    // uses for exactly this purpose, before ever building watch
+    // state. When --no-preprocessing is not given, Stage 8's
+    // preprocessing has already done this (so this is a no-op); this
+    // guarantees correctness either way.
+    let mut clauses = problem.clauses.clone();
+    let mut root_assignment = assignment::new(problem.num_vars);
+    if preprocess::unit_propagate(&mut clauses, &mut root_assignment).0 {
+        if verbose >= 1 {
+            println!("UNSAT");
+        }
+        return SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            num_nodes: 0,
+            timed_out: false,
+        };
+    }
+    let root_watch = match new_watch_state(&clauses, &root_assignment) {
+        Some(ws) => ws,
+        // Defensive: unit_propagate above should already rule this
+        // out, since every surviving clause has at least one
+        // unassigned literal (otherwise it would have been a unit
+        // clause caught above, or a contradiction).
+        None => {
+            if verbose >= 1 {
+                println!("UNSAT");
+            }
+            return SolveResult {
+                satisfiable: false,
+                assignment: assignment::new(problem.num_vars),
+                num_nodes: 0,
+                timed_out: false,
+            };
+        }
+    };
+
+    // working_problem wraps the (possibly bootstrap-simplified) clause
+    // set for select_var/select_var_fast_pick, which only ever need
+    // the clauses and variable count, not the original Problem value.
+    // clauses moves in here; bcp below reads it back out via
+    // working_problem.clauses, rather than keeping a second owner.
+    let working_problem = Problem {
+        num_vars: problem.num_vars,
+        clauses,
+    };
+
     let start_time = Instant::now();
-    let mut stack: Vec<Assignment> = vec![assignment::new(problem.num_vars)];
+    let mut stack: Vec<SearchNode> = vec![SearchNode {
+        assignment: root_assignment,
+        watch: root_watch,
+    }];
     let mut num_nodes: usize = 0;
 
-    while let Some(x) = stack.pop() {
+    while let Some(node) = stack.pop() {
         num_nodes += 1;
         if let Some(limit) = time_limit
             && num_nodes & TIME_CHECK_INTERVAL == 0
@@ -153,15 +289,22 @@ pub fn run<R: Rng>(
         }
 
         let i = match variant {
-            SelectVarVariant::Fast => select_var_fast_pick(problem, &x),
-            SelectVarVariant::Weighted => select_var(problem, &x, rng),
+            SelectVarVariant::Fast => select_var_fast_pick(&working_problem, &node.assignment),
+            SelectVarVariant::Weighted => select_var(&working_problem, &node.assignment, rng),
         };
 
         for &v in &[Value::False, Value::True] {
-            let mut branch = x.clone();
-            branch[i] = v;
+            let mut branch_assignment = node.assignment.clone();
+            branch_assignment[i] = v;
+            let mut branch_watch = node.watch.clone();
 
-            match bcp(problem, lists, &mut branch, i) {
+            match bcp(
+                &working_problem.clauses,
+                lists,
+                &mut branch_watch,
+                &mut branch_assignment,
+                i,
+            ) {
                 Status::Contra => continue,
                 Status::Done => {
                     if verbose >= 1 {
@@ -169,12 +312,15 @@ pub fn run<R: Rng>(
                     }
                     return SolveResult {
                         satisfiable: true,
-                        assignment: branch,
+                        assignment: branch_assignment,
                         num_nodes,
                         timed_out: false,
                     };
                 }
-                Status::Ok => stack.push(branch),
+                Status::Ok => stack.push(SearchNode {
+                    assignment: branch_assignment,
+                    watch: branch_watch,
+                }),
             }
         }
     }
@@ -192,42 +338,72 @@ pub fn run<R: Rng>(
 
 /// Applies boolean constraint propagation to partial assignment `x`,
 /// which must already have variable `i` set to its just-chosen branch
-/// value. It repeatedly finds clauses left with exactly one
-/// unassigned, not-yet-satisfied literal and forces that literal
-/// true, continuing until propagation settles or a contradiction is
-/// found. `x` is modified in place.
-pub fn bcp(problem: &Problem, lists: &Lists, x: &mut Assignment, i: usize) -> Status {
+/// value, using `ws`'s watched literals to find only the clauses that
+/// might need attention as a result. `x` and `ws` are both modified
+/// in place. `lists` is the static (never mutated) per-variable
+/// occurrence index from Stage 2, used here only to enumerate the
+/// *candidate* clauses to examine when a literal becomes false --
+/// most of them are dismissed in O(1) because they are not currently
+/// watching that literal; only the ones that are get the deeper look
+/// a plain occurrence-list scan would have given every candidate.
+fn bcp(
+    clauses: &[Clause],
+    lists: &Lists,
+    ws: &mut WatchState,
+    x: &mut Assignment,
+    i: usize,
+) -> Status {
     let mut queue = vec![i];
     let mut head = 0;
     while head < queue.len() {
         let v = queue[head];
         head += 1;
 
-        // falsified lists the clauses containing the literal of v
-        // that just became false because of v's new assignment: those
-        // are the only clauses whose status could have changed.
-        let falsified = if x[v] == Value::True {
-            &lists.negative[v]
+        // falsified_literal is the literal on v that just became
+        // false because of v's new assignment; candidates lists every
+        // clause that mentions it (only some of which are actually
+        // watching it right now).
+        let (falsified_literal, candidates) = if x[v] == Value::True {
+            (-(v as Literal), &lists.negative[v])
         } else {
-            &lists.positive[v]
+            (v as Literal, &lists.positive[v])
         };
 
-        for &c in falsified {
-            let (satisfied, contradiction, unit_literal) = evaluate_clause(&problem.clauses[c], x);
-            if contradiction {
-                return Status::Contra;
-            }
-            if satisfied || unit_literal.is_none() {
+        for &c in candidates {
+            let watch = ws.watch[c];
+            let other_watch = if watch[0] == falsified_literal {
+                watch[1]
+            } else if watch[1] == falsified_literal {
+                watch[0]
+            } else {
+                continue; // this clause isn't watching the falsified literal
+            };
+
+            if let Some(replacement) = choose_watch(&clauses[c], x, Some(other_watch)) {
+                if watch[0] == falsified_literal {
+                    ws.watch[c][0] = replacement;
+                } else {
+                    ws.watch[c][1] = replacement;
+                }
                 continue;
             }
-            let literal = unit_literal.expect("checked above");
-            let forced_var = cnf::literal_var(literal);
-            x[forced_var] = if cnf::literal_is_negative(literal) {
-                Value::False
-            } else {
-                Value::True
-            };
-            queue.push(forced_var);
+
+            // No replacement: other_watch is the clause's only
+            // literal that isn't currently false.
+            if is_false(other_watch, x) {
+                return Status::Contra;
+            }
+            let forced_var = cnf::literal_var(other_watch);
+            if x[forced_var] == Value::Unassigned {
+                x[forced_var] = if cnf::literal_is_negative(other_watch) {
+                    Value::False
+                } else {
+                    Value::True
+                };
+                queue.push(forced_var);
+            }
+            // Otherwise other_watch is already true: the clause is
+            // satisfied through it, and there is nothing to do.
         }
     }
 
@@ -235,32 +411,6 @@ pub fn bcp(problem: &Problem, lists: &Lists, x: &mut Assignment, i: usize) -> St
         Status::Ok
     } else {
         Status::Done
-    }
-}
-
-/// Examines `clause` under partial assignment `x` and reports:
-/// whether it is already satisfied by some literal; whether it is a
-/// contradiction (no unassigned literals, and none true); and, if it
-/// has exactly one unassigned literal and is not satisfied, that
-/// literal (the one `bcp` must now force true), or `None` otherwise.
-fn evaluate_clause(clause: &Clause, x: &Assignment) -> (bool, bool, Option<Literal>) {
-    let mut unassigned_count = 0;
-    let mut last_unassigned = None;
-    for &literal in clause {
-        let value = x[cnf::literal_var(literal)];
-        if value == Value::Unassigned {
-            unassigned_count += 1;
-            last_unassigned = Some(literal);
-            continue;
-        }
-        if literal_is_true(literal, value) {
-            return (true, false, None);
-        }
-    }
-    match unassigned_count {
-        0 => (false, true, None),
-        1 => (false, false, last_unassigned),
-        _ => (false, false, None),
     }
 }
 
@@ -370,58 +520,94 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
-    fn test_evaluate_clause_satisfied() {
-        let mut x = assignment::new(2);
-        x[1] = Value::True;
-        let (satisfied, contradiction, unit) = evaluate_clause(&vec![1, -2], &x);
-        assert!(satisfied);
-        assert!(!contradiction);
-        assert_eq!(unit, None);
+    fn test_choose_watch_skips_false_literals() {
+        let mut x = assignment::new(3);
+        x[1] = Value::False;
+        assert_eq!(choose_watch(&vec![1, 2, 3], &x, None), Some(2));
     }
 
     #[test]
-    fn test_evaluate_clause_contradiction() {
+    fn test_choose_watch_honors_avoid() {
+        let x = assignment::new(2);
+        assert_eq!(choose_watch(&vec![1, 2], &x, Some(1)), Some(2));
+    }
+
+    #[test]
+    fn test_choose_watch_fails_when_none_available() {
+        let mut x = assignment::new(2);
+        x[1] = Value::False;
+        x[2] = Value::False;
+        assert_eq!(choose_watch(&vec![1, 2], &x, None), None);
+    }
+
+    #[test]
+    fn test_new_watch_state_picks_two_non_false_literals() {
+        let clauses = vec![vec![1, 2, 3]];
+        let mut x = assignment::new(3);
+        x[1] = Value::False;
+
+        let ws = new_watch_state(&clauses, &x).expect("expected two non-false literals");
+        assert_eq!(ws.watch.len(), 1);
+        assert!(ws.watch[0].contains(&2));
+        assert!(ws.watch[0].contains(&3));
+    }
+
+    #[test]
+    fn test_new_watch_state_fails_on_contradiction() {
+        // Only one literal (-2) is not false, so no second watch exists.
+        let clauses = vec![vec![1, -2]];
         let mut x = assignment::new(2);
         x[1] = Value::False;
         x[2] = Value::True;
-        let (satisfied, contradiction, unit) = evaluate_clause(&vec![1, -2], &x);
-        assert!(!satisfied);
-        assert!(contradiction);
-        assert_eq!(unit, None);
+
+        assert!(new_watch_state(&clauses, &x).is_none());
     }
 
     #[test]
-    fn test_evaluate_clause_unit() {
-        let mut x = assignment::new(2);
+    fn test_clone_watch_state_is_independent() {
+        let clauses = vec![vec![1, 2]];
+        let x = assignment::new(2);
+        let ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let mut clone = ws.clone();
+        clone.watch[0][0] = 99;
+        assert_ne!(ws.watch[0][0], clone.watch[0][0]);
+    }
+
+    #[test]
+    fn test_bcp_moves_watch_away_from_falsified_literal() {
+        let clauses = vec![vec![1, 2, 3]];
+        let lists = crate::occurrence::build(&Problem {
+            num_vars: 3,
+            clauses: clauses.clone(),
+        });
+        let mut x = assignment::new(3);
+        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        // Force the clause to watch {1, 2} explicitly, then falsify 1;
+        // bcp must shed that watch onto 3 rather than forcing anything.
+        ws.watch[0] = [1, 2];
         x[1] = Value::False;
-        let (satisfied, contradiction, unit) = evaluate_clause(&vec![1, -2], &x);
-        assert!(!satisfied);
-        assert!(!contradiction);
-        assert_eq!(unit, Some(-2));
-    }
 
-    #[test]
-    fn test_evaluate_clause_unresolved() {
-        let x = assignment::new(3);
-        let (satisfied, contradiction, unit) = evaluate_clause(&vec![1, -2, 3], &x);
-        assert!(!satisfied);
-        assert!(!contradiction);
-        assert_eq!(unit, None);
+        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1), Status::Ok);
+        assert!(ws.watch[0].contains(&3));
+        assert_eq!(x[2], Value::Unassigned);
+        assert_eq!(x[3], Value::Unassigned);
     }
 
     #[test]
     fn test_bcp_propagates_unit_chain() {
         // 1 forces -2 true (via clause {-1, -2}) which forces 3 true
         // (via clause {2, 3}), completing the assignment.
+        let clauses = vec![vec![-1, -2], vec![2, 3]];
         let problem = Problem {
             num_vars: 3,
-            clauses: vec![vec![-1, -2], vec![2, 3]],
+            clauses: clauses.clone(),
         };
         let lists = crate::occurrence::build(&problem);
         let mut x = assignment::new(3);
+        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::True;
 
-        let status = bcp(&problem, &lists, &mut x, 1);
+        let status = bcp(&clauses, &lists, &mut ws, &mut x, 1);
         assert_eq!(status, Status::Done);
         assert_eq!(x[2], Value::False);
         assert_eq!(x[3], Value::True);
@@ -429,28 +615,39 @@ mod tests {
 
     #[test]
     fn test_bcp_detects_contradiction() {
+        // 1=True forces 2=False (via {-1,-2}), which forces 3=True
+        // (via {2,3}); clauses {-3,-4} and {-3,4} are then jointly
+        // unsatisfiable regardless of 4's value -- a genuine
+        // contradiction discovered purely through watch movement,
+        // with no pre-existing unit clause (every clause here has at
+        // least two literals, satisfying new_watch_state's
+        // precondition).
+        let clauses = vec![vec![-1, -2], vec![2, 3], vec![-3, -4], vec![-3, 4]];
         let problem = Problem {
-            num_vars: 3,
-            clauses: vec![vec![-1, -2], vec![2, 3], vec![-3]],
+            num_vars: 4,
+            clauses: clauses.clone(),
         };
         let lists = crate::occurrence::build(&problem);
-        let mut x = assignment::new(3);
+        let mut x = assignment::new(4);
+        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::True;
 
-        assert_eq!(bcp(&problem, &lists, &mut x, 1), Status::Contra);
+        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1), Status::Contra);
     }
 
     #[test]
     fn test_bcp_leaves_partial_assignment_ok() {
+        let clauses = vec![vec![1, 2, 3]];
         let problem = Problem {
             num_vars: 3,
-            clauses: vec![vec![1, 2, 3]],
+            clauses: clauses.clone(),
         };
         let lists = crate::occurrence::build(&problem);
         let mut x = assignment::new(3);
+        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::False;
 
-        assert_eq!(bcp(&problem, &lists, &mut x, 1), Status::Ok);
+        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1), Status::Ok);
         assert_eq!(x[2], Value::Unassigned);
         assert_eq!(x[3], Value::Unassigned);
     }

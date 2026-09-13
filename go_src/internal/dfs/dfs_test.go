@@ -10,51 +10,86 @@ import (
 	"vibe_sat/internal/occurrence"
 )
 
-// TestEvaluateClauseSatisfied verifies that evaluateClause detects a
-// clause satisfied by an already-assigned literal.
-func TestEvaluateClauseSatisfied(t *testing.T) {
+// TestChooseWatchSkipsFalseLiterals verifies that chooseWatch never
+// returns a literal that is currently false.
+func TestChooseWatchSkipsFalseLiterals(t *testing.T) {
 	x := assign.New(2)
-	x[1] = assign.True
-	satisfied, contradiction, unit := evaluateClause(cnf.Clause{cnf.Literal(1), cnf.Literal(-2)}, x)
-	if !satisfied || contradiction || unit != nil {
-		t.Errorf("got (%v, %v, %v), want (true, false, nil)", satisfied, contradiction, unit)
+	x[1] = assign.False // literal 1 is now false
+	lit, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, 0)
+	if !ok || lit != cnf.Literal(2) {
+		t.Errorf("chooseWatch() = (%v, %v), want (2, true)", lit, ok)
 	}
 }
 
-// TestEvaluateClauseContradiction verifies that evaluateClause detects
-// a clause whose every literal is assigned false.
-func TestEvaluateClauseContradiction(t *testing.T) {
+// TestChooseWatchHonorsAvoid verifies that chooseWatch never returns
+// the literal passed as avoid, even if it would otherwise be a valid
+// (non-false) choice.
+func TestChooseWatchHonorsAvoid(t *testing.T) {
+	x := assign.New(2)
+	lit, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, cnf.Literal(1))
+	if !ok || lit != cnf.Literal(2) {
+		t.Errorf("chooseWatch() = (%v, %v), want (2, true)", lit, ok)
+	}
+}
+
+// TestChooseWatchFailsWhenNoneAvailable verifies that chooseWatch
+// reports ok = false when every literal is either false or excluded.
+func TestChooseWatchFailsWhenNoneAvailable(t *testing.T) {
 	x := assign.New(2)
 	x[1] = assign.False
 	x[2] = assign.True
-	satisfied, contradiction, unit := evaluateClause(cnf.Clause{cnf.Literal(1), cnf.Literal(-2)}, x)
-	if satisfied || !contradiction || unit != nil {
-		t.Errorf("got (%v, %v, %v), want (false, true, nil)", satisfied, contradiction, unit)
+	if _, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(-2)}, x, 0); ok {
+		t.Errorf("chooseWatch() ok = true, want false (both literals are false)")
 	}
 }
 
-// TestEvaluateClauseUnit verifies that evaluateClause identifies the
-// single remaining unassigned literal of an otherwise-false clause.
-func TestEvaluateClauseUnit(t *testing.T) {
+// TestNewWatchStatePicksTwoNonFalseLiterals verifies that
+// newWatchState's initial choice of watches for each clause never
+// includes a literal that is currently false.
+func TestNewWatchStatePicksTwoNonFalseLiterals(t *testing.T) {
+	x := assign.New(3)
+	x[1] = assign.False // literal 1 is false; literal -1 is true
+	clauses := []cnf.Clause{{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)}}
+
+	ws, ok := newWatchState(clauses, x)
+	if !ok {
+		t.Fatalf("expected ok = true")
+	}
+	for _, lit := range ws.watch[0] {
+		if isFalse(lit, x) {
+			t.Errorf("watch[0] = %v contains a false literal", ws.watch[0])
+		}
+	}
+}
+
+// TestNewWatchStateFailsOnContradiction verifies that newWatchState
+// reports ok = false for a clause with fewer than two non-false
+// literals.
+func TestNewWatchStateFailsOnContradiction(t *testing.T) {
 	x := assign.New(2)
 	x[1] = assign.False
-	satisfied, contradiction, unit := evaluateClause(cnf.Clause{cnf.Literal(1), cnf.Literal(-2)}, x)
-	if satisfied || contradiction {
-		t.Fatalf("got (%v, %v, %v), want unresolved-unit", satisfied, contradiction, unit)
-	}
-	if unit == nil || *unit != cnf.Literal(-2) {
-		t.Errorf("unit = %v, want -2", unit)
+	x[2] = assign.True
+	clauses := []cnf.Clause{{cnf.Literal(1), cnf.Literal(-2)}} // both literals false
+	if _, ok := newWatchState(clauses, x); ok {
+		t.Errorf("expected ok = false for a clause with no valid watches")
 	}
 }
 
-// TestEvaluateClauseUnresolved verifies that a clause with two or more
-// unassigned literals and no true literal is reported as neither
-// satisfied, contradictory, nor unit.
-func TestEvaluateClauseUnresolved(t *testing.T) {
-	x := assign.New(3)
-	satisfied, contradiction, unit := evaluateClause(cnf.Clause{cnf.Literal(1), cnf.Literal(-2), cnf.Literal(3)}, x)
-	if satisfied || contradiction || unit != nil {
-		t.Errorf("got (%v, %v, %v), want (false, false, nil)", satisfied, contradiction, unit)
+// TestCloneWatchStateIsIndependent verifies that mutating a cloned
+// watchState does not affect the original.
+func TestCloneWatchStateIsIndependent(t *testing.T) {
+	x := assign.New(2)
+	ws, ok := newWatchState([]cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}, x)
+	if !ok {
+		t.Fatalf("expected ok = true")
+	}
+	original := ws.watch[0]
+
+	clone := cloneWatchState(ws)
+	clone.watch[0][0] = 99
+
+	if ws.watch[0] != original {
+		t.Errorf("original watch state changed: %v, want unchanged %v", ws.watch[0], original)
 	}
 }
 
@@ -72,9 +107,13 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 	}
 	lists := occurrence.Build(problem)
 	x := assign.New(3)
+	ws, ok := newWatchState(problem.Clauses, x)
+	if !ok {
+		t.Fatalf("expected ok = true")
+	}
 	x[1] = assign.True
 
-	status := BCP(problem, lists, x, 1)
+	status := BCP(problem.Clauses, lists, ws, x, 1)
 	if status != Done {
 		t.Fatalf("status = %v, want Done", status)
 	}
@@ -87,23 +126,33 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 }
 
 // TestBCPDetectsContradiction verifies that BCP reports Contra when
-// propagation is forced to falsify every literal of some clause.
+// propagation is forced to falsify every literal of some clause. Every
+// clause here has at least two literals, as newWatchState requires (a
+// unit clause has nothing to move a watch onto); Run guarantees this
+// precondition in practice via a bootstrap call to
+// preprocess.UnitPropagate before ever building watch state.
 func TestBCPDetectsContradiction(t *testing.T) {
-	// 1 forces -2 true (via {-1, -2}), forces 3 true (via {2, 3}), and
-	// then clause {-3} is immediately violated.
+	// 1 forces 2=False (via {-1,-2}), which forces 3=True (via
+	// {2,3}), which then makes clauses {-3,-4} and {-3,4} jointly
+	// unsatisfiable regardless of variable 4's value.
 	problem := &cnf.Problem{
-		NumVars: 3,
+		NumVars: 4,
 		Clauses: []cnf.Clause{
 			{cnf.Literal(-1), cnf.Literal(-2)},
 			{cnf.Literal(2), cnf.Literal(3)},
-			{cnf.Literal(-3)},
+			{cnf.Literal(-3), cnf.Literal(-4)},
+			{cnf.Literal(-3), cnf.Literal(4)},
 		},
 	}
 	lists := occurrence.Build(problem)
-	x := assign.New(3)
+	x := assign.New(4)
+	ws, ok := newWatchState(problem.Clauses, x)
+	if !ok {
+		t.Fatalf("expected ok = true")
+	}
 	x[1] = assign.True
 
-	if status := BCP(problem, lists, x, 1); status != Contra {
+	if status := BCP(problem.Clauses, lists, ws, x, 1); status != Contra {
 		t.Errorf("status = %v, want Contra", status)
 	}
 }
@@ -120,13 +169,51 @@ func TestBCPLeavesPartialAssignmentOK(t *testing.T) {
 	}
 	lists := occurrence.Build(problem)
 	x := assign.New(3)
+	ws, ok := newWatchState(problem.Clauses, x)
+	if !ok {
+		t.Fatalf("expected ok = true")
+	}
 	x[1] = assign.False
 
-	if status := BCP(problem, lists, x, 1); status != OK {
+	if status := BCP(problem.Clauses, lists, ws, x, 1); status != OK {
 		t.Errorf("status = %v, want OK", status)
 	}
 	if x[2] != assign.Unassigned || x[3] != assign.Unassigned {
 		t.Errorf("x = %v, want variables 2 and 3 still Unassigned", x)
+	}
+}
+
+// TestBCPMovesWatchAwayFromFalsifiedLiteral verifies the core watched-
+// literal behavior: when a watched literal becomes false but another
+// non-false literal is available, BCP moves the watch there instead
+// of reporting unit/contradiction.
+func TestBCPMovesWatchAwayFromFalsifiedLiteral(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	x := assign.New(3)
+	ws, ok := newWatchState(problem.Clauses, x)
+	if !ok {
+		t.Fatalf("expected ok = true")
+	}
+	initialWatch := ws.watch[0]
+
+	x[1] = assign.False
+	if status := BCP(problem.Clauses, lists, ws, x, 1); status != OK {
+		t.Fatalf("status = %v, want OK", status)
+	}
+
+	if ws.watch[0] == initialWatch && (initialWatch[0] == cnf.Literal(1) || initialWatch[1] == cnf.Literal(1)) {
+		t.Errorf("watch[0] = %v still references the falsified literal 1", ws.watch[0])
+	}
+	for _, lit := range ws.watch[0] {
+		if isFalse(lit, x) {
+			t.Errorf("watch[0] = %v contains a false literal after BCP", ws.watch[0])
+		}
 	}
 }
 

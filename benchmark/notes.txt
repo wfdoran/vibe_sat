@@ -7,4 +7,6 @@ Uniform Random-3-SAT, phase transition region, unforced filtered - description (
     uf20-91: 20 variables, 91 clauses - 1000 instances, all satisfiable
     uf50-218 / uuf50-218: 50 variables, 218 clauses - 1000 instances, all sat/unsat
     uf75-325 / uuf75-325: 75 variables, 325 clauses - 100 instances, all sat/unsat
-    uf100-430 / uuf100-430: 100 variables, 430 clauses - 1000 instances, all sat/unsat 
+    uf100-430 / uuf100-430: 100 variables, 430 clauses - 1000 instances, all sat/unsat
+    
+    uf250-1065 / uuf250-1065: 250 variables, 1065 clauses - 100 instances, all sat/unsat 

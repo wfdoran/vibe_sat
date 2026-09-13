@@ -38,13 +38,13 @@ func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment)
 	return false
 }
 
-// unitPropagate repeatedly finds a clause with exactly one unassigned
+// UnitPropagate repeatedly finds a clause with exactly one unassigned
 // literal and forces that literal true, removing now-satisfied
 // clauses and shrinking others as it goes (via simplifyWithAssignment),
 // until no clause is a unit clause or a contradiction is found. It
 // returns whether a contradiction was found, and how many variables
 // were newly fixed.
-func unitPropagate(clauses *[]cnf.Clause, assignment assign.Assignment) (unsat bool, numFixed int) {
+func UnitPropagate(clauses *[]cnf.Clause, assignment assign.Assignment) (unsat bool, numFixed int) {
 	for {
 		if unsat := simplifyWithAssignment(clauses, assignment); unsat {
 			return true, numFixed

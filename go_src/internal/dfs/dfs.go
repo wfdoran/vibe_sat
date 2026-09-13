@@ -1,6 +1,7 @@
 // Package dfs implements the depth-first search SAT solving algorithm
 // used by vibe_sat's "dfs" algorithm: a complete DPLL-style search
-// using boolean constraint propagation (BCP) and a choice of
+// using boolean constraint propagation (BCP, see watch.go for
+// STAGE9.md's watched-literal implementation) and a choice of
 // variable-selection heuristics (see SelectVarVariant). Unlike the
 // hill-climb-family algorithms (internal/hillclimb), this search is
 // complete: if it exhausts its search space without finding a
@@ -17,6 +18,7 @@ import (
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
 	"vibe_sat/internal/occurrence"
+	"vibe_sat/internal/preprocess"
 )
 
 // Status is the outcome of a single call to BCP.
@@ -76,6 +78,18 @@ type Result struct {
 	TimedOut    bool              // true if the search was abandoned due to the time limit, rather than exhausting the search space
 }
 
+// searchNode is one entry of Run's explicit search stack: a partial
+// assignment together with the watched-literal state describing it.
+// Every branch gets its own independent searchNode (see
+// cloneWatchState), matching STAGE5.md's original "stack of full
+// assignments" design -- STAGE9.md's watched literals speed up the
+// BCP call made when creating each node, not the overall search
+// structure.
+type searchNode struct {
+	assignment assign.Assignment
+	watch      *watchState
+}
+
 // Run performs the depth-first search described in STAGE5.md: starting
 // from the fully unassigned partial assignment, repeatedly pop a
 // partial assignment from an explicit stack, pick a variable to
@@ -116,8 +130,41 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
+	// The watched-literal scheme (see watch.go) requires every clause
+	// to have at least two literals: a unit clause has nothing to
+	// "shed" its second watch onto. Bootstrap by unit-propagating the
+	// root once, with the same routine internal/preprocess already
+	// uses for exactly this purpose, before ever building watch
+	// state. When --no-preprocessing is not given, Stage 8's
+	// preprocessing has already done this (so this is a no-op); this
+	// guarantees correctness either way.
+	clauses := append([]cnf.Clause(nil), problem.Clauses...)
+	rootAssignment := assign.New(problem.NumVars)
+	if unsat, _ := preprocess.UnitPropagate(&clauses, rootAssignment); unsat {
+		if verbose >= 1 {
+			fmt.Println("UNSAT")
+		}
+		return Result{Satisfiable: false}
+	}
+	rootWatch, ok := newWatchState(clauses, rootAssignment)
+	if !ok {
+		// Defensive: UnitPropagate above should already rule this
+		// out, since every surviving clause has at least one
+		// unassigned literal (otherwise it would have been a unit
+		// clause caught above, or a contradiction).
+		if verbose >= 1 {
+			fmt.Println("UNSAT")
+		}
+		return Result{Satisfiable: false}
+	}
+
+	// workingProblem wraps the (possibly bootstrap-simplified) clause
+	// set for SelectVar/SelectVarFastPick, which only ever need the
+	// clauses and variable count, not the original Problem value.
+	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
+
 	startTime := time.Now()
-	stack := []assign.Assignment{assign.New(problem.NumVars)}
+	stack := []searchNode{{assignment: rootAssignment, watch: rootWatch}}
 	numNodes := 0
 
 	for len(stack) > 0 {
@@ -129,30 +176,31 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 			return Result{Satisfiable: false, NumNodes: numNodes, TimedOut: true}
 		}
 
-		x := stack[len(stack)-1]
+		node := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
 		var i int
 		if variant == SelectVarFast {
-			i = SelectVarFastPick(problem, x)
+			i = SelectVarFastPick(workingProblem, node.assignment)
 		} else {
-			i = SelectVar(problem, x, rng)
+			i = SelectVar(workingProblem, node.assignment, rng)
 		}
 
 		for _, v := range [2]assign.Value{assign.False, assign.True} {
-			branch := append(assign.Assignment(nil), x...)
-			branch[i] = v
+			branchAssignment := append(assign.Assignment(nil), node.assignment...)
+			branchAssignment[i] = v
+			branchWatch := cloneWatchState(node.watch)
 
-			switch BCP(problem, lists, branch, i) {
+			switch BCP(clauses, lists, branchWatch, branchAssignment, i) {
 			case Contra:
 				continue
 			case Done:
 				if verbose >= 1 {
 					fmt.Println("SAT")
 				}
-				return Result{Satisfiable: true, Assignment: branch, NumNodes: numNodes}
+				return Result{Satisfiable: true, Assignment: branchAssignment, NumNodes: numNodes}
 			case OK:
-				stack = append(stack, branch)
+				stack = append(stack, searchNode{assignment: branchAssignment, watch: branchWatch})
 			}
 		}
 	}
@@ -161,83 +209,6 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 		fmt.Println("UNSAT")
 	}
 	return Result{Satisfiable: false, NumNodes: numNodes}
-}
-
-// BCP applies boolean constraint propagation to partial assignment x,
-// which must already have variable i set to its just-chosen branch
-// value. It repeatedly finds clauses left with exactly one unassigned,
-// not-yet-satisfied literal and forces that literal true, continuing
-// until propagation settles or a contradiction is found. x is
-// modified in place.
-func BCP(problem *cnf.Problem, lists *occurrence.Lists, x assign.Assignment, i int) Status {
-	queue := []int{i}
-	for len(queue) > 0 {
-		v := queue[0]
-		queue = queue[1:]
-
-		// falsified lists the clauses containing the literal of v that
-		// just became false because of v's new assignment: those are
-		// the only clauses whose status could have changed.
-		var falsified []int
-		if x[v] == assign.True {
-			falsified = lists.Negative[v]
-		} else {
-			falsified = lists.Positive[v]
-		}
-
-		for _, c := range falsified {
-			satisfied, contradiction, unitLiteral := evaluateClause(problem.Clauses[c], x)
-			if contradiction {
-				return Contra
-			}
-			if satisfied || unitLiteral == nil {
-				continue
-			}
-			forcedVar := unitLiteral.Var()
-			if unitLiteral.IsNegative() {
-				x[forcedVar] = assign.False
-			} else {
-				x[forcedVar] = assign.True
-			}
-			queue = append(queue, forcedVar)
-		}
-	}
-
-	for _, value := range x[1:] {
-		if value == assign.Unassigned {
-			return OK
-		}
-	}
-	return Done
-}
-
-// evaluateClause examines clause under partial assignment x and
-// reports: whether it is already satisfied by some literal; whether
-// it is a contradiction (no unassigned literals, and none true); and,
-// if it has exactly one unassigned literal and is not satisfied, that
-// literal (the one BCP must now force true), or nil otherwise.
-func evaluateClause(clause cnf.Clause, x assign.Assignment) (satisfied bool, contradiction bool, unitLiteral *cnf.Literal) {
-	unassignedCount := 0
-	var lastUnassigned cnf.Literal
-	for _, lit := range clause {
-		value := x[lit.Var()]
-		if value == assign.Unassigned {
-			unassignedCount++
-			lastUnassigned = lit
-			continue
-		}
-		if literalIsTrue(lit, value) {
-			return true, false, nil
-		}
-	}
-	switch unassignedCount {
-	case 0:
-		return false, true, nil
-	case 1:
-		return false, false, &lastUnassigned
-	default:
-		return false, false, nil
-	}
 }
 
 // literalIsTrue reports whether lit evaluates to true when its

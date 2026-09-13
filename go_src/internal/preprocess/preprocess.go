@@ -111,7 +111,7 @@ func Run(problem *cnf.Problem, verbose int) *Result {
 	for round := 0; round < maxRounds; round++ {
 		changed := false
 
-		unsat, unitsFixed := unitPropagate(&clauses, assignment)
+		unsat, unitsFixed := UnitPropagate(&clauses, assignment)
 		stats.UnitsPropagated += unitsFixed
 		if unsat {
 			return &Result{OriginalNumVars: problem.NumVars, Unsat: true, Stats: stats}
