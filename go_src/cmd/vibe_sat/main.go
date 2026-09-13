@@ -121,10 +121,14 @@ func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
 }
 
 // runDFS runs the depth-first search algorithm against problem using
-// the optional time limit and verbosity level given in args, then
-// writes out the result if a satisfying assignment was found. Unlike
-// runHillClimb/runWalkSat, a search that exhausts its space without a
-// time limit produces a proven UNSAT verdict, not just "not found".
+// the optional time limit, SelectVar variant, and verbosity level
+// given in args, then writes out the result if a satisfying
+// assignment was found. Unlike runHillClimb/runWalkSat, a search that
+// exhausts its space without a time limit produces a proven UNSAT
+// verdict, not just "not found". Per STAGE6.md, args.AlgParams[0] (if
+// given) selects the SelectVar variant: 0 (the default) for the
+// weighted heuristic from STAGE5.md, 1 for the cheaper static-order
+// heuristic from STAGE6.md.
 func runDFS(problem *cnf.Problem, args *cliargs.Args) {
 	lists := occurrence.Build(problem)
 	rng := newSeededRand()
@@ -135,7 +139,12 @@ func runDFS(problem *cnf.Problem, args *cliargs.Args) {
 		timeLimit = &limit
 	}
 
-	result := dfs.Run(problem, lists, timeLimit, rng, args.Verbose)
+	variant := dfs.SelectVarWeighted
+	if len(args.AlgParams) == 1 {
+		variant = dfs.SelectVarVariant(args.AlgParams[0])
+	}
+
+	result := dfs.Run(problem, lists, timeLimit, variant, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(result.Assignment, problem.NumVars, args)

@@ -1,6 +1,7 @@
 package cliargs
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -282,7 +283,31 @@ func TestParseDFSAcceptsTimeLimit(t *testing.T) {
 func TestParseDFSRejectsAlgParams(t *testing.T) {
 	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs", "--alg-params=5"})
 	if err == nil {
-		t.Fatalf("expected error for --alg-params with --algorithm=dfs")
+		t.Fatalf("expected error for an out-of-range --alg-params value with --algorithm=dfs")
+	}
+}
+
+// TestParseDFSAcceptsSelectVarVariant verifies that --algorithm=dfs
+// accepts a single --alg-params value of 0 or 1, selecting which
+// SelectVar heuristic to use (STAGE6.md).
+func TestParseDFSAcceptsSelectVarVariant(t *testing.T) {
+	for _, variant := range []int64{0, 1} {
+		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs", "--alg-params", strconv.FormatInt(variant, 10)})
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error for --alg-params=%d: %v", variant, err)
+		}
+		if len(args.AlgParams) != 1 || args.AlgParams[0] != variant {
+			t.Errorf("AlgParams = %v, want [%d]", args.AlgParams, variant)
+		}
+	}
+}
+
+// TestParseDFSRejectsMultipleAlgParams verifies that --algorithm=dfs
+// rejects more than one --alg-params value.
+func TestParseDFSRejectsMultipleAlgParams(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs", "--alg-params", "0", "1"})
+	if err == nil {
+		t.Fatalf("expected error for more than one alg-param with algorithm=dfs")
 	}
 }
 

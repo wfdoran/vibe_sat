@@ -43,18 +43,28 @@ Options:
   --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
         Algorithm-specific parameters (1 to 3 integer values); at
         least one of --alg-params or --time-limit-secs is required for
-        "hc"/"ws" (not used at all by "dfs", which takes no
-        parameters). The meaning of each value depends on --algorithm:
-          hc  val1 = number of random restarts to perform.
-          ws  val1 = number of random restarts ("tries") to perform.
-              val2 = max flips per try before giving up and starting a
-                     new try (default 10000 if omitted).
-              val3 = noise percent, 0-100: the chance of flipping a
-                     uniformly random variable of the chosen
-                     unsatisfied clause instead of the one that breaks
-                     the fewest other clauses (default 50 if omitted).
-              Values are positional: to set val2 or val3 you must also
-              supply every value before it.
+        "hc"/"ws". The meaning of each value depends on --algorithm:
+          hc   val1 = number of random restarts to perform.
+          ws   val1 = number of random restarts ("tries") to perform.
+               val2 = max flips per try before giving up and starting
+                      a new try (default 10000 if omitted).
+               val3 = noise percent, 0-100: the chance of flipping a
+                      uniformly random variable of the chosen
+                      unsatisfied clause instead of the one that
+                      breaks the fewest other clauses (default 50 if
+                      omitted).
+               Values are positional: to set val2 or val3 you must
+               also supply every value before it.
+          dfs  val1 = which SelectVar heuristic to use (STAGE6.md):
+                 0 = the default weighted heuristic from STAGE5.md
+                     (looks at every not-yet-satisfied clause on every
+                     node; more expensive, tends to keep the search
+                     tree smaller).
+                 1 = a cheap static-order heuristic that just picks
+                     the lowest-numbered unassigned variable, looking
+                     at no clause contents at all; much faster per
+                     node, but tends to grow the search tree.
+               Optional; defaults to 0 if --alg-params is not given.
 
   --help, -h
         Print this help message and exit.

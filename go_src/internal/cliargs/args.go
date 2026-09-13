@@ -267,8 +267,11 @@ func validate(args *Args, rawValues map[string][]string) error {
 		}
 
 	case "dfs":
-		if len(args.AlgParams) > 0 {
-			return fmt.Errorf("for --algorithm=dfs, --alg-params is not used (this algorithm takes no parameters)")
+		if len(args.AlgParams) > 1 {
+			return fmt.Errorf("for --algorithm=dfs, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)")
+		}
+		if len(args.AlgParams) == 1 && args.AlgParams[0] != 0 && args.AlgParams[0] != 1 {
+			return fmt.Errorf("for --algorithm=dfs, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
 			return fmt.Errorf("--time-limit-secs must be a positive integer")

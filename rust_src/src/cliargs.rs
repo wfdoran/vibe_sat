@@ -101,18 +101,28 @@ Options:
   --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
         Algorithm-specific parameters (1 to 3 integer values); at
         least one of --alg-params or --time-limit-secs is required for
-        "hc"/"ws" (not used at all by "dfs", which takes no
-        parameters). The meaning of each value depends on --algorithm:
-          hc  val1 = number of random restarts to perform.
-          ws  val1 = number of random restarts ("tries") to perform.
-              val2 = max flips per try before giving up and starting a
-                     new try (default 10000 if omitted).
-              val3 = noise percent, 0-100: the chance of flipping a
-                     uniformly random variable of the chosen
-                     unsatisfied clause instead of the one that breaks
-                     the fewest other clauses (default 50 if omitted).
-              Values are positional: to set val2 or val3 you must also
-              supply every value before it.
+        "hc"/"ws". The meaning of each value depends on --algorithm:
+          hc   val1 = number of random restarts to perform.
+          ws   val1 = number of random restarts ("tries") to perform.
+               val2 = max flips per try before giving up and starting
+                      a new try (default 10000 if omitted).
+               val3 = noise percent, 0-100: the chance of flipping a
+                      uniformly random variable of the chosen
+                      unsatisfied clause instead of the one that
+                      breaks the fewest other clauses (default 50 if
+                      omitted).
+               Values are positional: to set val2 or val3 you must
+               also supply every value before it.
+          dfs  val1 = which SelectVar heuristic to use (STAGE6.md):
+                 0 = the default weighted heuristic from STAGE5.md
+                     (looks at every not-yet-satisfied clause on every
+                     node; more expensive, tends to keep the search
+                     tree smaller).
+                 1 = a cheap static-order heuristic that just picks
+                     the lowest-numbered unassigned variable, looking
+                     at no clause contents at all; much faster per
+                     node, but tends to grow the search tree.
+               Optional; defaults to 0 if --alg-params is not given.
 
   --help, -h
         Print this help message and exit.
@@ -215,11 +225,19 @@ fn validate(args: &Args) -> Result<(), String> {
         }
 
         "dfs" => {
-            if args.alg_params.is_some() {
-                return Err(
-                    "for --algorithm=dfs, --alg-params is not used (this algorithm takes no parameters)"
-                        .to_string(),
-                );
+            if let Some(params) = &args.alg_params {
+                if params.len() > 1 {
+                    return Err(
+                        "for --algorithm=dfs, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)"
+                            .to_string(),
+                    );
+                }
+                if params[0] != 0 && params[0] != 1 {
+                    return Err(
+                        "for --algorithm=dfs, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)"
+                            .to_string(),
+                    );
+                }
             }
             if let Some(limit) = args.time_limit_secs
                 && limit < 1
@@ -452,6 +470,36 @@ mod tests {
             "--input=problem.cnf",
             "--algorithm=dfs",
             "--alg-params=5",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_dfs_accepts_select_var_variant() {
+        for variant in [0i64, 1i64] {
+            let args = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=dfs",
+                "--alg-params",
+                &variant.to_string(),
+            ])
+            .unwrap_or_else(|e| {
+                panic!("Parse returned unexpected error for --alg-params={variant}: {e}")
+            });
+            assert_eq!(args.alg_params, Some(vec![variant]));
+        }
+    }
+
+    #[test]
+    fn test_parse_dfs_rejects_multiple_alg_params() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=dfs",
+            "--alg-params",
+            "0",
+            "1",
         ]);
         assert!(result.is_err());
     }

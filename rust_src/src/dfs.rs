@@ -1,10 +1,11 @@
 //! Implements the depth-first search SAT solving algorithm used by
 //! vibe_sat's "dfs" algorithm: a complete DPLL-style search using
-//! boolean constraint propagation (BCP) and a weighted
-//! variable-selection heuristic. Unlike the hill-climb-family
-//! algorithms ([`crate::hillclimb`]), this search is complete: if it
-//! exhausts its search space without finding a satisfying assignment,
-//! the problem is proven UNSAT, not merely "not found yet".
+//! boolean constraint propagation (BCP) and a choice of
+//! variable-selection heuristics (see [`SelectVarVariant`]). Unlike
+//! the hill-climb-family algorithms ([`crate::hillclimb`]), this
+//! search is complete: if it exhausts its search space without
+//! finding a satisfying assignment, the problem is proven UNSAT, not
+//! merely "not found yet".
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,32 @@ pub enum Status {
     /// The assignment is now complete and, by construction, satisfies
     /// every clause.
     Done,
+}
+
+/// Identifies which `select_var*` heuristic [`run`] should use to
+/// pick the next branching variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectVarVariant {
+    /// The default heuristic from STAGE5.md: for every
+    /// not-yet-satisfied clause, every unassigned variable in it earns
+    /// `0.7^(n-2)` (`n` = that clause's unassigned literal count), and
+    /// the highest-scoring variable is picked. It costs time
+    /// proportional to the total size of the formula on every single
+    /// node (it rescans every clause), in exchange for making a more
+    /// informed choice that tends to keep the search tree small.
+    #[default]
+    Weighted,
+    /// The cheaper alternative from STAGE6.md: picks the
+    /// lowest-numbered still-unassigned variable, looking at no clause
+    /// contents at all. This is the "static/lexicographic ordering"
+    /// branching rule discussed in the SAT branching heuristic
+    /// literature (e.g. J. Marques-Silva, "The Impact of Branching
+    /// Heuristics in Propositional Satisfiability Algorithms," 1999)
+    /// as the cheap baseline that smarter dynamic heuristics are
+    /// compared against: it costs at most O(num_vars) per node with no
+    /// clause scanning, but ignores problem structure entirely, which
+    /// typically grows the search tree substantially.
+    Fast,
 }
 
 /// How often the time limit is checked, in number of search nodes,
@@ -62,23 +89,28 @@ pub struct SolveResult {
 /// stack to be explored later. If the stack empties without ever
 /// completing an assignment, `problem` is proven unsatisfiable.
 ///
+/// `variant` selects which of [`select_var`]/[`select_var_fast_pick`]
+/// is used to pick the branching variable at every node (see
+/// [`SelectVarVariant`]).
+///
 /// If `time_limit` is `Some`, the search gives up and reports an
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
 /// once it is exceeded, checked only periodically (see
 /// [`TIME_CHECK_INTERVAL`]) rather than after every node. `rng`
-/// supplies the randomness [`select_var`] uses to break ties, and
-/// `verbose` controls progress output: at verbose >= 1, "dfs" and the
-/// configured time limit (if any) are printed before searching, and
-/// "SAT", "UNSAT", or "UNKNOWN" (on timeout) are printed after.
+/// supplies the randomness the selected heuristic uses to break ties,
+/// and `verbose` controls progress output: at verbose >= 1, "dfs" and
+/// the configured time limit (if any) are printed before searching,
+/// and "SAT", "UNSAT", or "UNKNOWN" (on timeout) are printed after.
 pub fn run<R: Rng>(
     problem: &Problem,
     lists: &Lists,
     time_limit: Option<Duration>,
+    variant: SelectVarVariant,
     rng: &mut R,
     verbose: i32,
 ) -> SolveResult {
     if verbose >= 1 {
-        println!("dfs: {}", describe_params(time_limit));
+        println!("dfs: {}", describe_params(time_limit, variant));
     }
 
     // A problem with no variables can only contain empty clauses (no
@@ -120,7 +152,10 @@ pub fn run<R: Rng>(
             };
         }
 
-        let i = select_var(problem, &x, rng);
+        let i = match variant {
+            SelectVarVariant::Fast => select_var_fast_pick(problem, &x),
+            SelectVarVariant::Weighted => select_var(problem, &x, rng),
+        };
 
         for &v in &[Value::False, Value::True] {
             let mut branch = x.clone();
@@ -301,12 +336,30 @@ pub fn select_var<R: Rng>(problem: &Problem, x: &Assignment, rng: &mut R) -> usi
     best_var.expect("at least one unassigned variable must exist when select_var is called")
 }
 
-/// Formats the configured time limit for the "dfs:" announcement
-/// printed at verbose level 1.
-fn describe_params(time_limit: Option<Duration>) -> String {
+/// Implements [`SelectVarVariant::Fast`]: returns the lowest-numbered
+/// variable that is still `Unassigned` in `x`, without examining any
+/// clause. There is nothing to break ties between (the choice is
+/// always unique), so unlike [`select_var`] this needs no random
+/// source.
+pub fn select_var_fast_pick(problem: &Problem, x: &Assignment) -> usize {
+    (1..=problem.num_vars)
+        .find(|&v| x[v] == Value::Unassigned)
+        .expect("at least one unassigned variable must exist when select_var_fast_pick is called")
+}
+
+/// Formats the configured time limit and `SelectVar` variant for the
+/// "dfs:" announcement printed at verbose level 1.
+fn describe_params(time_limit: Option<Duration>, variant: SelectVarVariant) -> String {
+    let variant_code = match variant {
+        SelectVarVariant::Weighted => 0,
+        SelectVarVariant::Fast => 1,
+    };
     match time_limit {
-        Some(limit) => format!("time_limit_secs={}", limit.as_secs()),
-        None => "(no limit)".to_string(),
+        Some(limit) => format!(
+            "select_var={variant_code} time_limit_secs={}",
+            limit.as_secs()
+        ),
+        None => format!("select_var={variant_code}"),
     }
 }
 
@@ -436,6 +489,65 @@ mod tests {
     }
 
     #[test]
+    fn test_select_var_fast_pick_returns_lowest_unassigned() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1, 4]],
+        };
+        let mut x = assignment::new(4);
+        x[1] = Value::True;
+        x[2] = Value::False;
+
+        assert_eq!(select_var_fast_pick(&problem, &x), 3);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_select_var_fast_pick_panics_when_all_assigned() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![],
+        };
+        let mut x = assignment::new(2);
+        x[1] = Value::True;
+        x[2] = Value::False;
+
+        select_var_fast_pick(&problem, &x);
+    }
+
+    #[test]
+    fn test_run_with_fast_select_var_finds_satisfiable_formula() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
+        };
+        let lists = crate::occurrence::build(&problem);
+        let mut rng = StdRng::seed_from_u64(8);
+
+        let result = run(&problem, &lists, None, SelectVarVariant::Fast, &mut rng, 0);
+
+        assert!(result.satisfiable);
+        for (ci, clause) in problem.clauses.iter().enumerate() {
+            let satisfied = clause
+                .iter()
+                .any(|&lit| assignment::literal_is_true(&result.assignment, lit));
+            assert!(satisfied, "clause {ci} ({clause:?}) not satisfied");
+        }
+    }
+
+    #[test]
+    fn test_run_with_fast_select_var_proves_unsatisfiable_pigeonhole() {
+        let problem = pigeonhole_problem(4, 3);
+        let lists = crate::occurrence::build(&problem);
+        let mut rng = StdRng::seed_from_u64(9);
+
+        let result = run(&problem, &lists, None, SelectVarVariant::Fast, &mut rng, 0);
+
+        assert!(!result.satisfiable);
+        assert!(!result.timed_out);
+    }
+
+    #[test]
     fn test_run_finds_satisfiable_formula() {
         let problem = Problem {
             num_vars: 3,
@@ -444,7 +556,14 @@ mod tests {
         let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(3);
 
-        let result = run(&problem, &lists, None, &mut rng, 0);
+        let result = run(
+            &problem,
+            &lists,
+            None,
+            SelectVarVariant::Weighted,
+            &mut rng,
+            0,
+        );
 
         assert!(result.satisfiable);
         for (ci, clause) in problem.clauses.iter().enumerate() {
@@ -465,7 +584,14 @@ mod tests {
         let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(4);
 
-        let result = run(&problem, &lists, None, &mut rng, 0);
+        let result = run(
+            &problem,
+            &lists,
+            None,
+            SelectVarVariant::Weighted,
+            &mut rng,
+            0,
+        );
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -502,7 +628,14 @@ mod tests {
         let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(5);
 
-        let result = run(&problem, &lists, None, &mut rng, 0);
+        let result = run(
+            &problem,
+            &lists,
+            None,
+            SelectVarVariant::Weighted,
+            &mut rng,
+            0,
+        );
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -520,6 +653,7 @@ mod tests {
             &sat_problem,
             &crate::occurrence::build(&sat_problem),
             None,
+            SelectVarVariant::Weighted,
             &mut rng,
             0,
         );
@@ -533,6 +667,7 @@ mod tests {
             &unsat_problem,
             &crate::occurrence::build(&unsat_problem),
             None,
+            SelectVarVariant::Weighted,
             &mut rng,
             0,
         );
@@ -546,7 +681,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let tiny = Duration::from_nanos(1);
 
-        let result = run(&problem, &lists, Some(tiny), &mut rng, 0);
+        let result = run(
+            &problem,
+            &lists,
+            Some(tiny),
+            SelectVarVariant::Weighted,
+            &mut rng,
+            0,
+        );
 
         assert!(
             result.timed_out,

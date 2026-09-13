@@ -1,10 +1,11 @@
 // Package dfs implements the depth-first search SAT solving algorithm
 // used by vibe_sat's "dfs" algorithm: a complete DPLL-style search
-// using boolean constraint propagation (BCP) and a weighted
-// variable-selection heuristic. Unlike the hill-climb-family
-// algorithms (internal/hillclimb), this search is complete: if it
-// exhausts its search space without finding a satisfying assignment,
-// the problem is proven UNSAT, not merely "not found yet".
+// using boolean constraint propagation (BCP) and a choice of
+// variable-selection heuristics (see SelectVarVariant). Unlike the
+// hill-climb-family algorithms (internal/hillclimb), this search is
+// complete: if it exhausts its search space without finding a
+// satisfying assignment, the problem is proven UNSAT, not merely "not
+// found yet".
 package dfs
 
 import (
@@ -31,6 +32,32 @@ const (
 	// Done means the assignment is now complete and (by construction)
 	// satisfies every clause.
 	Done
+)
+
+// SelectVarVariant identifies which SelectVar heuristic Run should
+// use to pick the next branching variable.
+type SelectVarVariant int
+
+const (
+	// SelectVarWeighted is the default heuristic from STAGE5.md: for
+	// every not-yet-satisfied clause, every unassigned variable in it
+	// earns 0.7^(n-2) (n = that clause's unassigned literal count),
+	// and the highest-scoring variable is picked. It costs time
+	// proportional to the total size of the formula on every single
+	// node (it rescans every clause), in exchange for making a more
+	// informed choice that tends to keep the search tree small.
+	SelectVarWeighted SelectVarVariant = 0
+	// SelectVarFast is the cheaper alternative from STAGE6.md: it
+	// picks the lowest-numbered still-unassigned variable, looking at
+	// no clause contents at all. This is the "static/lexicographic
+	// ordering" branching rule discussed in the SAT branching
+	// heuristic literature (e.g. J. Marques-Silva, "The Impact of
+	// Branching Heuristics in Propositional Satisfiability
+	// Algorithms," 1999) as the cheap baseline that smarter dynamic
+	// heuristics are compared against: it costs at most O(NumVars)
+	// per node with no clause scanning, but ignores problem structure
+	// entirely, which typically grows the search tree substantially.
+	SelectVarFast SelectVarVariant = 1
 )
 
 // timeCheckInterval controls how often the time limit is checked
@@ -60,17 +87,20 @@ type Result struct {
 // explored later. If the stack empties without ever completing an
 // assignment, problem is proven unsatisfiable.
 //
+// variant selects which of SelectVar/SelectVarFast is used to pick
+// the branching variable at every node (see SelectVarVariant).
+//
 // If timeLimit is non-nil, the search gives up and reports an
 // inconclusive result (Satisfiable == false, TimedOut == true) once
 // it is exceeded, checked only periodically (see timeCheckInterval)
-// rather than after every node. rng supplies the randomness
-// SelectVar uses to break ties, and verbose controls progress output:
-// at verbose >= 1, "dfs" and the configured time limit (if any) are
-// printed before searching, and "SAT", "UNSAT", or "UNKNOWN" (on
-// timeout) are printed after.
-func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration, rng *rand.Rand, verbose int) Result {
+// rather than after every node. rng supplies the randomness the
+// selected heuristic uses to break ties, and verbose controls
+// progress output: at verbose >= 1, "dfs" and the configured time
+// limit (if any) are printed before searching, and "SAT", "UNSAT", or
+// "UNKNOWN" (on timeout) are printed after.
+func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration, variant SelectVarVariant, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
-		fmt.Println("dfs:", describeParams(timeLimit))
+		fmt.Println("dfs:", describeParams(timeLimit, variant))
 	}
 
 	// A problem with no variables can only contain empty clauses (no
@@ -102,7 +132,12 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 		x := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		i := SelectVar(problem, x, rng)
+		var i int
+		if variant == SelectVarFast {
+			i = SelectVarFastPick(problem, x)
+		} else {
+			i = SelectVar(problem, x, rng)
+		}
 
 		for _, v := range [2]assign.Value{assign.False, assign.True} {
 			branch := append(assign.Assignment(nil), x...)
@@ -275,11 +310,26 @@ func SelectVar(problem *cnf.Problem, x assign.Assignment, rng *rand.Rand) int {
 	return bestVar
 }
 
-// describeParams formats the configured time limit for the "dfs:"
-// announcement printed at verbose level 1.
-func describeParams(timeLimit *time.Duration) string {
-	if timeLimit == nil {
-		return "(no limit)"
+// SelectVarFastPick implements SelectVarFast (see SelectVarVariant):
+// it returns the lowest-numbered variable that is still Unassigned in
+// x, without examining any clause. There is nothing to break ties
+// between (the choice is always unique), so unlike SelectVar this
+// needs no random source.
+func SelectVarFastPick(problem *cnf.Problem, x assign.Assignment) int {
+	for v := 1; v <= problem.NumVars; v++ {
+		if x[v] == assign.Unassigned {
+			return v
+		}
 	}
-	return fmt.Sprintf("time_limit_secs=%d", int(timeLimit.Seconds()))
+	return -1
+}
+
+// describeParams formats the configured time limit and SelectVar
+// variant for the "dfs:" announcement printed at verbose level 1.
+func describeParams(timeLimit *time.Duration, variant SelectVarVariant) string {
+	description := fmt.Sprintf("select_var=%d", variant)
+	if timeLimit != nil {
+		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
+	}
+	return description
 }

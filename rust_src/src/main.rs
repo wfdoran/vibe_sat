@@ -130,11 +130,14 @@ fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
 }
 
 /// Runs the depth-first search algorithm against `problem` using the
-/// optional time limit and verbosity level given in `args`, then
-/// writes out the result if a satisfying assignment was found. Unlike
-/// `run_hill_climb`/`run_walksat`, a search that exhausts its space
-/// without a time limit produces a proven UNSAT verdict, not just
-/// "not found".
+/// optional time limit, `SelectVar` variant, and verbosity level given
+/// in `args`, then writes out the result if a satisfying assignment
+/// was found. Unlike `run_hill_climb`/`run_walksat`, a search that
+/// exhausts its space without a time limit produces a proven UNSAT
+/// verdict, not just "not found". Per STAGE6.md, `args.alg_params[0]`
+/// (if given) selects the `SelectVar` variant: 0 (the default) for the
+/// weighted heuristic from STAGE5.md, 1 for the cheaper static-order
+/// heuristic from STAGE6.md.
 fn run_dfs(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     let lists = occurrence::build(problem);
     let mut rng = StdRng::from_rng(&mut rand::rng());
@@ -143,7 +146,12 @@ fn run_dfs(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
         .time_limit_secs
         .map(|secs| Duration::from_secs(secs as u64));
 
-    let result = dfs::run(problem, &lists, time_limit, &mut rng, args.verbose);
+    let variant = match args.alg_params.as_deref() {
+        Some([1]) => dfs::SelectVarVariant::Fast,
+        _ => dfs::SelectVarVariant::Weighted,
+    };
+
+    let result = dfs::run(problem, &lists, time_limit, variant, &mut rng, args.verbose);
 
     if result.satisfiable {
         write_solution(&result.assignment, problem.num_vars, args)?;

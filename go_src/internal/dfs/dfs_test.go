@@ -173,6 +173,94 @@ func TestSelectVarOnlyReturnsUnassignedVariables(t *testing.T) {
 	}
 }
 
+// TestSelectVarFastPickReturnsLowestUnassigned verifies that
+// SelectVarFastPick returns the smallest-numbered unassigned
+// variable, ignoring clause contents entirely.
+func TestSelectVarFastPickReturnsLowestUnassigned(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 4,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1), cnf.Literal(4)},
+		},
+	}
+	x := assign.New(4)
+	x[1] = assign.True
+	x[2] = assign.False
+
+	if v := SelectVarFastPick(problem, x); v != 3 {
+		t.Errorf("SelectVarFastPick() = %d, want 3", v)
+	}
+}
+
+// TestSelectVarFastPickSkipsAllAssigned verifies that
+// SelectVarFastPick returns -1 when every variable is already
+// assigned (the degenerate case; Run never actually reaches this for
+// NumVars >= 1, since BCP-returned OK states always have at least one
+// unassigned variable).
+func TestSelectVarFastPickSkipsAllAssigned(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2}
+	x := assign.New(2)
+	x[1] = assign.True
+	x[2] = assign.False
+
+	if v := SelectVarFastPick(problem, x); v != -1 {
+		t.Errorf("SelectVarFastPick() = %d, want -1", v)
+	}
+}
+
+// TestRunWithFastSelectVarFindsSatisfiableFormula verifies that Run
+// still finds a correct satisfying assignment when configured to use
+// SelectVarFast instead of the default weighted heuristic.
+func TestRunWithFastSelectVarFindsSatisfiableFormula(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1), cnf.Literal(2)},
+			{cnf.Literal(-1), cnf.Literal(3)},
+			{cnf.Literal(-2), cnf.Literal(-3)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	rng := rand.New(rand.NewPCG(8, 8))
+
+	result := Run(problem, lists, nil, SelectVarFast, rng, 0)
+
+	if !result.Satisfiable {
+		t.Fatalf("expected Satisfiable = true")
+	}
+	for ci, clause := range problem.Clauses {
+		satisfied := false
+		for _, lit := range clause {
+			if result.Assignment.LiteralIsTrue(lit) {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			t.Errorf("clause %d (%v) not satisfied by returned assignment %v", ci, clause, result.Assignment)
+		}
+	}
+}
+
+// TestRunWithFastSelectVarProvesUnsatisfiablePigeonhole verifies that
+// Run, configured to use SelectVarFast, still correctly proves the
+// pigeonhole instance unsatisfiable (the cheaper heuristic must still
+// be sound, even though it typically explores a larger tree).
+func TestRunWithFastSelectVarProvesUnsatisfiablePigeonhole(t *testing.T) {
+	problem := pigeonholeProblem(t, 4, 3)
+	lists := occurrence.Build(problem)
+	rng := rand.New(rand.NewPCG(9, 9))
+
+	result := Run(problem, lists, nil, SelectVarFast, rng, 0)
+
+	if result.Satisfiable {
+		t.Fatalf("expected Satisfiable = false for an unsatisfiable pigeonhole instance")
+	}
+	if result.TimedOut {
+		t.Errorf("expected TimedOut = false (a genuine UNSAT proof, not a timeout)")
+	}
+}
+
 // TestRunFindsSatisfiableFormula verifies that Run finds a satisfying
 // assignment for a small satisfiable formula and that the returned
 // assignment actually satisfies every clause.
@@ -188,7 +276,7 @@ func TestRunFindsSatisfiableFormula(t *testing.T) {
 	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(3, 3))
 
-	result := Run(problem, lists, nil, rng, 0)
+	result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
 
 	if !result.Satisfiable {
 		t.Fatalf("expected Satisfiable = true")
@@ -222,7 +310,7 @@ func TestRunProvesUnsatisfiableFormula(t *testing.T) {
 	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(4, 4))
 
-	result := Run(problem, lists, nil, rng, 0)
+	result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatalf("expected Satisfiable = false")
@@ -241,7 +329,7 @@ func TestRunProvesUnsatisfiablePigeonhole(t *testing.T) {
 	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(5, 5))
 
-	result := Run(problem, lists, nil, rng, 0)
+	result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatalf("expected Satisfiable = false for an unsatisfiable pigeonhole instance")
@@ -290,12 +378,12 @@ func TestRunHandlesZeroVariableProblems(t *testing.T) {
 	rng := rand.New(rand.NewPCG(6, 6))
 
 	satProblem := &cnf.Problem{NumVars: 0, Clauses: nil}
-	if result := Run(satProblem, occurrence.Build(satProblem), nil, rng, 0); !result.Satisfiable {
+	if result := Run(satProblem, occurrence.Build(satProblem), nil, SelectVarWeighted, rng, 0); !result.Satisfiable {
 		t.Errorf("expected a 0-variable, 0-clause problem to be Satisfiable")
 	}
 
 	unsatProblem := &cnf.Problem{NumVars: 0, Clauses: []cnf.Clause{{}}}
-	if result := Run(unsatProblem, occurrence.Build(unsatProblem), nil, rng, 0); result.Satisfiable {
+	if result := Run(unsatProblem, occurrence.Build(unsatProblem), nil, SelectVarWeighted, rng, 0); result.Satisfiable {
 		t.Errorf("expected a 0-variable problem with an empty clause to be unsatisfiable")
 	}
 }
@@ -312,7 +400,7 @@ func TestRunRespectsTimeLimit(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
 	tiny := 1 * time.Nanosecond
 
-	result := Run(problem, lists, &tiny, rng, 0)
+	result := Run(problem, lists, &tiny, SelectVarWeighted, rng, 0)
 
 	if !result.TimedOut {
 		t.Fatalf("expected TimedOut = true with a 1ns time limit")
