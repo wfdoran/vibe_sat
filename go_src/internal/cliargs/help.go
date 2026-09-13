@@ -92,18 +92,46 @@ Options:
                LRB and the older structural heuristics on this
                project's actual (uniform random 3-SAT) benchmark set,
                so that measurement is what this default follows.
-               val2 = an optional learned-clause database memory
-                     limit (STAGE12.md): once the estimated size of
-                     the database exceeds this, the least "active"
-                     learned clauses are periodically deleted
-                     (MiniSat-style) to keep it under control. Either
-                     a plain integer (a number of bytes) or an
-                     integer immediately followed by one of "k",
-                     "kb", "m", "mb", "g", or "gb" (case-insensitive),
-                     e.g. "--alg-params 2 100MB". Omitted by default,
-                     in which case the database grows without bound.
-                     Note: val1 must be given to set val2, even if
-                     val1 is just the default (2).
+               val2 = restart strategy (STAGE15.md): periodically
+                     abandons the current decision stack and starts
+                     over from the root, keeping every learned clause
+                     collected so far -- this escapes runs of bad
+                     early decisions.
+                 0 = no restarts.
+                 1 = the Luby, Sinclair & Zuckerman sequence: restart
+                     intervals of 1, 1, 2, 1, 1, 2, 4, ... (in
+                     conflicts, times an internal scale constant).
+                 2 = a quadratic "polynomial" growth sequence: restart
+                     intervals of 1^2, 2^2, 3^2, 4^2, ... (in
+                     conflicts, times an internal scale constant).
+                 3 = the true geometric growth sequence: restart
+                     intervals grow by a constant ratio each time (in
+                     conflicts, times internal scale constants) --
+                     this is what "geometric restarts" conventionally
+                     means in the SAT literature (val2=2's sequence
+                     was originally, incorrectly, called "geometric";
+                     see reports/REPORT15.md).
+               Optional; defaults to 2 (polynomial) if not given: this
+               project's own benchmark comparison (reports/REPORT15.md)
+               found the polynomial schedule clearly ahead of no
+               restarts and of Luby on this project's actual benchmark
+               set, especially for proving UNSAT. Note: val1 must be
+               given to set val2, even if val1 is just the default
+               (2).
+               val3 = an optional learned-clause database memory
+                     limit (STAGE12.md; this was val2 before
+                     STAGE15.md added the restart strategy above):
+                     once the estimated size of the database exceeds
+                     this, the least "active" learned clauses are
+                     periodically deleted (MiniSat-style) to keep it
+                     under control. Either a plain integer (a number
+                     of bytes) or an integer immediately followed by
+                     one of "k", "kb", "m", "mb", "g", or "gb"
+                     (case-insensitive), e.g. "--alg-params 2 1 100MB".
+                     Omitted by default, in which case the database
+                     grows without bound. Note: val1 and val2 must
+                     both be given to set val3, even if they are just
+                     the defaults (2 and 1).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal

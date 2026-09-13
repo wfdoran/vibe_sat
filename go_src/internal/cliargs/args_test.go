@@ -363,19 +363,48 @@ func TestParseCDCLRejectsOutOfRangeAlgParams(t *testing.T) {
 	}
 }
 
-// TestParseCDCLRejectsThreeAlgParams verifies that --algorithm=cdcl
-// rejects more than two --alg-params values (STAGE12.md adds a second
-// value, the memory limit, but no third).
-func TestParseCDCLRejectsThreeAlgParams(t *testing.T) {
-	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "100", "5"})
+// TestParseCDCLRejectsFourAlgParams verifies that --algorithm=cdcl
+// rejects more than three --alg-params values (STAGE15.md's restart
+// strategy makes three the maximum: SelectVar variant, restart
+// strategy, memory limit).
+func TestParseCDCLRejectsFourAlgParams(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "1", "100", "5"})
 	if err == nil {
-		t.Fatalf("expected error for three alg-params with algorithm=cdcl")
+		t.Fatalf("expected error for four alg-params with algorithm=cdcl")
+	}
+}
+
+// TestParseCDCLAcceptsRestartStrategy verifies that --algorithm=cdcl
+// accepts a second --alg-params value of 0, 1, 2, or 3, selecting the
+// restart strategy (STAGE15.md): 0 = none, 1 = Luby, 2 = polynomial,
+// 3 = geometric.
+func TestParseCDCLAcceptsRestartStrategy(t *testing.T) {
+	for _, restart := range []int64{0, 1, 2, 3} {
+		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", strconv.FormatInt(restart, 10)})
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error for --alg-params 2 %d: %v", restart, err)
+		}
+		if len(args.AlgParams) != 2 || args.AlgParams[1] != restart {
+			t.Errorf("AlgParams = %v, want [2 %d]", args.AlgParams, restart)
+		}
+	}
+}
+
+// TestParseCDCLRejectsOutOfRangeRestartStrategy verifies that
+// --algorithm=cdcl rejects a second --alg-params value outside 0-3.
+func TestParseCDCLRejectsOutOfRangeRestartStrategy(t *testing.T) {
+	for _, restart := range []string{"4", "-1"} {
+		_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", restart})
+		if err == nil {
+			t.Errorf("expected error for --alg-params 2 %s with --algorithm=cdcl", restart)
+		}
 	}
 }
 
 // TestParseCDCLAcceptsMemoryLimit verifies that --algorithm=cdcl's
-// second --alg-params value is parsed as a memory limit in bytes,
-// per STAGE12.md, for a plain integer and for each supported unit
+// third --alg-params value is parsed as a memory limit in bytes,
+// per STAGE12.md (moved from the second value to the third by
+// STAGE15.md), for a plain integer and for each supported unit
 // suffix, case-insensitively.
 func TestParseCDCLAcceptsMemoryLimit(t *testing.T) {
 	cases := []struct {
@@ -393,12 +422,12 @@ func TestParseCDCLAcceptsMemoryLimit(t *testing.T) {
 		{"2Gb", 2 * 1024 * 1024 * 1024},
 	}
 	for _, c := range cases {
-		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", c.token})
+		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "0", c.token})
 		if err != nil {
-			t.Fatalf("Parse returned unexpected error for --alg-params 0 %s: %v", c.token, err)
+			t.Fatalf("Parse returned unexpected error for --alg-params 0 0 %s: %v", c.token, err)
 		}
 		if args.MemoryLimitBytes == nil || *args.MemoryLimitBytes != c.want {
-			t.Errorf("--alg-params 0 %s: MemoryLimitBytes = %v, want %d", c.token, args.MemoryLimitBytes, c.want)
+			t.Errorf("--alg-params 0 0 %s: MemoryLimitBytes = %v, want %d", c.token, args.MemoryLimitBytes, c.want)
 		}
 	}
 }
@@ -406,7 +435,7 @@ func TestParseCDCLAcceptsMemoryLimit(t *testing.T) {
 // TestParseCDCLRejectsMemoryLimitAsFirstValue verifies that
 // "--alg-params 100MB" (a memory-limit-shaped string given as the
 // *first* value) is rejected, since positionally that slot is the
-// SelectVar selector (0 or 1), not the memory limit.
+// SelectVar selector (0-3), not the memory limit.
 func TestParseCDCLRejectsMemoryLimitAsFirstValue(t *testing.T) {
 	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "100MB"})
 	if err == nil {
@@ -415,11 +444,11 @@ func TestParseCDCLRejectsMemoryLimitAsFirstValue(t *testing.T) {
 }
 
 // TestParseCDCLRejectsMalformedMemoryLimit verifies that a
-// second --alg-params value that isn't a valid byte size (no leading
+// third --alg-params value that isn't a valid byte size (no leading
 // digits, or an unrecognized unit suffix) is rejected.
 func TestParseCDCLRejectsMalformedMemoryLimit(t *testing.T) {
 	for _, bad := range []string{"MB", "100XB", "100.5MB", ""} {
-		_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", bad})
+		_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "0", bad})
 		if err == nil {
 			t.Errorf("expected error for malformed memory limit %q", bad)
 		}
@@ -429,7 +458,7 @@ func TestParseCDCLRejectsMalformedMemoryLimit(t *testing.T) {
 // TestParseCDCLRejectsNonPositiveMemoryLimit verifies that a memory
 // limit of zero bytes is rejected as nonsensical.
 func TestParseCDCLRejectsNonPositiveMemoryLimit(t *testing.T) {
-	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "0"})
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "0", "0"})
 	if err == nil {
 		t.Fatalf("expected error for a zero-byte memory limit")
 	}

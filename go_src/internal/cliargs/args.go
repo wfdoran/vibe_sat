@@ -28,16 +28,18 @@ type Args struct {
 	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
 	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
 
-	// MemoryLimitBytes is --alg-params/-p's second value for
-	// --algorithm=cdcl only (STAGE12.md): an optional learned-clause
-	// database memory limit, in bytes. Parsed by parseByteSize from
-	// either a plain integer (bytes) or an integer immediately
-	// followed by "k"/"kb"/"m"/"mb"/"g"/"gb" (case-insensitive; see
-	// --alg-params 0 100MB in the help text). nil if not given, in
+	// MemoryLimitBytes is --alg-params/-p's third value for
+	// --algorithm=cdcl only (STAGE12.md; shifted from the second value
+	// to the third by STAGE15.md, which inserted the restart strategy
+	// as the new second value): an optional learned-clause database
+	// memory limit, in bytes. Parsed by parseByteSize from either a
+	// plain integer (bytes) or an integer immediately followed by
+	// "k"/"kb"/"m"/"mb"/"g"/"gb" (case-insensitive; see
+	// --alg-params 0 1 100MB in the help text). nil if not given, in
 	// which case the database grows without bound, as it did before
-	// this stage. Kept separate from AlgParams (rather than as its
-	// third element) since it isn't a plain integer, unlike every
-	// other --alg-params value in this program.
+	// Stage 12. Kept separate from AlgParams (rather than as its third
+	// element) since it isn't a plain integer, unlike every other
+	// --alg-params value in this program.
 	MemoryLimitBytes *int64
 }
 
@@ -272,15 +274,17 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		args.TimeLimitSecs = &t
 	}
 	if values, ok := rawValues["alg-params"]; ok {
-		// --algorithm=cdcl's second --alg-params value is a memory
-		// size (STAGE12.md), not a plain integer like every other
+		// --algorithm=cdcl's third --alg-params value is a memory size
+		// (STAGE12.md), not a plain integer like every other
 		// --alg-params value in this program, so it needs its own
 		// parsing path rather than the uniform strconv.ParseInt loop
 		// below; this is why buildArgs (usually algorithm-agnostic)
-		// branches on args.Algorithm here.
+		// branches on args.Algorithm here. Per STAGE15.md, the second
+		// value (restart strategy) is a plain integer, appended to
+		// AlgParams just like the first.
 		if args.Algorithm == "cdcl" {
-			if len(values) > 2 {
-				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most two values (0 or 1 selecting which SelectVar heuristic to use, and an optional learned-clause database memory limit)")
+			if len(values) > 3 {
+				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-3 selecting the restart strategy, and an optional learned-clause database memory limit)")
 			}
 			if len(values) >= 1 {
 				p, err := strconv.ParseInt(values[0], 10, 64)
@@ -289,8 +293,15 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 				}
 				args.AlgParams = append(args.AlgParams, p)
 			}
-			if len(values) == 2 {
-				limit, err := parseByteSize(values[1])
+			if len(values) >= 2 {
+				p, err := strconv.ParseInt(values[1], 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid value for --alg-params: %q", values[1])
+				}
+				args.AlgParams = append(args.AlgParams, p)
+			}
+			if len(values) == 3 {
+				limit, err := parseByteSize(values[2])
 				if err != nil {
 					return nil, fmt.Errorf("invalid memory limit for --alg-params: %w", err)
 				}
@@ -369,16 +380,21 @@ func validate(args *Args, rawValues map[string][]string) error {
 		}
 
 	case "cdcl":
-		// The at-most-two-values check and the memory limit's own
+		// The at-most-three-values check and the memory limit's own
 		// syntax (plain integer, optionally with a k/kb/m/mb/g/gb
 		// suffix) were already enforced in buildArgs, since that's
 		// where the raw tokens are available; only the remaining
-		// business rules (variant is 0-3; the limit, if given, is
-		// positive) are checked here. STAGE13.md extends the first
-		// value's range from dfs's 0/1 (Weighted/Fast) to also allow
-		// 2 (VSIDS) and 3 (LRB), both cdcl-only.
-		if len(args.AlgParams) == 1 && (args.AlgParams[0] < 0 || args.AlgParams[0] > 3) {
+		// business rules (variant is 0-3; restart strategy is 0-3;
+		// the limit, if given, is positive) are checked here.
+		// STAGE13.md extends the first value's range from dfs's 0/1
+		// (Weighted/Fast) to also allow 2 (VSIDS) and 3 (LRB), both
+		// cdcl-only. STAGE15.md adds the second value (restart
+		// strategy: 0 = none, 1 = Luby, 2 = polynomial, 3 = geometric).
+		if len(args.AlgParams) >= 1 && (args.AlgParams[0] < 0 || args.AlgParams[0] > 3) {
 			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)")
+		}
+		if len(args.AlgParams) >= 2 && (args.AlgParams[1] < 0 || args.AlgParams[1] > 3) {
+			return fmt.Errorf("for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, or 3 (selecting the restart strategy)")
 		}
 		if args.MemoryLimitBytes != nil && *args.MemoryLimitBytes < 1 {
 			return fmt.Errorf("for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes")

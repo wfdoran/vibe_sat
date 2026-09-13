@@ -80,6 +80,48 @@
 //! related techniques (2007-era MiniSat/RSat literature) cited there.
 //! Unconditionally on for every `SelectVarVariant`, since STAGE14.md
 //! asks that it always be, with no `--alg-params` toggle.
+//!
+//! STAGE15.md adds restarts: periodically abandoning the current
+//! decision stack and starting over from decision level 0 -- exactly
+//! `backtrack_to(0, ...)`, already used for conflict-driven
+//! backjumping -- while every learned clause, and all other
+//! persistent state (activity scores, saved phases), is left
+//! untouched (see [`maybe_restart`]). Per Luby, Sinclair & Zuckerman,
+//! "Optimal Speedup of Las Vegas Algorithms," 1993, and Gomes, Selman
+//! & Kautz, "Boosting Combinatorial Search Through Randomization,"
+//! AAAI 1998, this escapes runs of unlucky early decisions. Three
+//! schedules are implemented (see [`RestartStrategy`]):
+//!
+//! - `RestartStrategy::Luby`: the classic Luby sequence (see
+//!   [`luby_term`]).
+//! - `RestartStrategy::Polynomial`: the quadratic sequence STAGE15.md
+//!   originally specified under the name "geometric" growth -- a*k^2
+//!   for k = 1, 2, 3, ... -- which is *not* the conventional,
+//!   geometric (equivalently, exponential-in-k) meaning of "geometric
+//!   restarts" found in the literature: a geometric sequence has a
+//!   constant ratio between consecutive terms, and a*k^2's ratio
+//!   shrinks (4, 2.25, 1.78, ...) rather than staying fixed. It is
+//!   implemented exactly as originally specified regardless, now
+//!   under the accurate name "polynomial" rather than "geometric."
+//! - `RestartStrategy::Geometric`: the true geometric schedule, added
+//!   once the naming mismatch above was caught -- c*r^k for
+//!   k = 0, 1, 2, ..., a constant ratio r between consecutive restart
+//!   intervals. This is what "geometric restarts" conventionally
+//!   means in the SAT literature (e.g. MiniSat 1.13/1.14's restart
+//!   scheme, before Luby restarts became the default in later MiniSat
+//!   versions).
+//!
+//! All three schedules are driven by conflict count, not decision
+//! count: STAGE15.md assumes "node count" as the restart statistic,
+//! and conflict count is this implementation's reading of that,
+//! matching both the convention in the restart literature cited above
+//! and MiniSat-lineage implementations generally (`dfs` has an
+//! explicit node count; `cdcl` does not, but does already track
+//! `num_conflicts` separately from `num_decisions` for exactly this
+//! kind of purpose). See `LUBY_BASE_CONFLICTS`/
+//! `POLYNOMIAL_BASE_CONFLICTS`/`GEOMETRIC_BASE_CONFLICTS` and
+//! `GEOMETRIC_GROWTH_FACTOR` for how each schedule's scale constant(s)
+//! were chosen.
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -112,6 +154,187 @@ pub enum SelectVarVariant {
     /// STAGE13.md's (simplified) LRB heuristic (see the module doc
     /// comment).
     Lrb,
+}
+
+/// Identifies which restart schedule [`maybe_restart`] applies for
+/// `--algorithm=cdcl` (STAGE15.md; see the module doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStrategy {
+    /// Disables restarts entirely -- `cdcl`'s original (pre-Stage-15)
+    /// behavior.
+    None,
+    /// Restarts on the classic Luby, Sinclair & Zuckerman sequence
+    /// (see [`luby_term`]), scaled by `LUBY_BASE_CONFLICTS`.
+    Luby,
+    /// Restarts on the quadratic sequence STAGE15.md originally
+    /// specified under the name "geometric" growth (a*k^2 for
+    /// k = 1, 2, 3, ...; see the module doc comment for why that name
+    /// was wrong and has been corrected here), scaled by
+    /// `POLYNOMIAL_BASE_CONFLICTS`. This is [`run`]'s default (see its
+    /// doc comment for why).
+    Polynomial,
+    /// Restarts on the true geometric sequence (see the module doc
+    /// comment): c*r^k for k = 0, 1, 2, ..., a constant ratio
+    /// `GEOMETRIC_GROWTH_FACTOR` between consecutive restart
+    /// intervals, scaled by `GEOMETRIC_BASE_CONFLICTS`.
+    Geometric,
+}
+
+/// `LUBY_BASE_CONFLICTS` and `POLYNOMIAL_BASE_CONFLICTS` are
+/// STAGE15.md's "b" and "a": the scale constants for the Luby and
+/// polynomial restart sequences respectively (see
+/// [`restart_threshold`]), expressed in conflicts (see the module doc
+/// comment for why conflicts, not decisions, is the chosen restart
+/// statistic). Both are internal parameters, not exposed via
+/// `--alg-params`, per STAGE15.md's explicit instruction that they're
+/// meant to be optimized later instead.
+///
+/// `LUBY_BASE_CONFLICTS` uses MiniSat's own default Luby restart base
+/// (its `-rfirst` option, 100 conflicts) -- a genuinely standard
+/// value in the literature/practice, inherited unchanged by most
+/// MiniSat-lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly
+/// the kind of standard STAGE15.md asks to prefer when one exists.
+///
+/// `POLYNOMIAL_BASE_CONFLICTS` has no such standard to inherit: the
+/// quadratic sequence STAGE15.md originally specified under the name
+/// "geometric" growth (a*k^2) is not itself a geometric sequence (see
+/// the module doc comment), so no standard constant applies to this
+/// exact formula. Per STAGE15.md's fallback instruction, this is
+/// instead picked empirically to be about one second of work on this
+/// project's own uf250/uuf250 benchmark sample: measured at
+/// ~17,300-18,900 conflicts/second across ten sampled instances (five
+/// uf250-1065, five uuf250-1065) under this project's current default
+/// `cdcl` configuration (VSIDS + phase saving), rounded to 18000.
+///
+/// `GEOMETRIC_BASE_CONFLICTS` and `GEOMETRIC_GROWTH_FACTOR` are "c"
+/// and "r" for the true geometric schedule (`RestartStrategy::Geometric`):
+/// the restart interval starts at c conflicts and is multiplied by r
+/// after every restart. Unlike `POLYNOMIAL_BASE_CONFLICTS`, a standard
+/// pairing of these two constants does exist in the literature:
+/// MiniSat 1.13/1.14's geometric restart scheme (the scheme Luby
+/// restarts later replaced as MiniSat's default) used a base restart
+/// interval of 100 conflicts -- the same "rfirst" constant reused
+/// here as `LUBY_BASE_CONFLICTS` -- and a growth factor of 1.5. That
+/// 1.5 was itself a practical (not theoretical) choice: a value a bit
+/// below the golden ratio (~1.618), the same growth-factor reasoning
+/// used when picking dynamic array growth factors to allow memory
+/// reuse (a factor at or above the golden ratio can never reuse
+/// previously freed memory as it grows). Per STAGE15.md's preference
+/// for a standard value when one exists, both constants are taken
+/// from that standard MiniSat pairing rather than re-derived
+/// empirically.
+const LUBY_BASE_CONFLICTS: usize = 100;
+const POLYNOMIAL_BASE_CONFLICTS: usize = 18000;
+const GEOMETRIC_BASE_CONFLICTS: usize = LUBY_BASE_CONFLICTS;
+const GEOMETRIC_GROWTH_FACTOR: f64 = 1.5;
+
+/// Returns the i-th term (0-indexed) of the Luby, Sinclair & Zuckerman
+/// restart sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, ...
+/// -- formally, t_i = 2^(k-1) if i+1 = 2^k - 1, else
+/// t_i = t_(i+1 - 2^(k-1) + 1) - 1 (1-indexed in the original
+/// definition; this is the standard 0-indexed iterative form used by
+/// MiniSat and its descendants to compute it without recursion).
+fn luby_term(i: usize) -> usize {
+    let mut size = 1usize;
+    let mut seq = 0u32;
+    while size < i + 1 {
+        seq += 1;
+        size = 2 * size + 1;
+    }
+    let mut i = i;
+    while size - 1 != i {
+        size = (size - 1) / 2;
+        seq -= 1;
+        i %= size;
+    }
+    1usize << seq
+}
+
+/// Returns the number of conflicts that must elapse since the
+/// previous restart (or since the search began, before the first one)
+/// before the next restart is due, per `restart_strategy` and
+/// `restart_count` (how many restarts have already happened, used to
+/// index into the sequence).
+///
+/// For `RestartStrategy::Luby`, this is
+/// `LUBY_BASE_CONFLICTS * luby_term(restart_count)` -- the classic
+/// Luby sequence 1, 1, 2, 1, 1, 2, 4, ... (see [`luby_term`]), scaled
+/// by "b" (STAGE15.md).
+///
+/// For `RestartStrategy::Polynomial`, this is
+/// `POLYNOMIAL_BASE_CONFLICTS * k^2`, where `k = restart_count + 1`:
+/// STAGE15.md's specified sequence a*1^2, a*2^2, a*3^2, ..., scaled by
+/// "a".
+///
+/// For `RestartStrategy::Geometric`, this is
+/// `GEOMETRIC_BASE_CONFLICTS * GEOMETRIC_GROWTH_FACTOR^restart_count`
+/// -- the true geometric sequence c, c*r, c*r^2, ..., scaled by "c"
+/// and with constant ratio "r" between consecutive terms. Truncated
+/// (rather than rounded) to a `usize`, matching MiniSat's own
+/// geometric restart implementation.
+fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) -> usize {
+    match restart_strategy {
+        RestartStrategy::Luby => LUBY_BASE_CONFLICTS * luby_term(restart_count),
+        RestartStrategy::Polynomial => {
+            let k = restart_count + 1;
+            POLYNOMIAL_BASE_CONFLICTS * k * k
+        }
+        RestartStrategy::Geometric => {
+            (GEOMETRIC_BASE_CONFLICTS as f64 * GEOMETRIC_GROWTH_FACTOR.powi(restart_count as i32))
+                as usize
+        }
+        RestartStrategy::None => 0, // never actually consulted (see maybe_restart)
+    }
+}
+
+/// Implements STAGE15.md's restart schedules (see the module doc
+/// comment): once `*conflicts_since_restart` reaches the threshold
+/// for `restart_strategy` and the current restart index (see
+/// [`restart_threshold`]), the search abandons its current decision
+/// stack and starts over from decision level 0 -- exactly
+/// `backtrack_to(0, ...)`, the same primitive conflict-driven
+/// backjumping already uses -- while every learned clause and all
+/// other persistent state (clause and variable activity, saved
+/// phases) is left untouched, since `backtrack_to` never removes
+/// clauses or resets activity/phase bookkeeping. Called once after
+/// every conflict is otherwise handled (i.e. after the backjump and
+/// its bookkeeping, in [`run`]); a no-op if `restart_strategy` is
+/// `RestartStrategy::None`.
+#[allow(clippy::too_many_arguments)]
+fn maybe_restart(
+    restart_strategy: RestartStrategy,
+    conflicts_since_restart: &mut usize,
+    restart_count: &mut usize,
+    trail: &mut Vec<usize>,
+    trail_lim: &mut Vec<usize>,
+    x: &mut Assignment,
+    q_head: &mut usize,
+    current_level: &mut usize,
+    variant: SelectVarVariant,
+    num_conflicts: usize,
+    lrb: &mut LrbState,
+    saved_phase: &mut [Value],
+) {
+    if restart_strategy == RestartStrategy::None {
+        return;
+    }
+    if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count) {
+        return;
+    }
+    backtrack_to(
+        0,
+        trail,
+        trail_lim,
+        x,
+        q_head,
+        current_level,
+        variant,
+        num_conflicts,
+        lrb,
+        saved_phase,
+    );
+    *conflicts_since_restart = 0;
+    *restart_count += 1;
 }
 
 /// `VAR_ACTIVITY_DECAY` is `SelectVarVariant::Vsids`'s per-variable
@@ -277,11 +500,32 @@ pub struct SolveResult {
 /// here. Callers that want one of the others still get it by passing
 /// `Weighted`, `Fast`, or `Lrb` explicitly.
 ///
+/// `restart_strategy` is the third algorithm parameter, STAGE15.md:
+/// which restart schedule to use (see [`RestartStrategy`] and the
+/// module doc comment). STAGE15.md leaves the default up to this
+/// implementation: it is `RestartStrategy::Polynomial`. Most
+/// MiniSat-lineage solvers (MiniSat, Glucose, CaDiCaL) default to
+/// Luby restarts instead, but this project's own benchmark comparison
+/// (`reports/REPORT15.md`) found the polynomial schedule clearly
+/// ahead on this project's actual (uniform random 3-SAT) benchmark
+/// set -- especially on UNSAT instances (10/10 solved within a fixed
+/// budget, vs. 6/10 with no restarts and just 3/10, worse than no
+/// restarts at all, with Luby) -- so, as in STAGE13.md's `SelectVar`
+/// default, real measurement on the relevant benchmarks wins out over
+/// the a priori literature default here. See `reports/REPORT15.md`
+/// for how `RestartStrategy::Geometric` (added later, once the
+/// original "geometric" name for `RestartStrategy::Polynomial` turned
+/// out to be wrong) compared. Callers that want one of the others
+/// still get it by passing `RestartStrategy::None`,
+/// `RestartStrategy::Luby`, or `RestartStrategy::Geometric`
+/// explicitly.
+///
 /// `memory_limit_bytes` is the second, optional, STAGE12.md algorithm
-/// parameter: once the estimated size of the learned-clause database
-/// exceeds it, the least active learned clauses are periodically
-/// deleted (see [`reduce_clause_database`]); `None` means unbounded,
-/// matching `cdcl`'s original (Stage 11) behavior.
+/// parameter (shifted to the third `--alg-params` slot by
+/// STAGE15.md): once the estimated size of the learned-clause
+/// database exceeds it, the least active learned clauses are
+/// periodically deleted (see [`reduce_clause_database`]); `None`
+/// means unbounded, matching `cdcl`'s original (Stage 11) behavior.
 ///
 /// If `time_limit` is `Some`, the search gives up and reports an
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
@@ -289,10 +533,12 @@ pub struct SolveResult {
 /// [`TIME_CHECK_INTERVAL`]). `rng` supplies the randomness
 /// `SelectVarVariant::Weighted` uses to break ties, and `verbose`
 /// controls progress output, matching [`crate::dfs::run`].
+#[allow(clippy::too_many_arguments)]
 pub fn run<R: Rng>(
     problem: &Problem,
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
+    restart_strategy: RestartStrategy,
     memory_limit_bytes: Option<i64>,
     rng: &mut R,
     verbose: i32,
@@ -300,7 +546,7 @@ pub fn run<R: Rng>(
     if verbose >= 1 {
         println!(
             "cdcl: {}{}",
-            describe_params(time_limit, variant),
+            describe_params(time_limit, variant, restart_strategy),
             describe_memory_limit(memory_limit_bytes)
         );
     }
@@ -367,6 +613,14 @@ pub fn run<R: Rng>(
     // exactly the polarity a variable that has never been assigned
     // before should default to (see backtrack_to's doc comment).
     let mut saved_phase = vec![Value::False; problem.num_vars + 1];
+
+    // STAGE15.md's restart bookkeeping: conflicts_since_restart counts
+    // conflicts since the previous restart (or since the search
+    // began, if none yet); restart_count is how many restarts have
+    // happened so far, indexing into the Luby/geometric sequence (see
+    // restart_threshold).
+    let mut conflicts_since_restart = 0usize;
+    let mut restart_count = 0usize;
 
     let start_time = Instant::now();
     let mut step: usize = 0;
@@ -504,6 +758,22 @@ pub fn run<R: Rng>(
                     num_original_clauses,
                 );
             }
+
+            conflicts_since_restart += 1;
+            maybe_restart(
+                restart_strategy,
+                &mut conflicts_since_restart,
+                &mut restart_count,
+                &mut trail,
+                &mut trail_lim,
+                &mut x,
+                &mut q_head,
+                &mut current_level,
+                variant,
+                num_conflicts,
+                &mut lrb,
+                &mut saved_phase,
+            );
             continue;
         }
 
@@ -1103,19 +1373,29 @@ fn is_false(literal: Literal, assignment: &Assignment) -> bool {
 
 /// Formats the configured time limit and `SelectVar` variant for the
 /// "cdcl:" announcement printed at verbose level 1.
-fn describe_params(time_limit: Option<Duration>, variant: SelectVarVariant) -> String {
+fn describe_params(
+    time_limit: Option<Duration>,
+    variant: SelectVarVariant,
+    restart_strategy: RestartStrategy,
+) -> String {
     let variant_code = match variant {
         SelectVarVariant::Weighted => 0,
         SelectVarVariant::Fast => 1,
         SelectVarVariant::Vsids => 2,
         SelectVarVariant::Lrb => 3,
     };
+    let restart_code = match restart_strategy {
+        RestartStrategy::None => 0,
+        RestartStrategy::Luby => 1,
+        RestartStrategy::Polynomial => 2,
+        RestartStrategy::Geometric => 3,
+    };
     match time_limit {
         Some(limit) => format!(
-            "select_var={variant_code} time_limit_secs={}",
+            "select_var={variant_code} restart={restart_code} time_limit_secs={}",
             limit.as_secs()
         ),
-        None => format!("select_var={variant_code}"),
+        None => format!("select_var={variant_code} restart={restart_code}"),
     }
 }
 
@@ -1375,7 +1655,15 @@ mod tests {
             SelectVarVariant::Lrb,
         ] {
             let mut rng = StdRng::seed_from_u64(1);
-            let result = run(&problem, None, variant, None, &mut rng, 0);
+            let result = run(
+                &problem,
+                None,
+                variant,
+                RestartStrategy::None,
+                None,
+                &mut rng,
+                0,
+            );
             assert!(
                 result.satisfiable,
                 "variant {variant:?}: expected satisfiable"
@@ -1418,7 +1706,15 @@ mod tests {
             SelectVarVariant::Lrb,
         ] {
             let mut rng = StdRng::seed_from_u64(1);
-            let result = run(&problem, None, variant, None, &mut rng, 0);
+            let result = run(
+                &problem,
+                None,
+                variant,
+                RestartStrategy::None,
+                None,
+                &mut rng,
+                0,
+            );
             assert!(
                 !result.satisfiable,
                 "variant {variant:?}: expected unsatisfiable"
@@ -1594,6 +1890,7 @@ mod tests {
             &problem,
             None,
             SelectVarVariant::Fast,
+            RestartStrategy::None,
             Some(200),
             &mut rng,
             0,
@@ -1618,6 +1915,7 @@ mod tests {
             &problem,
             None,
             SelectVarVariant::Weighted,
+            RestartStrategy::None,
             Some(64),
             &mut rng,
             0,
@@ -1874,7 +2172,15 @@ mod tests {
         let problem = pigeonhole_problem(4, 3);
         let mut rng = StdRng::seed_from_u64(9);
 
-        let result = run(&problem, None, SelectVarVariant::Vsids, None, &mut rng, 0);
+        let result = run(
+            &problem,
+            None,
+            SelectVarVariant::Vsids,
+            RestartStrategy::None,
+            None,
+            &mut rng,
+            0,
+        );
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -1885,10 +2191,307 @@ mod tests {
         let problem = pigeonhole_problem(4, 3);
         let mut rng = StdRng::seed_from_u64(9);
 
-        let result = run(&problem, None, SelectVarVariant::Lrb, None, &mut rng, 0);
+        let result = run(
+            &problem,
+            None,
+            SelectVarVariant::Lrb,
+            RestartStrategy::None,
+            None,
+            &mut rng,
+            0,
+        );
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
+    }
+
+    /// Verifies luby_term against the first seven terms of the Luby,
+    /// Sinclair & Zuckerman sequence as STAGE15.md quotes them
+    /// (1-indexed there; luby_term is 0-indexed, so term i here is
+    /// STAGE15.md's term i+1): 1, 1, 2, 1, 1, 2, 4.
+    #[test]
+    fn test_luby_term_matches_hand_verified_sequence() {
+        let want = [1, 1, 2, 1, 1, 2, 4];
+        for (i, w) in want.into_iter().enumerate() {
+            assert_eq!(luby_term(i), w, "luby_term({i})");
+        }
+    }
+
+    /// Verifies the next block of the sequence (terms 8-15, 0-indexed
+    /// 7-14): 1, 1, 2, 1, 1, 2, 4, 8 -- the same first block again,
+    /// followed by 8, per the recursive definition (t_i = 2^(k-1)
+    /// exactly at the end of each doubling block).
+    #[test]
+    fn test_luby_term_continues_past_first_block() {
+        let want = [1, 1, 2, 1, 1, 2, 4, 8];
+        for (offset, w) in want.into_iter().enumerate() {
+            let i = 7 + offset;
+            assert_eq!(luby_term(i), w, "luby_term({i})");
+        }
+    }
+
+    /// Verifies restart_threshold's Luby case directly:
+    /// threshold(k) = LUBY_BASE_CONFLICTS * luby_term(k).
+    #[test]
+    fn test_restart_threshold_luby() {
+        for (k, term) in [1, 1, 2, 1, 1, 2, 4].into_iter().enumerate() {
+            let want = LUBY_BASE_CONFLICTS * term;
+            assert_eq!(restart_threshold(RestartStrategy::Luby, k), want);
+        }
+    }
+
+    /// Verifies restart_threshold's polynomial case directly against
+    /// STAGE15.md's originally-specified sequence (there under the
+    /// incorrect name "geometric"): threshold at restart index k
+    /// (0-indexed) is POLYNOMIAL_BASE_CONFLICTS * (k+1)^2, matching
+    /// a*1^2, a*2^2, a*3^2, ....
+    #[test]
+    fn test_restart_threshold_polynomial() {
+        for k in 0..4 {
+            let want = POLYNOMIAL_BASE_CONFLICTS * (k + 1) * (k + 1);
+            assert_eq!(restart_threshold(RestartStrategy::Polynomial, k), want);
+        }
+    }
+
+    /// Verifies restart_threshold's true geometric case directly:
+    /// threshold at restart index k (0-indexed) is
+    /// GEOMETRIC_BASE_CONFLICTS * GEOMETRIC_GROWTH_FACTOR^k, a
+    /// sequence with a constant ratio (GEOMETRIC_GROWTH_FACTOR)
+    /// between consecutive terms, unlike the polynomial case above.
+    #[test]
+    fn test_restart_threshold_geometric() {
+        for k in 0..4 {
+            let want =
+                (GEOMETRIC_BASE_CONFLICTS as f64 * GEOMETRIC_GROWTH_FACTOR.powi(k as i32)) as usize;
+            assert_eq!(restart_threshold(RestartStrategy::Geometric, k), want);
+        }
+        // Directly pin the first four terms against the known
+        // constants (base 100, ratio 1.5), so a future change to the
+        // constants themselves is caught by this test's own
+        // formula-based check above, while this pins the actual
+        // numbers STAGE15.md's default configuration produces today.
+        for (k, want) in [100, 150, 225, 337].into_iter().enumerate() {
+            assert_eq!(restart_threshold(RestartStrategy::Geometric, k), want);
+        }
+    }
+
+    /// Verifies that maybe_restart never triggers a restart when
+    /// restart_strategy is RestartStrategy::None, regardless of how
+    /// many conflicts have accumulated.
+    #[test]
+    fn test_maybe_restart_is_no_op_for_restart_none() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (_working_problem, _watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut trail: Vec<usize> = Vec::new();
+        let mut trail_lim: Vec<usize> = vec![0];
+        let mut current_level = 0usize;
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(2);
+        let mut saved_phase = vec![Value::False; 3];
+        let mut conflicts_since_restart = 1_000_000usize;
+        let mut restart_count = 0usize;
+
+        maybe_restart(
+            RestartStrategy::None,
+            &mut conflicts_since_restart,
+            &mut restart_count,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+            &mut saved_phase,
+        );
+
+        assert_eq!(restart_count, 0, "RestartStrategy::None must never restart");
+        assert_eq!(conflicts_since_restart, 1_000_000);
+    }
+
+    /// Verifies the actual restart mechanics for RestartStrategy::Luby:
+    /// below threshold, nothing happens; at or above it,
+    /// backtrack_to(0, ...) runs (undoing the level-1 assignment), the
+    /// conflict counter resets, and restart_count advances -- while
+    /// the learned clause added beforehand survives the restart
+    /// untouched, per STAGE15.md's explicit requirement.
+    #[test]
+    fn test_maybe_restart_triggers_at_threshold_and_resets() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let mut level = vec![0usize; 3];
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut estimated_bytes = 0i64;
+        let learned_idx = add_learned_clause(
+            &vec![-1, 2],
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        let before_clauses = working_problem.clauses.len();
+
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut trail_lim: Vec<usize> = vec![0];
+        let mut current_level = 0usize;
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(2);
+        let mut saved_phase = vec![Value::False; 3];
+
+        current_level += 1;
+        trail_lim.push(trail.len());
+        assign_literal(
+            1,
+            current_level,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        );
+
+        let mut conflicts_since_restart = LUBY_BASE_CONFLICTS * luby_term(0) - 1;
+        let mut restart_count = 0usize;
+        maybe_restart(
+            RestartStrategy::Luby,
+            &mut conflicts_since_restart,
+            &mut restart_count,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+            &mut saved_phase,
+        );
+        assert_eq!(restart_count, 0, "below threshold, must not restart yet");
+        assert_ne!(
+            x[1],
+            Value::Unassigned,
+            "variable 1 was unassigned before the threshold was reached"
+        );
+
+        conflicts_since_restart += 1;
+        maybe_restart(
+            RestartStrategy::Luby,
+            &mut conflicts_since_restart,
+            &mut restart_count,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+            &mut saved_phase,
+        );
+
+        assert_eq!(restart_count, 1, "threshold reached");
+        assert_eq!(conflicts_since_restart, 0, "reset to 0");
+        assert_eq!(current_level, 0, "current_level after restart");
+        assert_eq!(x[1], Value::Unassigned, "x[1] after restart");
+        assert_eq!(
+            working_problem.clauses.len(),
+            before_clauses,
+            "learned clauses must survive a restart"
+        );
+        assert_eq!(working_problem.clauses[learned_idx][0], -1);
+    }
+
+    /// Checks both restart strategies end to end against a problem
+    /// already verified without restarts
+    /// (test_run_proves_unsatisfiable_pigeonhole), confirming restarts
+    /// (which repeatedly discard the decision stack but must keep
+    /// every learned clause) don't change the verdict.
+    #[test]
+    fn test_run_with_restarts_still_proves_unsatisfiable_pigeonhole() {
+        for restart_strategy in [
+            RestartStrategy::Luby,
+            RestartStrategy::Polynomial,
+            RestartStrategy::Geometric,
+        ] {
+            let problem = pigeonhole_problem(4, 3);
+            let mut rng = StdRng::seed_from_u64(9);
+
+            let result = run(
+                &problem,
+                None,
+                SelectVarVariant::Fast,
+                restart_strategy,
+                None,
+                &mut rng,
+                0,
+            );
+
+            assert!(
+                !result.satisfiable,
+                "restart strategy {restart_strategy:?}: expected unsatisfiable"
+            );
+            assert!(
+                !result.timed_out,
+                "restart strategy {restart_strategy:?}: unexpected timeout"
+            );
+        }
+    }
+
+    /// The satisfiable-path analog of
+    /// test_run_with_restarts_still_proves_unsatisfiable_pigeonhole.
+    #[test]
+    fn test_run_with_restarts_still_finds_satisfiable_formula() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
+        };
+
+        for restart_strategy in [
+            RestartStrategy::Luby,
+            RestartStrategy::Polynomial,
+            RestartStrategy::Geometric,
+        ] {
+            let mut rng = StdRng::seed_from_u64(1);
+            let result = run(
+                &problem,
+                None,
+                SelectVarVariant::Vsids,
+                restart_strategy,
+                None,
+                &mut rng,
+                0,
+            );
+            assert!(
+                result.satisfiable,
+                "restart strategy {restart_strategy:?}: expected satisfiable"
+            );
+            for (ci, clause) in problem.clauses.iter().enumerate() {
+                let satisfied = clause
+                    .iter()
+                    .any(|&lit| assignment::literal_is_true(&result.assignment, lit));
+                assert!(
+                    satisfied,
+                    "restart strategy {restart_strategy:?}: clause {ci} ({clause:?}) not satisfied"
+                );
+            }
+        }
     }
 
     /// Builds the standard CNF encoding of "num_pigeons pigeons cannot
@@ -1920,7 +2523,15 @@ mod tests {
         let problem = pigeonhole_problem(4, 3);
         let mut rng = StdRng::seed_from_u64(9);
 
-        let result = run(&problem, None, SelectVarVariant::Fast, None, &mut rng, 0);
+        let result = run(
+            &problem,
+            None,
+            SelectVarVariant::Fast,
+            RestartStrategy::None,
+            None,
+            &mut rng,
+            0,
+        );
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -1938,6 +2549,7 @@ mod tests {
             &sat_problem,
             None,
             SelectVarVariant::Weighted,
+            RestartStrategy::None,
             None,
             &mut rng,
             0,
@@ -1952,6 +2564,7 @@ mod tests {
             &unsat_problem,
             None,
             SelectVarVariant::Weighted,
+            RestartStrategy::None,
             None,
             &mut rng,
             0,
@@ -1969,6 +2582,7 @@ mod tests {
             &problem,
             Some(tiny),
             SelectVarVariant::Weighted,
+            RestartStrategy::None,
             None,
             &mut rng,
             0,

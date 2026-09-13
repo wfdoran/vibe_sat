@@ -199,8 +199,14 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 // Fast heuristics, and 2/3 (STAGE13.md) select cdcl's own VSIDS/LRB
 // heuristics; unlike dfs, cdcl defaults to VSIDS (cdcl.SelectVarVsids)
 // if --alg-params is omitted entirely, per cdcl's own package doc
-// comment. args.MemoryLimitBytes (if given, via --alg-params's second
-// value: STAGE12.md) bounds the learned-clause database's estimated
+// comment. args.AlgParams[1] (if given, via --alg-params's second
+// value: STAGE15.md) selects the restart strategy: 0 disables
+// restarts, 1 selects the Luby sequence, 2 selects the quadratic
+// "polynomial" sequence, 3 selects the true geometric sequence; cdcl
+// defaults to the polynomial sequence (cdcl.RestartPolynomial) if not
+// given. args.MemoryLimitBytes (if given,
+// via --alg-params's third value: STAGE12.md, moved from the second
+// value by STAGE15.md) bounds the learned-clause database's estimated
 // size, past which the least active learned clauses are periodically
 // deleted; nil leaves it unbounded, as before Stage 12. If preResult
 // is non-nil, the found assignment is reconstructed back to
@@ -228,7 +234,15 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 		variant = cdcl.SelectVarVariant(args.AlgParams[0])
 	}
 
-	result := cdcl.Run(problem, timeLimit, variant, args.MemoryLimitBytes, rng, args.Verbose)
+	// STAGE15.md leaves the default restart strategy up to this
+	// implementation too; see cdcl.Run's doc comment for why it's
+	// RestartPolynomial.
+	restartStrategy := cdcl.RestartPolynomial
+	if len(args.AlgParams) >= 2 {
+		restartStrategy = cdcl.RestartStrategy(args.AlgParams[1])
+	}
+
+	result := cdcl.Run(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

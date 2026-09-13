@@ -71,10 +71,50 @@
 // related techniques (2007-era MiniSat/RSat literature) cited there.
 // Unconditionally on for every SelectVarVariant, since STAGE14.md
 // asks that it always be, with no --alg-params toggle.
+//
+// STAGE15.md adds restarts: periodically abandoning the current
+// decision stack and starting over from decision level 0 -- exactly
+// backtrackTo(0), already used for conflict-driven backjumping --
+// while every learned clause, and all other persistent state
+// (activity scores, saved phases), is left untouched (see
+// maybeRestart). Per Luby, Sinclair & Zuckerman, "Optimal Speedup of
+// Las Vegas Algorithms," 1993, and Gomes, Selman & Kautz, "Boosting
+// Combinatorial Search Through Randomization," AAAI 1998, this
+// escapes runs of unlucky early decisions. Three schedules are
+// implemented (see RestartStrategy):
+//
+//   - RestartLuby: the classic Luby sequence (see lubyTerm).
+//   - RestartPolynomial: the quadratic sequence STAGE15.md originally
+//     specified under the name "geometric growth" -- a*k^2 for
+//     k = 1, 2, 3, ... -- which is *not* the conventional, geometric
+//     (equivalently, exponential-in-k) meaning of "geometric
+//     restarts" found in the literature: a geometric sequence has a
+//     constant ratio between consecutive terms, and a*k^2's ratio
+//     shrinks (4, 2.25, 1.78, ...) rather than staying fixed. It is
+//     implemented exactly as originally specified regardless, now
+//     under the accurate name "polynomial" rather than "geometric."
+//   - RestartGeometric: the true geometric schedule, added once the
+//     naming mismatch above was caught -- c*r^k for k = 0, 1, 2, ...,
+//     a constant ratio r between consecutive restart intervals. This
+//     is what "geometric restarts" conventionally means in the SAT
+//     literature (e.g. MiniSat 1.13/1.14's restart scheme, before
+//     Luby restarts became the default in later MiniSat versions).
+//
+// All three schedules are driven by conflict count, not decision
+// count: STAGE15.md assumes "node count" as the restart statistic,
+// and conflict count is this implementation's reading of that,
+// matching both the convention in the restart literature cited above
+// and MiniSat-lineage implementations generally (dfs has an explicit
+// node count; cdcl does not, but does already track NumConflicts
+// separately from NumDecisions for exactly this kind of purpose). See
+// lubyBaseConflicts/polynomialBaseConflicts/geometricBaseConflicts and
+// geometricGrowthFactor for how each schedule's scale constant(s) were
+// chosen.
 package cdcl
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"time"
@@ -142,6 +182,54 @@ const (
 // simplification (see the package doc comment).
 const lrbAlpha = 0.4
 
+// lubyBaseConflicts and polynomialBaseConflicts are STAGE15.md's "b"
+// and "a": the scale constants for the Luby and polynomial restart
+// sequences respectively (see restartThreshold), expressed in
+// conflicts (see the package doc comment for why conflicts, not
+// decisions, is the chosen restart statistic). Both are internal
+// parameters, not exposed via --alg-params, per STAGE15.md's explicit
+// instruction that they're meant to be optimized later instead.
+//
+// lubyBaseConflicts uses MiniSat's own default Luby restart base (its
+// "-rfirst" option, 100 conflicts) -- a genuinely standard value in
+// the literature/practice, inherited unchanged by most MiniSat-
+// lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly the
+// kind of standard STAGE15.md asks to prefer when one exists.
+//
+// polynomialBaseConflicts has no such standard to inherit: the
+// quadratic sequence STAGE15.md originally specified under the name
+// "geometric" growth (a*k^2) is not itself a geometric sequence (see
+// the package doc comment), so no standard constant applies to this
+// exact formula. Per STAGE15.md's fallback instruction, this is
+// instead picked empirically to be about one second of work on this
+// project's own uf250/uuf250 benchmark sample: measured at
+// ~17,300-18,900 conflicts/second across ten sampled instances (five
+// uf250-1065, five uuf250-1065) under this project's current default
+// cdcl configuration (VSIDS + phase saving), rounded to 18000.
+//
+// geometricBaseConflicts and geometricGrowthFactor are "c" and "r"
+// for the true geometric schedule (RestartGeometric): the restart
+// interval starts at c conflicts and is multiplied by r after every
+// restart. Unlike polynomialBaseConflicts, a standard pairing of
+// these two constants does exist in the literature: MiniSat
+// 1.13/1.14's geometric restart scheme (the scheme Luby restarts
+// later replaced as MiniSat's default) used a base restart interval
+// of 100 conflicts -- the same "rfirst" constant reused here as
+// lubyBaseConflicts -- and a growth factor of 1.5. That 1.5 was
+// itself a practical (not theoretical) choice: a value a bit below
+// the golden ratio (~1.618), the same growth-factor reasoning used
+// when picking dynamic array growth factors to allow memory reuse
+// (a factor at or above the golden ratio can never reuse previously
+// freed memory as it grows). Per STAGE15.md's preference for a
+// standard value when one exists, both constants are taken from that
+// standard MiniSat pairing rather than re-derived empirically.
+const (
+	lubyBaseConflicts       = 100
+	polynomialBaseConflicts = 18000
+	geometricBaseConflicts  = lubyBaseConflicts
+	geometricGrowthFactor   = 1.5
+)
+
 // SelectVarVariant identifies which heuristic Run should use to pick
 // the next branching variable. Values 0 and 1 match dfs.SelectVarVariant
 // exactly (and are delegated to dfs.SelectVar/dfs.SelectVarFastPick
@@ -163,6 +251,32 @@ const (
 	// SelectVarLrb is STAGE13.md's (simplified) LRB heuristic (see
 	// the package doc comment).
 	SelectVarLrb SelectVarVariant = 3
+)
+
+// RestartStrategy identifies which restart schedule maybeRestart
+// applies for --algorithm=cdcl (STAGE15.md; see the package doc
+// comment).
+type RestartStrategy int
+
+const (
+	// RestartNone disables restarts entirely -- cdcl's original
+	// (pre-Stage-15) behavior.
+	RestartNone RestartStrategy = 0
+	// RestartLuby restarts on the classic Luby, Sinclair & Zuckerman
+	// sequence (see lubyTerm), scaled by lubyBaseConflicts.
+	RestartLuby RestartStrategy = 1
+	// RestartPolynomial restarts on the quadratic sequence STAGE15.md
+	// originally specified under the name "geometric" growth (a*k^2
+	// for k = 1, 2, 3, ...; see the package doc comment for why that
+	// name was wrong and has been corrected here), scaled by
+	// polynomialBaseConflicts. This is Run's default (see Run's doc
+	// comment for why).
+	RestartPolynomial RestartStrategy = 2
+	// RestartGeometric restarts on the true geometric sequence (see
+	// the package doc comment): c*r^k for k = 0, 1, 2, ..., a constant
+	// ratio geometricGrowthFactor between consecutive restart
+	// intervals, scaled by geometricBaseConflicts.
+	RestartGeometric RestartStrategy = 3
 )
 
 // Result describes the outcome of a CDCL search.
@@ -255,6 +369,17 @@ type solver struct {
 	// initialization is needed.
 	savedPhase assign.Assignment
 
+	// restartStrategy selects which restart schedule maybeRestart
+	// applies (STAGE15.md); fixed for the lifetime of one solver/Run
+	// call. restartCount is how many restarts have happened so far,
+	// indexing into the Luby/geometric sequence (see
+	// restartThreshold); conflictsSinceRestart counts conflicts since
+	// the previous restart, or since the search began if there
+	// hasn't been one yet.
+	restartStrategy       RestartStrategy
+	restartCount          int
+	conflictsSinceRestart int
+
 	x            assign.Assignment // current (partial) assignment
 	level        []int             // level[v] = decision level at which v was assigned (meaningless if x[v] is Unassigned)
 	reason       []int             // reason[v] = index into clauses of the clause that forced v, or noReason for a decision or a level-0 fact
@@ -282,9 +407,10 @@ func clauseByteCost(clause cnf.Clause) int64 {
 // watch state for whatever clauses survive it. memoryLimitBytes is
 // the optional learned-clause database memory limit (STAGE12.md); nil
 // means unbounded. variant is the SelectVar heuristic to use
-// (STAGE13.md). ok is false if this bootstrap alone already proves
+// (STAGE13.md). restartStrategy is the restart schedule to use
+// (STAGE15.md). ok is false if this bootstrap alone already proves
 // problem unsatisfiable.
-func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant) (s *solver, ok bool) {
+func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy) (s *solver, ok bool) {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	x := assign.New(problem.NumVars)
 	if unsat, _ := preprocess.UnitPropagate(&clauses, x); unsat {
@@ -322,6 +448,7 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		estimatedBytes:          estimatedBytes,
 		memoryLimitBytes:        memoryLimitBytes,
 		variant:                 variant,
+		restartStrategy:         restartStrategy,
 		varActivity:             make([]float64, problem.NumVars+1),
 		varActivityIncrement:    1.0,
 		lrbQ:                    make([]float64, problem.NumVars+1),
@@ -360,20 +487,38 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 // here. Callers that want one of the others still get it by passing
 // 0, 1, or 3 explicitly.
 //
+// restartStrategy is the third algorithm parameter, STAGE15.md: which
+// restart schedule to use (see RestartStrategy and the package doc
+// comment). STAGE15.md leaves the default up to this implementation:
+// it is RestartPolynomial. Most MiniSat-lineage solvers (MiniSat,
+// Glucose, CaDiCaL) default to Luby restarts instead, but this
+// project's own benchmark comparison (reports/REPORT15.md) found the
+// polynomial schedule clearly ahead on this project's actual (uniform
+// random 3-SAT) benchmark set -- especially on UNSAT instances (10/10
+// solved within a fixed budget, vs. 6/10 with no restarts and just
+// 3/10, worse than no restarts at all, with Luby) -- so, as in
+// STAGE13.md's SelectVar default, real measurement on the relevant
+// benchmarks wins out over the a priori literature default here. See
+// reports/REPORT15.md for how RestartGeometric (added later, once the
+// original "geometric" name for RestartPolynomial turned out to be
+// wrong) compared. Callers that want one of the others still get it
+// by passing RestartNone, RestartLuby, or RestartGeometric explicitly.
+//
 // memoryLimitBytes is the second, optional, STAGE12.md algorithm
-// parameter: once the estimated size of the learned-clause database
-// exceeds it, the least active learned clauses are periodically
-// deleted (see reduceClauseDatabase); nil means unbounded, matching
-// cdcl's original (Stage 11) behavior.
+// parameter (shifted to the third --alg-params slot by STAGE15.md):
+// once the estimated size of the learned-clause database exceeds it,
+// the least active learned clauses are periodically deleted (see
+// reduceClauseDatabase); nil means unbounded, matching cdcl's original
+// (Stage 11) behavior.
 //
 // If timeLimit is non-nil, the search gives up and reports an
 // inconclusive result (Satisfiable == false, TimedOut == true) once
 // it is exceeded, checked only periodically (see timeCheckInterval).
 // rng supplies the randomness SelectVarWeighted uses to break ties,
 // and verbose controls progress output, matching dfs.Run.
-func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
+func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
-		fmt.Println("cdcl:", describeParams(timeLimit, variant)+describeMemoryLimit(memoryLimitBytes))
+		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy)+describeMemoryLimit(memoryLimitBytes))
 	}
 
 	if problem.NumVars == 0 {
@@ -384,7 +529,7 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	s, ok := newSolver(problem, memoryLimitBytes, variant)
+	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy)
 	if !ok {
 		if verbose >= 1 {
 			fmt.Println("UNSAT")
@@ -413,6 +558,8 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 				return Result{Satisfiable: false, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts}
 			}
 			s.learnAndBackjump(confl)
+			s.conflictsSinceRestart++
+			s.maybeRestart()
 			continue
 		}
 
@@ -618,6 +765,84 @@ func (s *solver) learnAndBackjump(confl int) {
 	if s.memoryLimitBytes != nil && s.estimatedBytes > *s.memoryLimitBytes {
 		s.reduceClauseDatabase()
 	}
+}
+
+// maybeRestart implements STAGE15.md's restart schedules (see the
+// package doc comment): once s.conflictsSinceRestart reaches the
+// threshold for the current strategy and restart index (see
+// restartThreshold), the search abandons its current decision stack
+// and starts over from decision level 0 -- exactly backtrackTo(0),
+// the same primitive conflict-driven backjumping already uses --
+// while every learned clause and all other persistent state (clause
+// and variable activity, saved phases) is left untouched, since
+// backtrackTo never removes clauses or resets activity/phase
+// bookkeeping. Called once after every conflict is otherwise handled
+// (i.e. after learnAndBackjump); a no-op if s.restartStrategy is
+// RestartNone.
+func (s *solver) maybeRestart() {
+	if s.restartStrategy == RestartNone {
+		return
+	}
+	if s.conflictsSinceRestart < s.restartThreshold() {
+		return
+	}
+	s.backtrackTo(0)
+	s.conflictsSinceRestart = 0
+	s.restartCount++
+}
+
+// restartThreshold returns the number of conflicts that must elapse
+// since the previous restart (or since the search began, before the
+// first one) before the next restart is due, per s.restartStrategy
+// and s.restartCount (how many restarts have already happened, used
+// to index into the sequence).
+//
+// For RestartLuby, this is lubyBaseConflicts * lubyTerm(s.restartCount)
+// -- the classic Luby sequence 1, 1, 2, 1, 1, 2, 4, ... (see lubyTerm),
+// scaled by "b" (STAGE15.md).
+//
+// For RestartPolynomial, this is polynomialBaseConflicts * k^2, where
+// k = s.restartCount + 1: STAGE15.md's specified sequence a*1^2,
+// a*2^2, a*3^2, ..., scaled by "a".
+//
+// For RestartGeometric, this is
+// geometricBaseConflicts * geometricGrowthFactor^s.restartCount --
+// the true geometric sequence c, c*r, c*r^2, ..., scaled by "c" and
+// with constant ratio "r" between consecutive terms. Truncated
+// (rather than rounded) to an int, matching MiniSat's own geometric
+// restart implementation.
+func (s *solver) restartThreshold() int {
+	switch s.restartStrategy {
+	case RestartLuby:
+		return lubyBaseConflicts * lubyTerm(s.restartCount)
+	case RestartPolynomial:
+		k := s.restartCount + 1
+		return polynomialBaseConflicts * k * k
+	case RestartGeometric:
+		return int(geometricBaseConflicts * math.Pow(geometricGrowthFactor, float64(s.restartCount)))
+	default: // RestartNone; never actually consulted (see maybeRestart)
+		return 0
+	}
+}
+
+// lubyTerm returns the i-th term (0-indexed) of the Luby, Sinclair &
+// Zuckerman restart sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2,
+// 4, 8, ... -- formally, t_i = 2^(k-1) if i+1 = 2^k - 1, else
+// t_i = t_(i+1 - 2^(k-1) + 1) - 1 (1-indexed in the original
+// definition; this is the standard 0-indexed iterative form used by
+// MiniSat and its descendants to compute it without recursion).
+func lubyTerm(i int) int {
+	size, seq := 1, 0
+	for size < i+1 {
+		seq++
+		size = 2*size + 1
+	}
+	for size-1 != i {
+		size = (size - 1) / 2
+		seq--
+		i = i % size
+	}
+	return 1 << seq
 }
 
 // analyze walks the implication graph backward from the clause at
@@ -942,8 +1167,8 @@ func isFalse(lit cnf.Literal, assignment assign.Assignment) bool {
 
 // describeParams formats the configured time limit and SelectVar
 // variant for the "cdcl:" announcement printed at verbose level 1.
-func describeParams(timeLimit *time.Duration, variant SelectVarVariant) string {
-	description := fmt.Sprintf("select_var=%d", variant)
+func describeParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy) string {
+	description := fmt.Sprintf("select_var=%d restart=%d", variant, restartStrategy)
 	if timeLimit != nil {
 		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
 	}

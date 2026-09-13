@@ -5,13 +5,14 @@
 //!
 //! `--alg-params`/`-p` is unusual in that it accepts between one and
 //! three values (`--alg-params <val1> [<val2> <val3>]`); clap's
-//! `num_args` supports this directly. `--algorithm=cdcl`'s second
-//! value (STAGE12.md, a memory limit like "100MB") isn't a plain
-//! integer like every other `--alg-params` value in this program, so
-//! clap collects the raw tokens as strings ([`RawArgs::alg_params`])
-//! and [`build_args`] parses each one itself, depending on which
-//! algorithm was selected -- mirroring the Go implementation's
-//! tokenize/buildArgs split for the same reason.
+//! `num_args` supports this directly. `--algorithm=cdcl`'s third
+//! value (STAGE12.md, a memory limit like "100MB"; shifted from the
+//! second value to the third by STAGE15.md's restart strategy) isn't
+//! a plain integer like every other `--alg-params` value in this
+//! program, so clap collects the raw tokens as strings
+//! ([`RawArgs::alg_params`]) and [`build_args`] parses each one
+//! itself, depending on which algorithm was selected -- mirroring the
+//! Go implementation's tokenize/buildArgs split for the same reason.
 
 use clap::Parser;
 
@@ -77,22 +78,25 @@ pub struct Args {
 
     /// Algorithm-specific integer parameters (1 to 3 values); see
     /// [`help_text`] for what each value means per algorithm. For
-    /// `--algorithm=cdcl`, this holds only the first (SelectVar)
-    /// value -- the second (a memory limit) is parsed separately into
-    /// `memory_limit_bytes`, since it isn't a plain integer.
+    /// `--algorithm=cdcl`, this holds the first (SelectVar) and second
+    /// (restart strategy, STAGE15.md) values -- the third (a memory
+    /// limit) is parsed separately into `memory_limit_bytes`, since it
+    /// isn't a plain integer.
     pub alg_params: Option<Vec<i64>>,
 
     /// Skip preprocessing (STAGE8.md); default is to run it.
     pub no_preprocessing: bool,
 
-    /// `--alg-params`/`-p`'s second value for `--algorithm=cdcl` only
-    /// (STAGE12.md): an optional learned-clause database memory
+    /// `--alg-params`/`-p`'s third value for `--algorithm=cdcl` only
+    /// (STAGE12.md; shifted from the second value to the third by
+    /// STAGE15.md, which inserted the restart strategy as the new
+    /// second value): an optional learned-clause database memory
     /// limit, in bytes. Parsed by [`parse_byte_size`] from either a
     /// plain integer (bytes) or an integer immediately followed by
     /// "k"/"kb"/"m"/"mb"/"g"/"gb" (case-insensitive; see
-    /// `--alg-params 0 100MB` in the help text). `None` if not given,
-    /// in which case the database grows without bound, as it did
-    /// before this stage.
+    /// `--alg-params 0 1 100MB` in the help text). `None` if not
+    /// given, in which case the database grows without bound, as it
+    /// did before Stage 12.
     pub memory_limit_bytes: Option<i64>,
 }
 
@@ -197,18 +201,46 @@ Options:
                LRB and the older structural heuristics on this
                project's actual (uniform random 3-SAT) benchmark set,
                so that measurement is what this default follows.
-               val2 = an optional learned-clause database memory
-                     limit (STAGE12.md): once the estimated size of
-                     the database exceeds this, the least "active"
-                     learned clauses are periodically deleted
-                     (MiniSat-style) to keep it under control. Either
-                     a plain integer (a number of bytes) or an
-                     integer immediately followed by one of "k",
-                     "kb", "m", "mb", "g", or "gb" (case-insensitive),
-                     e.g. "--alg-params 2 100MB". Omitted by default,
-                     in which case the database grows without bound.
-                     Note: val1 must be given to set val2, even if
-                     val1 is just the default (2).
+               val2 = restart strategy (STAGE15.md): periodically
+                     abandons the current decision stack and starts
+                     over from the root, keeping every learned clause
+                     collected so far -- this escapes runs of bad
+                     early decisions.
+                 0 = no restarts.
+                 1 = the Luby, Sinclair & Zuckerman sequence: restart
+                     intervals of 1, 1, 2, 1, 1, 2, 4, ... (in
+                     conflicts, times an internal scale constant).
+                 2 = a quadratic "polynomial" growth sequence: restart
+                     intervals of 1^2, 2^2, 3^2, 4^2, ... (in
+                     conflicts, times an internal scale constant).
+                 3 = the true geometric growth sequence: restart
+                     intervals grow by a constant ratio each time (in
+                     conflicts, times internal scale constants) --
+                     this is what "geometric restarts" conventionally
+                     means in the SAT literature (val2=2's sequence
+                     was originally, incorrectly, called "geometric";
+                     see reports/REPORT15.md).
+               Optional; defaults to 2 (polynomial) if not given: this
+               project's own benchmark comparison (reports/REPORT15.md)
+               found the polynomial schedule clearly ahead of no
+               restarts and of Luby on this project's actual benchmark
+               set, especially for proving UNSAT. Note: val1 must be
+               given to set val2, even if val1 is just the default
+               (2).
+               val3 = an optional learned-clause database memory
+                     limit (STAGE12.md; this was val2 before
+                     STAGE15.md added the restart strategy above):
+                     once the estimated size of the database exceeds
+                     this, the least "active" learned clauses are
+                     periodically deleted (MiniSat-style) to keep it
+                     under control. Either a plain integer (a number
+                     of bytes) or an integer immediately followed by
+                     one of "k", "kb", "m", "mb", "g", or "gb"
+                     (case-insensitive), e.g. "--alg-params 2 1 100MB".
+                     Omitted by default, in which case the database
+                     grows without bound. Note: val1 and val2 must
+                     both be given to set val3, even if they are just
+                     the defaults (2 and 1).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -246,17 +278,20 @@ impl Args {
 /// Converts a [`RawArgs`] (clap's direct parse, with `alg_params` as
 /// raw string tokens) into the typed [`Args`] callers use: every
 /// `--alg-params` token is parsed as a plain integer, except
-/// `--algorithm=cdcl`'s second token, which is parsed as a memory
+/// `--algorithm=cdcl`'s third token, which is parsed as a memory
 /// size instead (see [`parse_byte_size`] and the module doc comment).
+/// STAGE15.md's restart strategy is `--algorithm=cdcl`'s second
+/// value, a plain integer appended to `alg_params` just like the
+/// first.
 fn build_args(raw: RawArgs) -> Result<Args, String> {
     let mut alg_params: Vec<i64> = Vec::new();
     let mut memory_limit_bytes: Option<i64> = None;
 
     if let Some(values) = &raw.alg_params {
         if raw.algorithm == "cdcl" {
-            if values.len() > 2 {
+            if values.len() > 3 {
                 return Err(
-                    "for --algorithm=cdcl, --alg-params accepts at most two values (0 or 1 selecting which SelectVar heuristic to use, and an optional learned-clause database memory limit)"
+                    "for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-3 selecting the restart strategy, and an optional learned-clause database memory limit)"
                         .to_string(),
                 );
             }
@@ -267,7 +302,13 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
                 alg_params.push(p);
             }
             if let Some(second) = values.get(1) {
-                let limit = parse_byte_size(second)
+                let p = second
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid value for --alg-params: \"{second}\""))?;
+                alg_params.push(p);
+            }
+            if let Some(third) = values.get(2) {
+                let limit = parse_byte_size(third)
                     .map_err(|e| format!("invalid memory limit for --alg-params: {e}"))?;
                 memory_limit_bytes = Some(limit);
             }
@@ -428,20 +469,31 @@ fn validate(args: &Args) -> Result<(), String> {
         }
 
         "cdcl" => {
-            // The at-most-two-values check and the memory limit's own
-            // syntax (plain integer, optionally with a
+            // The at-most-three-values check and the memory limit's
+            // own syntax (plain integer, optionally with a
             // k/kb/m/mb/g/gb suffix) were already enforced in
             // build_args, since that's where the raw tokens are
             // available; only the remaining business rules (variant
-            // is 0-3; the limit, if given, is positive) are checked
-            // here. STAGE13.md extends the first value's range from
-            // dfs's 0/1 (Weighted/Fast) to also allow 2 (VSIDS) and 3
-            // (LRB), both cdcl-only.
+            // is 0-3; restart strategy is 0-3; the limit, if given,
+            // is positive) are checked here. STAGE13.md extends the
+            // first value's range from dfs's 0/1 (Weighted/Fast) to
+            // also allow 2 (VSIDS) and 3 (LRB), both cdcl-only.
+            // STAGE15.md adds the second value (restart strategy: 0 =
+            // none, 1 = Luby, 2 = polynomial, 3 = geometric).
             if let Some(params) = &args.alg_params
                 && !(0..=3).contains(&params[0])
             {
                 return Err(
                     "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)"
+                        .to_string(),
+                );
+            }
+            if let Some(params) = &args.alg_params
+                && let Some(&restart) = params.get(1)
+                && !(0..=3).contains(&restart)
+            {
+                return Err(
+                    "for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, or 3 (selecting the restart strategy)"
                         .to_string(),
                 );
             }
@@ -771,19 +823,56 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cdcl_rejects_three_alg_params() {
-        // STAGE12.md adds a second value (the memory limit), but no
-        // third.
+    fn test_parse_cdcl_rejects_four_alg_params() {
+        // STAGE15.md's restart strategy makes three the maximum
+        // (SelectVar variant, restart strategy, memory limit).
         let result = Args::parse_from_args([
             "vibe_sat",
             "--input=problem.cnf",
             "--algorithm=cdcl",
             "--alg-params",
             "0",
+            "1",
             "100",
             "5",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cdcl_accepts_restart_strategy() {
+        for restart in [0i64, 1i64, 2i64, 3i64] {
+            let args = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                "2",
+                &restart.to_string(),
+            ])
+            .unwrap_or_else(|e| {
+                panic!("Parse returned unexpected error for --alg-params 2 {restart}: {e}")
+            });
+            assert_eq!(args.alg_params, Some(vec![2, restart]));
+        }
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_out_of_range_restart_strategy() {
+        for restart in ["4", "-1"] {
+            let result = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                "2",
+                restart,
+            ]);
+            assert!(
+                result.is_err(),
+                "expected error for --alg-params 2 {restart} with --algorithm=cdcl"
+            );
+        }
     }
 
     #[test]
@@ -806,15 +895,16 @@ mod tests {
                 "--algorithm=cdcl",
                 "--alg-params",
                 "0",
+                "0",
                 token,
             ])
             .unwrap_or_else(|e| {
-                panic!("Parse returned unexpected error for --alg-params 0 {token}: {e}")
+                panic!("Parse returned unexpected error for --alg-params 0 0 {token}: {e}")
             });
             assert_eq!(
                 args.memory_limit_bytes,
                 Some(want),
-                "--alg-params 0 {token}"
+                "--alg-params 0 0 {token}"
             );
         }
     }
@@ -822,7 +912,7 @@ mod tests {
     #[test]
     fn test_parse_cdcl_rejects_memory_limit_as_first_value() {
         // "100MB" alone is positionally val1 (the SelectVar
-        // selector), not val2, and is not a valid SelectVar value.
+        // selector), not val3, and is not a valid SelectVar value.
         let result = Args::parse_from_args([
             "vibe_sat",
             "--input=problem.cnf",
@@ -842,6 +932,7 @@ mod tests {
                 "--algorithm=cdcl",
                 "--alg-params",
                 "0",
+                "0",
                 bad,
             ]);
             assert!(
@@ -858,6 +949,7 @@ mod tests {
             "--input=problem.cnf",
             "--algorithm=cdcl",
             "--alg-params",
+            "0",
             "0",
             "0",
         ]);

@@ -235,13 +235,19 @@ fn run_dfs(
 /// and 2/3 (STAGE13.md) select cdcl's own VSIDS/LRB heuristics;
 /// unlike `dfs`, `cdcl` defaults to VSIDS (`cdcl::SelectVarVariant::Vsids`)
 /// if `--alg-params` is omitted entirely, per `cdcl`'s own module doc
-/// comment. `args.memory_limit_bytes` (if given, via `--alg-params`'s
-/// second value: STAGE12.md) bounds the learned-clause database's
-/// estimated size, past which the least active learned clauses are
-/// periodically deleted; `None` leaves it unbounded, as before
-/// Stage 12. If `preresult` is `Some`, the found assignment is
-/// reconstructed back to `original_num_vars` variables before being
-/// written out.
+/// comment. `args.alg_params[1]` (if given, via `--alg-params`'s
+/// second value: STAGE15.md) selects the restart strategy: 0 disables
+/// restarts, 1 selects the Luby sequence, 2 selects the quadratic
+/// "polynomial" sequence, 3 selects the true geometric sequence;
+/// `cdcl` defaults to the polynomial sequence
+/// (`cdcl::RestartStrategy::Polynomial`) if not given.
+/// `args.memory_limit_bytes` (if given, via `--alg-params`'s third
+/// value: STAGE12.md, moved from the second value by STAGE15.md)
+/// bounds the learned-clause database's estimated size, past which
+/// the least active learned clauses are periodically deleted; `None`
+/// leaves it unbounded, as before Stage 12. If `preresult` is `Some`,
+/// the found assignment is reconstructed back to `original_num_vars`
+/// variables before being written out.
 fn run_cdcl(
     problem: &cnf::Problem,
     preresult: &Option<PreprocessResult>,
@@ -265,17 +271,29 @@ fn run_cdcl(
     // VSIDS is the default here (unlike dfs, which keeps its own
     // Weighted default).
     let variant = match args.alg_params.as_deref() {
-        Some([0]) => cdcl::SelectVarVariant::Weighted,
-        Some([1]) => cdcl::SelectVarVariant::Fast,
-        Some([2]) => cdcl::SelectVarVariant::Vsids,
-        Some([3]) => cdcl::SelectVarVariant::Lrb,
+        Some([0, ..]) => cdcl::SelectVarVariant::Weighted,
+        Some([1, ..]) => cdcl::SelectVarVariant::Fast,
+        Some([2, ..]) => cdcl::SelectVarVariant::Vsids,
+        Some([3, ..]) => cdcl::SelectVarVariant::Lrb,
         _ => cdcl::SelectVarVariant::Vsids,
+    };
+
+    // STAGE15.md leaves the default restart strategy up to this
+    // implementation too; see cdcl::run's doc comment for why it's
+    // RestartStrategy::Polynomial.
+    let restart_strategy = match args.alg_params.as_deref() {
+        Some([_, 0, ..]) => cdcl::RestartStrategy::None,
+        Some([_, 1, ..]) => cdcl::RestartStrategy::Luby,
+        Some([_, 2, ..]) => cdcl::RestartStrategy::Polynomial,
+        Some([_, 3, ..]) => cdcl::RestartStrategy::Geometric,
+        _ => cdcl::RestartStrategy::Polynomial,
     };
 
     let result = cdcl::run(
         problem,
         time_limit,
         variant,
+        restart_strategy,
         args.memory_limit_bytes,
         &mut rng,
         args.verbose,
