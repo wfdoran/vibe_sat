@@ -72,8 +72,19 @@ Options:
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
           cdcl val1 = which SelectVar heuristic to use, same meaning
-                     and default as "dfs" above (STAGE11.md adds no
-                     new algorithm parameters of its own).
+                     and default as "dfs" above.
+               val2 = an optional learned-clause database memory
+                     limit (STAGE12.md): once the estimated size of
+                     the database exceeds this, the least "active"
+                     learned clauses are periodically deleted
+                     (MiniSat-style) to keep it under control. Either
+                     a plain integer (a number of bytes) or an
+                     integer immediately followed by one of "k",
+                     "kb", "m", "mb", "g", or "gb" (case-insensitive),
+                     e.g. "--alg-params 0 100MB". Omitted by default,
+                     in which case the database grows without bound.
+                     Note: val1 must be given to set val2, even if
+                     val1 is just the default (0).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal

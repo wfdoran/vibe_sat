@@ -26,11 +26,19 @@
 // algorithm selectable via --algorithm=cdcl/-a cdcl, sharing dfs's
 // SelectVar heuristics (dfs.SelectVar/dfs.SelectVarFastPick) but
 // nothing else.
+//
+// STAGE12.md adds learned-clause database management: once the
+// estimated size of the clause database (see clauseByteCost) exceeds
+// an optional user-supplied memory limit, reduceClauseDatabase deletes
+// the least "active" half of the learned clauses that are safe to
+// delete (see its doc comment), MiniSat-style (Eén & Sörensson,
+// "An Extensible SAT-solver," SAT 2003).
 package cdcl
 
 import (
 	"fmt"
 	"math/rand/v2"
+	"sort"
 	"time"
 
 	"vibe_sat/internal/assign"
@@ -51,6 +59,36 @@ const noReason = -1
 // dfs's timeCheckInterval and for the same reason: checking the clock
 // on every single step would add needless overhead.
 const timeCheckInterval = 0xfff
+
+// bytesPerLiteral and perClauseOverheadBytes approximate the memory
+// footprint of one clause, for comparing against a user-supplied
+// --alg-params memory limit (STAGE12.md): 4 bytes per cnf.Literal
+// (an int32), plus a fixed overhead per clause standing in for its
+// slice header and its parallel watch/activity slots (see solver's
+// watch/activity fields). This is deliberately an approximation, not
+// an exact accounting of Go's actual heap usage -- the point is a
+// reduction policy that responds sensibly to a size budget, not a
+// byte-for-byte memory profiler.
+const (
+	bytesPerLiteral        = 4
+	perClauseOverheadBytes = 40
+)
+
+// clauseActivityDecay and clauseActivityRescaleThreshold implement
+// MiniSat's clause activity bookkeeping (see solver's activity
+// field): rather than multiplying every clause's activity by
+// clauseActivityDecay after every conflict (an O(clauses) cost per
+// conflict), the single clauseActivityIncrement is grown by
+// 1/clauseActivityDecay instead, which has the same relative effect
+// (older bumps count for less compared to newer ones) at O(1) cost.
+// If the increment ever grows past clauseActivityRescaleThreshold,
+// every clause's activity and the increment itself are divided back
+// down by the same factor, to stay well within float64's range over
+// a very long run.
+const (
+	clauseActivityDecay            = 0.999
+	clauseActivityRescaleThreshold = 1e100
+)
 
 // Result describes the outcome of a CDCL search.
 type Result struct {
@@ -79,6 +117,36 @@ type solver struct {
 	watch   [][2]cnf.Literal
 	lists   *occurrence.Lists
 
+	// numOriginalClauses is len(clauses) immediately after bootstrap,
+	// before any clause is learned. Every clause at an index below
+	// this is part of the original (bootstrapped) problem and must
+	// never be deleted; only clauses at or above it are learned, and
+	// so are eligible for reduceClauseDatabase to consider. Since
+	// reduceClauseDatabase only ever removes entries at indices >=
+	// numOriginalClauses while preserving the relative order of
+	// everything else, this threshold stays valid across any number
+	// of reduction passes without needing to be updated.
+	numOriginalClauses int
+
+	// activity holds one MiniSat-style "activity" score per clause
+	// (see clauseActivityDecay), parallel to clauses; only entries at
+	// index >= numOriginalClauses are ever read or written, since
+	// original clauses are never deletion candidates.
+	activity                []float64
+	clauseActivityIncrement float64
+
+	// estimatedBytes tracks clauseByteCost summed over every current
+	// clause, kept up to date incrementally as clauses are learned or
+	// deleted (rather than recomputed from scratch on every check) --
+	// except immediately after a reduction pass, where recomputing it
+	// once from the (now much shorter) clause list is simpler than
+	// trying to track the exact amount subtracted.
+	estimatedBytes int64
+	// memoryLimitBytes is the optional --alg-params-supplied limit
+	// (STAGE12.md); nil means "no limit" (STAGE11.md's original,
+	// unbounded behavior).
+	memoryLimitBytes *int64
+
 	x            assign.Assignment // current (partial) assignment
 	level        []int             // level[v] = decision level at which v was assigned (meaningless if x[v] is Unassigned)
 	reason       []int             // reason[v] = index into clauses of the clause that forced v, or noReason for a decision or a level-0 fact
@@ -93,13 +161,21 @@ type solver struct {
 	numConflicts int
 }
 
+// clauseByteCost estimates clause's contribution to the clause
+// database's memory footprint; see bytesPerLiteral/perClauseOverheadBytes.
+func clauseByteCost(clause cnf.Clause) int64 {
+	return perClauseOverheadBytes + int64(len(clause))*bytesPerLiteral
+}
+
 // newSolver builds the initial solver state for problem: a defensive
 // bootstrap round of unit propagation (see dfs.Run's identical
 // bootstrap step for why this is needed even though Stage 8's
 // preprocessing already does this by default), followed by initial
-// watch state for whatever clauses survive it. ok is false if this
-// bootstrap alone already proves problem unsatisfiable.
-func newSolver(problem *cnf.Problem) (s *solver, ok bool) {
+// watch state for whatever clauses survive it. memoryLimitBytes is
+// the optional learned-clause database memory limit (STAGE12.md); nil
+// means unbounded. ok is false if this bootstrap alone already proves
+// problem unsatisfiable.
+func newSolver(problem *cnf.Problem, memoryLimitBytes *int64) (s *solver, ok bool) {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	x := assign.New(problem.NumVars)
 	if unsat, _ := preprocess.UnitPropagate(&clauses, x); unsat {
@@ -107,6 +183,7 @@ func newSolver(problem *cnf.Problem) (s *solver, ok bool) {
 	}
 
 	watch := make([][2]cnf.Literal, len(clauses))
+	var estimatedBytes int64
 	for c, clause := range clauses {
 		first, foundFirst := chooseWatch(clause, x, 0)
 		if !foundFirst {
@@ -117,6 +194,7 @@ func newSolver(problem *cnf.Problem) (s *solver, ok bool) {
 			return nil, false
 		}
 		watch[c] = [2]cnf.Literal{first, second}
+		estimatedBytes += clauseByteCost(clause)
 	}
 
 	reason := make([]int, problem.NumVars+1)
@@ -125,15 +203,20 @@ func newSolver(problem *cnf.Problem) (s *solver, ok bool) {
 	}
 
 	return &solver{
-		numVars:  problem.NumVars,
-		clauses:  clauses,
-		watch:    watch,
-		lists:    occurrence.Build(&cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}),
-		x:        x,
-		level:    make([]int, problem.NumVars+1),
-		reason:   reason,
-		trailLim: []int{0},
-		seen:     make([]bool, problem.NumVars+1),
+		numVars:                 problem.NumVars,
+		clauses:                 clauses,
+		watch:                   watch,
+		lists:                   occurrence.Build(&cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}),
+		numOriginalClauses:      len(clauses),
+		activity:                make([]float64, len(clauses)),
+		clauseActivityIncrement: 1.0,
+		estimatedBytes:          estimatedBytes,
+		memoryLimitBytes:        memoryLimitBytes,
+		x:                       x,
+		level:                   make([]int, problem.NumVars+1),
+		reason:                  reason,
+		trailLim:                []int{0},
+		seen:                    make([]bool, problem.NumVars+1),
 	}, true
 }
 
@@ -147,17 +230,22 @@ func newSolver(problem *cnf.Problem) (s *solver, ok bool) {
 //
 // variant selects which of dfs.SelectVar/dfs.SelectVarFastPick is
 // used to pick the branching variable at every decision (see
-// dfs.SelectVarVariant); per STAGE11.md, this is the only algorithm
-// parameter cdcl currently accepts, same as dfs.
+// dfs.SelectVarVariant); per STAGE11.md, this is the first algorithm
+// parameter cdcl accepts, same as dfs. memoryLimitBytes is the
+// second, optional, STAGE12.md algorithm parameter: once the
+// estimated size of the learned-clause database exceeds it, the
+// least active learned clauses are periodically deleted (see
+// reduceClauseDatabase); nil means unbounded, matching cdcl's
+// original (Stage 11) behavior.
 //
 // If timeLimit is non-nil, the search gives up and reports an
 // inconclusive result (Satisfiable == false, TimedOut == true) once
 // it is exceeded, checked only periodically (see timeCheckInterval).
 // rng supplies the randomness SelectVar uses to break ties, and
 // verbose controls progress output, matching dfs.Run.
-func Run(problem *cnf.Problem, timeLimit *time.Duration, variant dfs.SelectVarVariant, rng *rand.Rand, verbose int) Result {
+func Run(problem *cnf.Problem, timeLimit *time.Duration, variant dfs.SelectVarVariant, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
-		fmt.Println("cdcl:", describeParams(timeLimit, variant))
+		fmt.Println("cdcl:", describeParams(timeLimit, variant)+describeMemoryLimit(memoryLimitBytes))
 	}
 
 	if problem.NumVars == 0 {
@@ -168,7 +256,7 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant dfs.SelectVarVa
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	s, ok := newSolver(problem)
+	s, ok := newSolver(problem, memoryLimitBytes)
 	if !ok {
 		if verbose >= 1 {
 			fmt.Println("UNSAT")
@@ -331,11 +419,30 @@ func (s *solver) propagate() int {
 // which is now a forced consequence of the learned clause, not a
 // fresh decision, so the next call to propagate() will pick it up
 // from the trail exactly like any other propagated literal.
+//
+// Once per conflict (matching MiniSat's claDecayActivity), the clause
+// activity increment is grown so that future activity bumps (in
+// analyze) count for relatively more than past ones -- the O(1)
+// equivalent of decaying every clause's activity individually. If a
+// memory limit was given (STAGE12.md) and the database's estimated
+// size has grown past it, reduceClauseDatabase is triggered.
 func (s *solver) learnAndBackjump(confl int) {
 	learned, backtrackLevel := s.analyze(confl)
 	s.backtrackTo(backtrackLevel)
 	newClause := s.addLearnedClause(learned)
 	s.assignLiteral(learned[0], backtrackLevel, newClause)
+
+	s.clauseActivityIncrement /= clauseActivityDecay
+	if s.clauseActivityIncrement > clauseActivityRescaleThreshold {
+		for i := range s.activity {
+			s.activity[i] /= clauseActivityRescaleThreshold
+		}
+		s.clauseActivityIncrement /= clauseActivityRescaleThreshold
+	}
+
+	if s.memoryLimitBytes != nil && s.estimatedBytes > *s.memoryLimitBytes {
+		s.reduceClauseDatabase()
+	}
 }
 
 // analyze walks the implication graph backward from the clause at
@@ -356,6 +463,13 @@ func (s *solver) learnAndBackjump(confl int) {
 // doc comment for references); level-0 literals are omitted entirely,
 // since they are permanent facts that can never become unassigned
 // again and so need no antecedent recorded in the learned clause.
+//
+// As a side effect (STAGE12.md), every learned clause visited along
+// the way (every reasonClause at index >= s.numOriginalClauses) has
+// its activity bumped by s.clauseActivityIncrement, MiniSat's measure
+// of how useful a clause has recently been to conflict analysis --
+// this is what reduceClauseDatabase later uses to decide which
+// learned clauses to keep.
 func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
 	for i := range s.seen {
 		s.seen[i] = false
@@ -367,6 +481,9 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
 	reasonClause := confl
 
 	for {
+		if reasonClause >= s.numOriginalClauses {
+			s.activity[reasonClause] += s.clauseActivityIncrement
+		}
 		for _, lit := range s.clauses[reasonClause] {
 			if p != 0 && lit.Var() == p.Var() {
 				continue
@@ -466,6 +583,8 @@ func (s *solver) addLearnedClause(learned cnf.Clause) int {
 
 	idx := len(s.clauses)
 	s.clauses = append(s.clauses, learned)
+	s.activity = append(s.activity, 0.0)
+	s.estimatedBytes += clauseByteCost(learned)
 	for _, lit := range learned {
 		v := lit.Var()
 		if lit.IsNegative() {
@@ -490,6 +609,84 @@ func (s *solver) addLearnedClause(learned cnf.Clause) int {
 	}
 	s.watch = append(s.watch, [2]cnf.Literal{learned[0], learned[best]})
 	return idx
+}
+
+// reduceClauseDatabase deletes roughly the least active half of the
+// learned clauses that are safe to delete, MiniSat-style (see the
+// package doc comment), to bring the database's estimated size back
+// under control. A learned clause is "safe to delete" if it is not
+// currently locked: locked means it is some currently assigned
+// variable's reason (reason[v] for some v with x[v] != Unassigned),
+// since analyze may still need to walk through it if that variable's
+// assignment participates in a future conflict. Clauses at index <
+// s.numOriginalClauses (the original, bootstrapped problem) are never
+// candidates at all -- deleting one of those would be unsound, not
+// just wasteful.
+//
+// Deleting from the middle of s.clauses would silently invalidate
+// every other index into it (every watch entry, every reason[v], and
+// every occurrence.Lists entry), so this rebuilds all of them
+// together from an old-index-to-new-index map, rather than trying to
+// patch each in place. This is an O(current clauses + literals)
+// operation, which is fine since it only runs when the configured
+// memory limit is actually exceeded, not on every conflict.
+func (s *solver) reduceClauseDatabase() {
+	locked := make([]bool, len(s.clauses))
+	for v := 1; v <= s.numVars; v++ {
+		if s.x[v] != assign.Unassigned && s.reason[v] != noReason {
+			locked[s.reason[v]] = true
+		}
+	}
+
+	var eligible []int
+	for idx := s.numOriginalClauses; idx < len(s.clauses); idx++ {
+		if !locked[idx] {
+			eligible = append(eligible, idx)
+		}
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		return s.activity[eligible[i]] < s.activity[eligible[j]]
+	})
+
+	numToDelete := len(eligible) / 2
+	if numToDelete == 0 {
+		return // nothing eligible to delete; not worth a full rebuild
+	}
+	toDelete := make([]bool, len(s.clauses))
+	for _, idx := range eligible[:numToDelete] {
+		toDelete[idx] = true
+	}
+
+	oldToNew := make([]int, len(s.clauses))
+	newClauses := make([]cnf.Clause, 0, len(s.clauses)-numToDelete)
+	newWatch := make([][2]cnf.Literal, 0, len(s.clauses)-numToDelete)
+	newActivity := make([]float64, 0, len(s.clauses)-numToDelete)
+	for idx, clause := range s.clauses {
+		if toDelete[idx] {
+			oldToNew[idx] = noReason
+			continue
+		}
+		oldToNew[idx] = len(newClauses)
+		newClauses = append(newClauses, clause)
+		newWatch = append(newWatch, s.watch[idx])
+		newActivity = append(newActivity, s.activity[idx])
+	}
+
+	for v := 1; v <= s.numVars; v++ {
+		if s.x[v] != assign.Unassigned && s.reason[v] != noReason {
+			s.reason[v] = oldToNew[s.reason[v]]
+		}
+	}
+
+	s.clauses = newClauses
+	s.watch = newWatch
+	s.activity = newActivity
+	s.lists = occurrence.Build(&cnf.Problem{NumVars: s.numVars, Clauses: newClauses})
+
+	s.estimatedBytes = 0
+	for _, clause := range newClauses {
+		s.estimatedBytes += clauseByteCost(clause)
+	}
 }
 
 // chooseWatch scans clause for a literal that is not false under
@@ -532,4 +729,14 @@ func describeParams(timeLimit *time.Duration, variant dfs.SelectVarVariant) stri
 		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
 	}
 	return description
+}
+
+// describeMemoryLimit formats an optional STAGE12.md memory limit for
+// the "cdcl:" announcement printed at verbose level 1, in whichever
+// unit main.go's --alg-params parsing recorded it in bytes as.
+func describeMemoryLimit(memoryLimitBytes *int64) string {
+	if memoryLimitBytes == nil {
+		return ""
+	}
+	return fmt.Sprintf(" memory_limit_bytes=%d", *memoryLimitBytes)
 }

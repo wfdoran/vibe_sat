@@ -196,9 +196,13 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 // a search that exhausts its space without a time limit produces a
 // proven UNSAT verdict, not just "not found". args.AlgParams[0] (if
 // given) selects the SelectVar variant, with the same meaning and
-// default as "dfs" -- STAGE11.md adds no algorithm parameters of its
-// own. If preResult is non-nil, the found assignment is reconstructed
-// back to originalNumVars variables before being written out.
+// default as "dfs". args.MemoryLimitBytes (if given, via
+// --alg-params's second value: STAGE12.md) bounds the learned-clause
+// database's estimated size, past which the least active learned
+// clauses are periodically deleted; nil leaves it unbounded, as
+// before Stage 12. If preResult is non-nil, the found assignment is
+// reconstructed back to originalNumVars variables before being
+// written out.
 func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
 	rng := newSeededRand()
 
@@ -213,7 +217,7 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 		variant = dfs.SelectVarVariant(args.AlgParams[0])
 	}
 
-	result := cdcl.Run(problem, timeLimit, variant, rng, args.Verbose)
+	result := cdcl.Run(problem, timeLimit, variant, args.MemoryLimitBytes, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

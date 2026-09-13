@@ -1,6 +1,7 @@
 package cdcl
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -52,7 +53,7 @@ func TestNewSolverDetectsBootstrapContradiction(t *testing.T) {
 		NumVars: 1,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
 	}
-	_, ok := newSolver(problem)
+	_, ok := newSolver(problem, nil)
 	if ok {
 		t.Errorf("newSolver() reported ok = true for a contradictory unit-clause pair")
 	}
@@ -66,7 +67,7 @@ func TestPropagatePropagatesUnitChain(t *testing.T) {
 		NumVars: 3,
 		Clauses: []cnf.Clause{{cnf.Literal(-1), cnf.Literal(-2)}, {cnf.Literal(2), cnf.Literal(3)}},
 	}
-	s, ok := newSolver(problem)
+	s, ok := newSolver(problem, nil)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -115,7 +116,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-4)},
 		},
 	}
-	s, ok := newSolver(problem)
+	s, ok := newSolver(problem, nil)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -144,7 +145,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 // none: it becomes a permanent level-0 fact instead).
 func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem)
+	s, ok := newSolver(problem, nil)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -165,7 +166,7 @@ func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 // highest decision level.
 func TestAddLearnedClauseWatchesAssertingLiteralAndHighestLevel(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem)
+	s, ok := newSolver(problem, nil)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -193,7 +194,7 @@ func TestRunFindsSatisfiableFormula(t *testing.T) {
 
 	for _, variant := range []dfs.SelectVarVariant{dfs.SelectVarWeighted, dfs.SelectVarFast} {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, variant, rng, 0)
+		result := Run(problem, nil, variant, nil, rng, 0)
 		if !result.Satisfiable {
 			t.Fatalf("variant %v: Run() reported unsatisfiable for a satisfiable formula", variant)
 		}
@@ -233,7 +234,7 @@ func TestRunProvesUnsatisfiableSmallFormula(t *testing.T) {
 
 	for _, variant := range []dfs.SelectVarVariant{dfs.SelectVarWeighted, dfs.SelectVarFast} {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, variant, rng, 0)
+		result := Run(problem, nil, variant, nil, rng, 0)
 		if result.Satisfiable {
 			t.Fatalf("variant %v: Run() reported satisfiable for an unsatisfiable formula", variant)
 		}
@@ -252,7 +253,7 @@ func TestRunProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(4, 3)
 	rng := rand.New(rand.NewPCG(9, 9))
 
-	result := Run(problem, nil, dfs.SelectVarFast, rng, 0)
+	result := Run(problem, nil, dfs.SelectVarFast, nil, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -267,13 +268,13 @@ func TestRunHandlesZeroVariableProblems(t *testing.T) {
 	rng := rand.New(rand.NewPCG(6, 6))
 
 	satProblem := &cnf.Problem{NumVars: 0, Clauses: nil}
-	result := Run(satProblem, nil, dfs.SelectVarWeighted, rng, 0)
+	result := Run(satProblem, nil, dfs.SelectVarWeighted, nil, rng, 0)
 	if !result.Satisfiable {
 		t.Error("Run() reported unsatisfiable for an empty problem")
 	}
 
 	unsatProblem := &cnf.Problem{NumVars: 0, Clauses: []cnf.Clause{{}}}
-	result = Run(unsatProblem, nil, dfs.SelectVarWeighted, rng, 0)
+	result = Run(unsatProblem, nil, dfs.SelectVarWeighted, nil, rng, 0)
 	if result.Satisfiable {
 		t.Error("Run() reported satisfiable for a problem with an empty clause")
 	}
@@ -287,13 +288,148 @@ func TestRunRespectsTimeLimit(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
 	tiny := time.Duration(1)
 
-	result := Run(problem, &tiny, dfs.SelectVarWeighted, rng, 0)
+	result := Run(problem, &tiny, dfs.SelectVarWeighted, nil, rng, 0)
 
 	if !result.TimedOut {
 		t.Error("expected TimedOut = true with a 1ns time limit")
 	}
 	if result.Satisfiable {
 		t.Error("expected Satisfiable = false when timed out")
+	}
+}
+
+// TestClauseByteCost verifies the memory-estimate formula directly.
+func TestClauseByteCost(t *testing.T) {
+	got := clauseByteCost(cnf.Clause{1, 2, 3})
+	want := int64(perClauseOverheadBytes + 3*bytesPerLiteral)
+	if got != want {
+		t.Errorf("clauseByteCost() = %d, want %d", got, want)
+	}
+}
+
+// TestReduceClauseDatabaseKeepsLockedAndActiveClauses exercises
+// reduceClauseDatabase directly: given three learned clauses -- one
+// locked (currently some variable's reason), one unlocked with low
+// activity, and one unlocked with high activity -- only the unlocked,
+// low-activity one should be deleted, and every remaining reference
+// (reason[v] for the locked clause's variable, plus the occurrence
+// lists) must still be correct afterward.
+func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 5, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	idxLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)})
+	idxLocked := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)})
+	idxHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-3), cnf.Literal(5)})
+	s.activity[idxLow] = 1.0
+	s.activity[idxHigh] = 100.0
+
+	s.x[4] = assign.True
+	s.reason[4] = idxLocked
+
+	before := len(s.clauses)
+	s.reduceClauseDatabase()
+
+	if len(s.clauses) != before-1 {
+		t.Fatalf("len(s.clauses) = %d, want %d (exactly the low-activity clause removed)", len(s.clauses), before-1)
+	}
+
+	found := map[string]bool{}
+	for _, c := range s.clauses {
+		found[fmt.Sprint(c)] = true
+	}
+	if found[fmt.Sprint(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)})] {
+		t.Error("the unlocked, low-activity clause {-1,3} should have been deleted")
+	}
+	if !found[fmt.Sprint(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)})] {
+		t.Error("the locked clause {-2,4} should have survived")
+	}
+	if !found[fmt.Sprint(cnf.Clause{cnf.Literal(-3), cnf.Literal(5)})] {
+		t.Error("the unlocked, high-activity clause {-3,5} should have survived")
+	}
+
+	if got := s.clauses[s.reason[4]]; fmt.Sprint(got) != fmt.Sprint(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}) {
+		t.Errorf("reason[4] after reduction points to %v, want {-2,4}", got)
+	}
+	if len(s.lists.Negative[1]) != 0 {
+		t.Errorf("lists.Negative[1] = %v, want empty (its only clause, {-1,3}, was deleted)", s.lists.Negative[1])
+	}
+}
+
+// TestReduceClauseDatabaseNoOpWhenNothingEligible verifies that
+// reduceClauseDatabase does nothing (and, importantly, does not
+// panic) when every learned clause is currently locked.
+func TestReduceClauseDatabaseNoOpWhenNothingEligible(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2)})
+	s.x[2] = assign.True
+	s.reason[2] = idx
+
+	before := len(s.clauses)
+	s.reduceClauseDatabase()
+
+	if len(s.clauses) != before {
+		t.Errorf("len(s.clauses) = %d, want unchanged at %d", len(s.clauses), before)
+	}
+}
+
+// TestRunWithTinyMemoryLimitStillProvesUnsatisfiablePigeonhole is the
+// strongest available test of the whole reduction pipeline: a memory
+// limit set far below the problem's own baseline size forces
+// reduceClauseDatabase to run, and very likely actually delete
+// clauses, on nearly every conflict -- exactly the index-remapping
+// path (reason[], watch, occurrence lists all rebuilt together) that
+// would be easiest to get subtly wrong. The verdict must still match
+// Stage 11's (memory-limit-free) result for the same problem.
+func TestRunWithTinyMemoryLimitStillProvesUnsatisfiablePigeonhole(t *testing.T) {
+	problem := pigeonholeProblem(4, 3)
+	rng := rand.New(rand.NewPCG(9, 9))
+	limit := int64(200)
+
+	result := Run(problem, nil, dfs.SelectVarFast, &limit, rng, 0)
+
+	if result.Satisfiable {
+		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
+	}
+	if result.TimedOut {
+		t.Error("Run() timed out with no time limit set")
+	}
+}
+
+// TestRunWithMemoryLimitStillFindsSatisfiableFormula checks that a
+// memory limit doesn't interfere with the satisfiable path: the
+// returned assignment must still satisfy every clause.
+func TestRunWithMemoryLimitStillFindsSatisfiableFormula(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}, {cnf.Literal(-1), cnf.Literal(3)}, {cnf.Literal(-2), cnf.Literal(-3)}},
+	}
+	rng := rand.New(rand.NewPCG(1, 2))
+	limit := int64(64)
+
+	result := Run(problem, nil, dfs.SelectVarWeighted, &limit, rng, 0)
+
+	if !result.Satisfiable {
+		t.Fatal("Run() reported unsatisfiable for a satisfiable formula")
+	}
+	for ci, clause := range problem.Clauses {
+		satisfied := false
+		for _, lit := range clause {
+			if result.Assignment.LiteralIsTrue(lit) {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			t.Errorf("clause %d (%v) not satisfied by %v", ci, clause, result.Assignment)
+		}
 	}
 }
 

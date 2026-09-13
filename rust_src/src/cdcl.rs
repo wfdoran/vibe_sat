@@ -34,6 +34,14 @@
 //! reference, some not) into helper functions is always
 //! straightforward, unlike it would be if they were all fields of one
 //! shared struct being threaded through `&mut self` methods.
+//!
+//! STAGE12.md adds learned-clause database management: once the
+//! estimated size of the clause database (see [`clause_byte_cost`])
+//! exceeds an optional user-supplied memory limit,
+//! [`reduce_clause_database`] deletes the least "active" half of the
+//! learned clauses that are safe to delete (see its doc comment),
+//! MiniSat-style (Eén & Sörensson, "An Extensible SAT-solver," SAT
+//! 2003).
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -49,6 +57,39 @@ use crate::preprocess;
 /// and for the same reason: checking the clock on every single step
 /// would add needless overhead.
 const TIME_CHECK_INTERVAL: usize = 0xfff;
+
+/// `BYTES_PER_LITERAL` and `PER_CLAUSE_OVERHEAD_BYTES` approximate the
+/// memory footprint of one clause, for comparing against a
+/// user-supplied `--alg-params` memory limit (STAGE12.md): 4 bytes
+/// per [`Literal`] (an i32), plus a fixed overhead per clause
+/// standing in for its `Vec` header and its parallel watch/activity
+/// slots. This is deliberately an approximation, not an exact
+/// accounting of Rust's actual heap usage -- the point is a reduction
+/// policy that responds sensibly to a size budget, not a
+/// byte-for-byte memory profiler.
+const BYTES_PER_LITERAL: i64 = 4;
+const PER_CLAUSE_OVERHEAD_BYTES: i64 = 40;
+
+/// `CLAUSE_ACTIVITY_DECAY` and `CLAUSE_ACTIVITY_RESCALE_THRESHOLD`
+/// implement MiniSat's clause activity bookkeeping (see
+/// [`analyze`]'s activity bump): rather than multiplying every
+/// clause's activity by `CLAUSE_ACTIVITY_DECAY` after every conflict
+/// (an O(clauses) cost per conflict), the single
+/// clause-activity-increment is grown by `1/CLAUSE_ACTIVITY_DECAY`
+/// instead, which has the same relative effect (older bumps count
+/// for less compared to newer ones) at O(1) cost. If the increment
+/// ever grows past `CLAUSE_ACTIVITY_RESCALE_THRESHOLD`, every
+/// clause's activity and the increment itself are divided back down
+/// by the same factor, to stay well within f64's range over a very
+/// long run.
+const CLAUSE_ACTIVITY_DECAY: f64 = 0.999;
+const CLAUSE_ACTIVITY_RESCALE_THRESHOLD: f64 = 1e100;
+
+/// Estimates `clause`'s contribution to the clause database's memory
+/// footprint; see `BYTES_PER_LITERAL`/`PER_CLAUSE_OVERHEAD_BYTES`.
+fn clause_byte_cost(clause: &Clause) -> i64 {
+    PER_CLAUSE_OVERHEAD_BYTES + clause.len() as i64 * BYTES_PER_LITERAL
+}
 
 /// Describes the outcome of a CDCL search.
 pub struct SolveResult {
@@ -79,8 +120,13 @@ pub struct SolveResult {
 /// `variant` selects which of [`crate::dfs::select_var`]/
 /// [`crate::dfs::select_var_fast_pick`] is used to pick the branching
 /// variable at every decision (see [`SelectVarVariant`]); per
-/// STAGE11.md, this is the only algorithm parameter `cdcl` currently
-/// accepts, same as `dfs`.
+/// STAGE11.md, this is the first algorithm parameter `cdcl` accepts,
+/// same as `dfs`. `memory_limit_bytes` is the second, optional,
+/// STAGE12.md algorithm parameter: once the estimated size of the
+/// learned-clause database exceeds it, the least active learned
+/// clauses are periodically deleted (see [`reduce_clause_database`]);
+/// `None` means unbounded, matching `cdcl`'s original (Stage 11)
+/// behavior.
 ///
 /// If `time_limit` is `Some`, the search gives up and reports an
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
@@ -92,11 +138,16 @@ pub fn run<R: Rng>(
     problem: &Problem,
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
+    memory_limit_bytes: Option<i64>,
     rng: &mut R,
     verbose: i32,
 ) -> SolveResult {
     if verbose >= 1 {
-        println!("cdcl: {}", describe_params(time_limit, variant));
+        println!(
+            "cdcl: {}{}",
+            describe_params(time_limit, variant),
+            describe_memory_limit(memory_limit_bytes)
+        );
     }
 
     // A problem with no variables can only contain empty clauses (no
@@ -140,6 +191,15 @@ pub fn run<R: Rng>(
     let mut seen = vec![false; problem.num_vars + 1];
     let mut num_decisions = 0usize;
     let mut num_conflicts = 0usize;
+
+    // num_original_clauses marks the boundary below which a clause is
+    // part of the original (bootstrapped) problem and must never be
+    // deleted; only clauses at or above it are learned, and so are
+    // eligible for reduce_clause_database to consider (STAGE12.md).
+    let num_original_clauses = working_problem.clauses.len();
+    let mut activity = vec![0.0f64; num_original_clauses];
+    let mut clause_activity_increment = 1.0f64;
+    let mut estimated_bytes: i64 = working_problem.clauses.iter().map(clause_byte_cost).sum();
 
     let start_time = Instant::now();
     let mut step: usize = 0;
@@ -198,6 +258,9 @@ pub fn run<R: Rng>(
                 &x,
                 &mut seen,
                 current_level,
+                &mut activity,
+                clause_activity_increment,
+                num_original_clauses,
             );
             backtrack_to(
                 backtrack_level,
@@ -213,6 +276,8 @@ pub fn run<R: Rng>(
                 &mut lists,
                 &mut watch,
                 &level,
+                &mut activity,
+                &mut estimated_bytes,
             );
             assign_literal(
                 learned[0],
@@ -223,6 +288,33 @@ pub fn run<R: Rng>(
                 &mut reason,
                 &mut trail,
             );
+
+            // Once per conflict (matching MiniSat's claDecayActivity),
+            // grow the increment so future activity bumps count for
+            // relatively more than past ones -- the O(1) equivalent of
+            // decaying every clause's activity individually.
+            clause_activity_increment /= CLAUSE_ACTIVITY_DECAY;
+            if clause_activity_increment > CLAUSE_ACTIVITY_RESCALE_THRESHOLD {
+                for a in activity.iter_mut() {
+                    *a /= CLAUSE_ACTIVITY_RESCALE_THRESHOLD;
+                }
+                clause_activity_increment /= CLAUSE_ACTIVITY_RESCALE_THRESHOLD;
+            }
+
+            if let Some(limit) = memory_limit_bytes
+                && estimated_bytes > limit
+            {
+                reduce_clause_database(
+                    &mut working_problem.clauses,
+                    &mut lists,
+                    &mut watch,
+                    &mut activity,
+                    &mut estimated_bytes,
+                    &x,
+                    &mut reason,
+                    num_original_clauses,
+                );
+            }
             continue;
         }
 
@@ -414,6 +506,14 @@ fn propagate(
 /// entirely, since they are permanent facts that can never become
 /// unassigned again and so need no antecedent recorded in the learned
 /// clause. `seen` is scratch space, reset at the start of every call.
+///
+/// As a side effect (STAGE12.md), every learned clause visited along
+/// the way (every `reason_clause` at index >= `num_original_clauses`)
+/// has its activity (in `activity`) bumped by
+/// `clause_activity_increment`, MiniSat's measure of how useful a
+/// clause has recently been to conflict analysis -- this is what
+/// [`reduce_clause_database`] later uses to decide which learned
+/// clauses to keep.
 #[allow(clippy::too_many_arguments)]
 fn analyze(
     confl: usize,
@@ -424,6 +524,9 @@ fn analyze(
     x: &Assignment,
     seen: &mut [bool],
     current_level: usize,
+    activity: &mut [f64],
+    clause_activity_increment: f64,
+    num_original_clauses: usize,
 ) -> (Clause, usize) {
     for s in seen.iter_mut() {
         *s = false;
@@ -436,6 +539,9 @@ fn analyze(
     let mut learned: Clause = Vec::new();
 
     loop {
+        if reason_clause >= num_original_clauses {
+            activity[reason_clause] += clause_activity_increment;
+        }
         for &lit in &clauses[reason_clause] {
             if let Some(pl) = p
                 && cnf::literal_var(lit) == cnf::literal_var(pl)
@@ -536,13 +642,18 @@ fn backtrack_to(
 /// (asserting) literal is about to become a permanent level-0 fact,
 /// exactly like a variable fixed by the bootstrap unit propagation in
 /// [`bootstrap`]. Returns the new clause's index, or `None` if none
-/// was stored.
+/// was stored. `activity` gets a fresh `0.0` entry and
+/// `estimated_bytes` is increased by [`clause_byte_cost`] for the new
+/// clause (STAGE12.md), kept parallel to `clauses`/`watch`.
+#[allow(clippy::too_many_arguments)]
 fn add_learned_clause(
     learned: &Clause,
     clauses: &mut Vec<Clause>,
     lists: &mut Lists,
     watch: &mut Vec<[Literal; 2]>,
     level: &[usize],
+    activity: &mut Vec<f64>,
+    estimated_bytes: &mut i64,
 ) -> Option<usize> {
     if learned.len() == 1 {
         return None;
@@ -550,6 +661,8 @@ fn add_learned_clause(
 
     let idx = clauses.len();
     clauses.push(learned.clone());
+    activity.push(0.0);
+    *estimated_bytes += clause_byte_cost(learned);
     for &lit in learned {
         let v = cnf::literal_var(lit);
         if cnf::literal_is_negative(lit) {
@@ -574,6 +687,93 @@ fn add_learned_clause(
     }
     watch.push([learned[0], learned[best]]);
     Some(idx)
+}
+
+/// Deletes roughly the least active half of the learned clauses that
+/// are safe to delete, MiniSat-style (see the module doc comment), to
+/// bring the database's estimated size back under control. A learned
+/// clause is "safe to delete" if it is not currently locked: locked
+/// means it is some currently assigned variable's reason (`reason[v]`
+/// for some `v` with `x[v] != Value::Unassigned`), since [`analyze`]
+/// may still need to walk through it if that variable's assignment
+/// participates in a future conflict. Clauses at index <
+/// `num_original_clauses` (the original, bootstrapped problem) are
+/// never candidates at all -- deleting one of those would be
+/// unsound, not just wasteful.
+///
+/// Deleting from the middle of `clauses` would silently invalidate
+/// every other index into it (every watch entry, every `reason[v]`,
+/// and every occurrence [`Lists`] entry), so this rebuilds all of
+/// them together from an old-index-to-new-index map, rather than
+/// trying to patch each in place. This is an O(current clauses +
+/// literals) operation, which is fine since it only runs when the
+/// configured memory limit is actually exceeded, not on every
+/// conflict.
+#[allow(clippy::too_many_arguments)]
+fn reduce_clause_database(
+    clauses: &mut Vec<Clause>,
+    lists: &mut Lists,
+    watch: &mut Vec<[Literal; 2]>,
+    activity: &mut Vec<f64>,
+    estimated_bytes: &mut i64,
+    x: &Assignment,
+    reason: &mut [Option<usize>],
+    num_original_clauses: usize,
+) {
+    let mut locked = vec![false; clauses.len()];
+    for (v, &value) in x.iter().enumerate().skip(1) {
+        if value != Value::Unassigned
+            && let Some(r) = reason[v]
+        {
+            locked[r] = true;
+        }
+    }
+
+    let mut eligible: Vec<usize> = (num_original_clauses..clauses.len())
+        .filter(|&idx| !locked[idx])
+        .collect();
+    eligible.sort_by(|&a, &b| activity[a].partial_cmp(&activity[b]).unwrap());
+
+    let num_to_delete = eligible.len() / 2;
+    if num_to_delete == 0 {
+        return; // nothing eligible to delete; not worth a full rebuild
+    }
+    let mut to_delete = vec![false; clauses.len()];
+    for &idx in &eligible[..num_to_delete] {
+        to_delete[idx] = true;
+    }
+
+    let mut old_to_new = vec![None; clauses.len()];
+    let mut new_clauses = Vec::with_capacity(clauses.len() - num_to_delete);
+    let mut new_watch = Vec::with_capacity(clauses.len() - num_to_delete);
+    let mut new_activity = Vec::with_capacity(clauses.len() - num_to_delete);
+    for (idx, clause) in clauses.iter().enumerate() {
+        if to_delete[idx] {
+            continue;
+        }
+        old_to_new[idx] = Some(new_clauses.len());
+        new_clauses.push(clause.clone());
+        new_watch.push(watch[idx]);
+        new_activity.push(activity[idx]);
+    }
+
+    for (v, &value) in x.iter().enumerate().skip(1) {
+        if value != Value::Unassigned
+            && let Some(r) = reason[v]
+        {
+            reason[v] = old_to_new[r];
+        }
+    }
+
+    *estimated_bytes = new_clauses.iter().map(clause_byte_cost).sum();
+    let temp_problem = Problem {
+        num_vars: x.len() - 1,
+        clauses: new_clauses,
+    };
+    *lists = occurrence::build(&temp_problem);
+    *clauses = temp_problem.clauses;
+    *watch = new_watch;
+    *activity = new_activity;
 }
 
 /// Scans `clause` for a literal that is not false under `assignment`
@@ -621,6 +821,15 @@ fn describe_params(time_limit: Option<Duration>, variant: SelectVarVariant) -> S
             limit.as_secs()
         ),
         None => format!("select_var={variant_code}"),
+    }
+}
+
+/// Formats an optional STAGE12.md memory limit for the "cdcl:"
+/// announcement printed at verbose level 1, in bytes.
+fn describe_memory_limit(memory_limit_bytes: Option<i64>) -> String {
+    match memory_limit_bytes {
+        Some(limit) => format!(" memory_limit_bytes={limit}"),
+        None => String::new(),
     }
 }
 
@@ -746,6 +955,8 @@ mod tests {
         )
         .expect("expected clause {-2,-4} to be falsified");
 
+        let mut activity = vec![0.0f64; working_problem.clauses.len()];
+
         let (learned, backtrack_level) = analyze(
             confl,
             &working_problem.clauses,
@@ -755,6 +966,9 @@ mod tests {
             &x,
             &mut seen,
             1,
+            &mut activity,
+            1.0,
+            working_problem.clauses.len(),
         );
 
         assert_eq!(backtrack_level, 0);
@@ -771,6 +985,8 @@ mod tests {
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let level = vec![0usize; 3];
+        let mut activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut estimated_bytes = 0i64;
         let before = working_problem.clauses.len();
 
         let idx = add_learned_clause(
@@ -779,6 +995,8 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
+            &mut activity,
+            &mut estimated_bytes,
         );
 
         assert_eq!(idx, None);
@@ -797,6 +1015,8 @@ mod tests {
         let mut level = vec![0usize; 4];
         level[2] = 1;
         level[3] = 3; // higher than variable 2's level
+        let mut activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut estimated_bytes = 0i64;
 
         let idx = add_learned_clause(
             &vec![-1, 2, 3],
@@ -804,6 +1024,8 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
+            &mut activity,
+            &mut estimated_bytes,
         )
         .expect("expected a stored clause for a length-3 learned clause");
 
@@ -819,7 +1041,7 @@ mod tests {
 
         for variant in [SelectVarVariant::Weighted, SelectVarVariant::Fast] {
             let mut rng = StdRng::seed_from_u64(1);
-            let result = run(&problem, None, variant, &mut rng, 0);
+            let result = run(&problem, None, variant, None, &mut rng, 0);
             assert!(
                 result.satisfiable,
                 "variant {variant:?}: expected satisfiable"
@@ -857,7 +1079,7 @@ mod tests {
 
         for variant in [SelectVarVariant::Weighted, SelectVarVariant::Fast] {
             let mut rng = StdRng::seed_from_u64(1);
-            let result = run(&problem, None, variant, &mut rng, 0);
+            let result = run(&problem, None, variant, None, &mut rng, 0);
             assert!(
                 !result.satisfiable,
                 "variant {variant:?}: expected unsatisfiable"
@@ -867,6 +1089,207 @@ mod tests {
                 result.num_conflicts > 0,
                 "variant {variant:?}: expected at least one conflict"
             );
+        }
+    }
+
+    #[test]
+    fn test_clause_byte_cost() {
+        let got = clause_byte_cost(&vec![1, 2, 3]);
+        let want = PER_CLAUSE_OVERHEAD_BYTES + 3 * BYTES_PER_LITERAL;
+        assert_eq!(got, want);
+    }
+
+    /// Exercises reduce_clause_database directly: given three learned
+    /// clauses -- one locked (currently some variable's reason), one
+    /// unlocked with low activity, and one unlocked with high
+    /// activity -- only the unlocked, low-activity one should be
+    /// deleted, and every remaining reference (reason[v] for the
+    /// locked clause's variable, plus the occurrence lists) must
+    /// still be correct afterward.
+    #[test]
+    fn test_reduce_clause_database_keeps_locked_and_active_clauses() {
+        let problem = Problem {
+            num_vars: 5,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let level = vec![0usize; 6];
+        let num_original_clauses = working_problem.clauses.len();
+        let mut activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut estimated_bytes: i64 = 0;
+        let mut reason: Vec<Option<usize>> = vec![None; 6];
+
+        let idx_low = add_learned_clause(
+            &vec![-1, 3],
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut activity,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        let idx_locked = add_learned_clause(
+            &vec![-2, 4],
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut activity,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        let idx_high = add_learned_clause(
+            &vec![-3, 5],
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut activity,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        activity[idx_low] = 1.0;
+        activity[idx_high] = 100.0;
+
+        x[4] = Value::True;
+        reason[4] = Some(idx_locked);
+
+        let before = working_problem.clauses.len();
+        reduce_clause_database(
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &mut activity,
+            &mut estimated_bytes,
+            &x,
+            &mut reason,
+            num_original_clauses,
+        );
+
+        assert_eq!(working_problem.clauses.len(), before - 1);
+        assert!(
+            !working_problem.clauses.contains(&vec![-1, 3]),
+            "the unlocked, low-activity clause {{-1,3}} should have been deleted"
+        );
+        assert!(
+            working_problem.clauses.contains(&vec![-2, 4]),
+            "the locked clause {{-2,4}} should have survived"
+        );
+        assert!(
+            working_problem.clauses.contains(&vec![-3, 5]),
+            "the unlocked, high-activity clause {{-3,5}} should have survived"
+        );
+        assert_eq!(
+            working_problem.clauses[reason[4].expect("reason[4] should still be set")],
+            vec![-2, 4]
+        );
+        assert!(
+            lists.negative[1].is_empty(),
+            "lists.negative[1] should be empty (its only clause, {{-1,3}}, was deleted)"
+        );
+    }
+
+    /// Verifies that reduce_clause_database does nothing (and,
+    /// importantly, does not panic) when every learned clause is
+    /// currently locked.
+    #[test]
+    fn test_reduce_clause_database_no_op_when_nothing_eligible() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let level = vec![0usize; 3];
+        let num_original_clauses = working_problem.clauses.len();
+        let mut activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut estimated_bytes: i64 = 0;
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+
+        let idx = add_learned_clause(
+            &vec![-1, 2],
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut activity,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        x[2] = Value::True;
+        reason[2] = Some(idx);
+
+        let before = working_problem.clauses.len();
+        reduce_clause_database(
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &mut activity,
+            &mut estimated_bytes,
+            &x,
+            &mut reason,
+            num_original_clauses,
+        );
+
+        assert_eq!(working_problem.clauses.len(), before);
+    }
+
+    /// The strongest available test of the whole reduction pipeline:
+    /// a memory limit set far below the problem's own baseline size
+    /// forces reduce_clause_database to run, and very likely
+    /// actually delete clauses, on nearly every conflict -- exactly
+    /// the index-remapping path (reason[], watch, occurrence lists
+    /// all rebuilt together) that would be easiest to get subtly
+    /// wrong. The verdict must still match Stage 11's
+    /// (memory-limit-free) result for the same problem.
+    #[test]
+    fn test_run_with_tiny_memory_limit_still_proves_unsatisfiable_pigeonhole() {
+        let problem = pigeonhole_problem(4, 3);
+        let mut rng = StdRng::seed_from_u64(9);
+
+        let result = run(
+            &problem,
+            None,
+            SelectVarVariant::Fast,
+            Some(200),
+            &mut rng,
+            0,
+        );
+
+        assert!(!result.satisfiable);
+        assert!(!result.timed_out);
+    }
+
+    /// Checks that a memory limit doesn't interfere with the
+    /// satisfiable path: the returned assignment must still satisfy
+    /// every clause.
+    #[test]
+    fn test_run_with_memory_limit_still_finds_satisfiable_formula() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
+        };
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let result = run(
+            &problem,
+            None,
+            SelectVarVariant::Weighted,
+            Some(64),
+            &mut rng,
+            0,
+        );
+
+        assert!(result.satisfiable, "expected satisfiable");
+        for (ci, clause) in problem.clauses.iter().enumerate() {
+            let satisfied = clause
+                .iter()
+                .any(|&lit| assignment::literal_is_true(&result.assignment, lit));
+            assert!(satisfied, "clause {ci} ({clause:?}) not satisfied");
         }
     }
 
@@ -899,7 +1322,7 @@ mod tests {
         let problem = pigeonhole_problem(4, 3);
         let mut rng = StdRng::seed_from_u64(9);
 
-        let result = run(&problem, None, SelectVarVariant::Fast, &mut rng, 0);
+        let result = run(&problem, None, SelectVarVariant::Fast, None, &mut rng, 0);
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -913,7 +1336,14 @@ mod tests {
             num_vars: 0,
             clauses: vec![],
         };
-        let result = run(&sat_problem, None, SelectVarVariant::Weighted, &mut rng, 0);
+        let result = run(
+            &sat_problem,
+            None,
+            SelectVarVariant::Weighted,
+            None,
+            &mut rng,
+            0,
+        );
         assert!(result.satisfiable);
 
         let unsat_problem = Problem {
@@ -924,6 +1354,7 @@ mod tests {
             &unsat_problem,
             None,
             SelectVarVariant::Weighted,
+            None,
             &mut rng,
             0,
         );
@@ -940,6 +1371,7 @@ mod tests {
             &problem,
             Some(tiny),
             SelectVarVariant::Weighted,
+            None,
             &mut rng,
             0,
         );

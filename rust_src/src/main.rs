@@ -231,10 +231,13 @@ fn run_dfs(
 /// unlike `run_hill_climb`/`run_walksat`), a search that exhausts its
 /// space without a time limit produces a proven UNSAT verdict, not
 /// just "not found". `args.alg_params[0]` (if given) selects the
-/// `SelectVar` variant, with the same meaning and default as `dfs` --
-/// STAGE11.md adds no algorithm parameters of its own. If `preresult`
-/// is `Some`, the found assignment is reconstructed back to
-/// `original_num_vars` variables before being written out.
+/// `SelectVar` variant, with the same meaning and default as `dfs`.
+/// `args.memory_limit_bytes` (if given, via `--alg-params`'s second
+/// value: STAGE12.md) bounds the learned-clause database's estimated
+/// size, past which the least active learned clauses are periodically
+/// deleted; `None` leaves it unbounded, as before Stage 12. If
+/// `preresult` is `Some`, the found assignment is reconstructed back
+/// to `original_num_vars` variables before being written out.
 fn run_cdcl(
     problem: &cnf::Problem,
     preresult: &Option<PreprocessResult>,
@@ -252,7 +255,14 @@ fn run_cdcl(
         _ => dfs::SelectVarVariant::Weighted,
     };
 
-    let result = cdcl::run(problem, time_limit, variant, &mut rng, args.verbose);
+    let result = cdcl::run(
+        problem,
+        time_limit,
+        variant,
+        args.memory_limit_bytes,
+        &mut rng,
+        args.verbose,
+    );
 
     if result.satisfiable {
         let assignment = reconstructed_assignment(&result.assignment, preresult);

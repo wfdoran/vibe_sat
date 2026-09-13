@@ -5,52 +5,95 @@
 //!
 //! `--alg-params`/`-p` is unusual in that it accepts between one and
 //! three values (`--alg-params <val1> [<val2> <val3>]`); clap's
-//! `num_args` supports this directly.
+//! `num_args` supports this directly. `--algorithm=cdcl`'s second
+//! value (STAGE12.md, a memory limit like "100MB") isn't a plain
+//! integer like every other `--alg-params` value in this program, so
+//! clap collects the raw tokens as strings ([`RawArgs::alg_params`])
+//! and [`build_args`] parses each one itself, depending on which
+//! algorithm was selected -- mirroring the Go implementation's
+//! tokenize/buildArgs split for the same reason.
 
 use clap::Parser;
 
-/// Command line arguments accepted by vibe_sat.
-///
-/// clap's own auto-generated `--help`/`-h` flag is disabled here
-/// (`disable_help_flag`) because `--help`/`-h` is instead detected by
-/// [`wants_help`] and handled by `main` before [`Args::parse_from_args`]
-/// is ever called, so that it always works even when other required
-/// arguments are missing.
+/// The command line arguments clap parses directly, before any
+/// algorithm-specific interpretation of `alg_params`'s raw string
+/// tokens (see [`build_args`] and the module doc comment). Not
+/// exposed outside this module; [`Args`] is the typed result callers
+/// actually use.
 #[derive(Parser, Debug)]
 #[command(
     name = "vibe_sat",
     about = "A command line SAT solver",
     disable_help_flag = true
 )]
+struct RawArgs {
+    #[arg(long = "input", short = 'i')]
+    input: String,
+
+    #[arg(long = "verbose", short = 'v', default_value_t = 0)]
+    verbose: i32,
+
+    #[arg(long = "algorithm", short = 'a')]
+    algorithm: String,
+
+    #[arg(long = "output", short = 'o')]
+    output: Option<String>,
+
+    #[arg(long = "time-limit-secs", short = 't')]
+    time_limit_secs: Option<i64>,
+
+    #[arg(long = "alg-params", short = 'p', num_args = 1..=3, allow_negative_numbers = true)]
+    alg_params: Option<Vec<String>>,
+
+    #[arg(long = "no-preprocessing", short = 'x')]
+    no_preprocessing: bool,
+}
+
+/// Command line arguments accepted by vibe_sat, after
+/// algorithm-specific interpretation of the raw `--alg-params` tokens
+/// (see [`RawArgs`] and [`build_args`]).
+///
+/// clap's own auto-generated `--help`/`-h` flag is disabled here
+/// (`disable_help_flag`) because `--help`/`-h` is instead detected by
+/// [`wants_help`] and handled by `main` before [`Args::parse_from_args`]
+/// is ever called, so that it always works even when other required
+/// arguments are missing.
+#[derive(Debug)]
 pub struct Args {
     /// SAT CNF file to read in (required).
-    #[arg(long = "input", short = 'i')]
     pub input: String,
 
     /// Verbose level. Default is 0.
-    #[arg(long = "verbose", short = 'v', default_value_t = 0)]
     pub verbose: i32,
 
     /// Solving algorithm to use (required; "hc", "ws", "dfs", or "cdcl").
-    #[arg(long = "algorithm", short = 'a')]
     pub algorithm: String,
 
     /// Where to write the solution, in DIMACS solution format.
-    #[arg(long = "output", short = 'o')]
     pub output: Option<String>,
 
     /// Optional time limit, in seconds, for the search.
-    #[arg(long = "time-limit-secs", short = 't')]
     pub time_limit_secs: Option<i64>,
 
     /// Algorithm-specific integer parameters (1 to 3 values); see
-    /// [`help_text`] for what each value means per algorithm.
-    #[arg(long = "alg-params", short = 'p', num_args = 1..=3, allow_negative_numbers = true)]
+    /// [`help_text`] for what each value means per algorithm. For
+    /// `--algorithm=cdcl`, this holds only the first (SelectVar)
+    /// value -- the second (a memory limit) is parsed separately into
+    /// `memory_limit_bytes`, since it isn't a plain integer.
     pub alg_params: Option<Vec<i64>>,
 
     /// Skip preprocessing (STAGE8.md); default is to run it.
-    #[arg(long = "no-preprocessing", short = 'x')]
     pub no_preprocessing: bool,
+
+    /// `--alg-params`/`-p`'s second value for `--algorithm=cdcl` only
+    /// (STAGE12.md): an optional learned-clause database memory
+    /// limit, in bytes. Parsed by [`parse_byte_size`] from either a
+    /// plain integer (bytes) or an integer immediately followed by
+    /// "k"/"kb"/"m"/"mb"/"g"/"gb" (case-insensitive; see
+    /// `--alg-params 0 100MB` in the help text). `None` if not given,
+    /// in which case the database grows without bound, as it did
+    /// before this stage.
+    pub memory_limit_bytes: Option<i64>,
 }
 
 /// Returns true if `argv` contains a `--help` or `-h` token anywhere.
@@ -134,8 +177,19 @@ Options:
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
           cdcl val1 = which SelectVar heuristic to use, same meaning
-                     and default as "dfs" above (STAGE11.md adds no
-                     new algorithm parameters of its own).
+                     and default as "dfs" above.
+               val2 = an optional learned-clause database memory
+                     limit (STAGE12.md): once the estimated size of
+                     the database exceeds this, the least "active"
+                     learned clauses are periodically deleted
+                     (MiniSat-style) to keep it under control. Either
+                     a plain integer (a number of bytes) or an
+                     integer immediately followed by one of "k",
+                     "kb", "m", "mb", "g", or "gb" (case-insensitive),
+                     e.g. "--alg-params 0 100MB". Omitted by default,
+                     in which case the database grows without bound.
+                     Note: val1 must be given to set val2, even if
+                     val1 is just the default (0).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -163,10 +217,97 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let args = Args::try_parse_from(argv).map_err(|e| e.to_string())?;
+        let raw = RawArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
+        let args = build_args(raw)?;
         validate(&args)?;
         Ok(args)
     }
+}
+
+/// Converts a [`RawArgs`] (clap's direct parse, with `alg_params` as
+/// raw string tokens) into the typed [`Args`] callers use: every
+/// `--alg-params` token is parsed as a plain integer, except
+/// `--algorithm=cdcl`'s second token, which is parsed as a memory
+/// size instead (see [`parse_byte_size`] and the module doc comment).
+fn build_args(raw: RawArgs) -> Result<Args, String> {
+    let mut alg_params: Vec<i64> = Vec::new();
+    let mut memory_limit_bytes: Option<i64> = None;
+
+    if let Some(values) = &raw.alg_params {
+        if raw.algorithm == "cdcl" {
+            if values.len() > 2 {
+                return Err(
+                    "for --algorithm=cdcl, --alg-params accepts at most two values (0 or 1 selecting which SelectVar heuristic to use, and an optional learned-clause database memory limit)"
+                        .to_string(),
+                );
+            }
+            if let Some(first) = values.first() {
+                let p = first
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid value for --alg-params: \"{first}\""))?;
+                alg_params.push(p);
+            }
+            if let Some(second) = values.get(1) {
+                let limit = parse_byte_size(second)
+                    .map_err(|e| format!("invalid memory limit for --alg-params: {e}"))?;
+                memory_limit_bytes = Some(limit);
+            }
+        } else {
+            for value in values {
+                let p = value
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid value for --alg-params: \"{value}\""))?;
+                alg_params.push(p);
+            }
+        }
+    }
+
+    Ok(Args {
+        input: raw.input,
+        verbose: raw.verbose,
+        algorithm: raw.algorithm,
+        output: raw.output,
+        time_limit_secs: raw.time_limit_secs,
+        alg_params: if alg_params.is_empty() {
+            None
+        } else {
+            Some(alg_params)
+        },
+        no_preprocessing: raw.no_preprocessing,
+        memory_limit_bytes,
+    })
+}
+
+/// Parses `s` as a byte count (STAGE12.md): either a plain
+/// non-negative integer (a number of bytes), or such an integer
+/// immediately followed by one of "k", "kb", "m", "mb", "g", or "gb"
+/// (case-insensitive; e.g. "100MB", "100mb", and "100Mb" all parse
+/// the same way), for kilobytes, megabytes, or gigabytes (each 1024
+/// times the previous unit, not 1000).
+fn parse_byte_size(s: &str) -> Result<i64, String> {
+    let digit_count = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return Err(format!("{s:?} does not start with a number"));
+    }
+
+    let (digits, unit) = s.split_at(digit_count);
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| format!("{s:?} is not a valid byte size"))?;
+
+    let multiplier: i64 = match unit.to_lowercase().as_str() {
+        "" => 1,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(format!(
+                "{s:?} has an unrecognized unit {unit:?}; expected one of k, kb, m, mb, g, gb"
+            ));
+        }
+    };
+
+    Ok(n * multiplier)
 }
 
 /// Checks that the parsed [`Args`] are internally consistent for the
@@ -268,19 +409,29 @@ fn validate(args: &Args) -> Result<(), String> {
         }
 
         "cdcl" => {
-            if let Some(params) = &args.alg_params {
-                if params.len() > 1 {
-                    return Err(
-                        "for --algorithm=cdcl, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)"
-                            .to_string(),
-                    );
-                }
-                if params[0] != 0 && params[0] != 1 {
-                    return Err(
-                        "for --algorithm=cdcl, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)"
-                            .to_string(),
-                    );
-                }
+            // The at-most-two-values check and the memory limit's own
+            // syntax (plain integer, optionally with a
+            // k/kb/m/mb/g/gb suffix) were already enforced in
+            // build_args, since that's where the raw tokens are
+            // available; only the remaining business rules (variant
+            // is 0 or 1; the limit, if given, is positive) are
+            // checked here.
+            if let Some(params) = &args.alg_params
+                && params[0] != 0
+                && params[0] != 1
+            {
+                return Err(
+                    "for --algorithm=cdcl, the first --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)"
+                        .to_string(),
+                );
+            }
+            if let Some(limit) = args.memory_limit_bytes
+                && limit < 1
+            {
+                return Err(
+                    "for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes"
+                        .to_string(),
+                );
             }
             if let Some(limit) = args.time_limit_secs
                 && limit < 1
@@ -595,26 +746,114 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cdcl_rejects_multiple_alg_params() {
+    fn test_parse_cdcl_rejects_three_alg_params() {
+        // STAGE12.md adds a second value (the memory limit), but no
+        // third.
         let result = Args::parse_from_args([
             "vibe_sat",
             "--input=problem.cnf",
             "--algorithm=cdcl",
             "--alg-params",
             "0",
-            "1",
+            "100",
+            "5",
         ]);
         assert!(result.is_err());
     }
 
     #[test]
+    fn test_parse_cdcl_accepts_memory_limit() {
+        let cases: [(&str, i64); 9] = [
+            ("100", 100),
+            ("100k", 100 * 1024),
+            ("100K", 100 * 1024),
+            ("100kb", 100 * 1024),
+            ("100KB", 100 * 1024),
+            ("5m", 5 * 1024 * 1024),
+            ("5MB", 5 * 1024 * 1024),
+            ("2g", 2 * 1024 * 1024 * 1024),
+            ("2Gb", 2 * 1024 * 1024 * 1024),
+        ];
+        for (token, want) in cases {
+            let args = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                "0",
+                token,
+            ])
+            .unwrap_or_else(|e| {
+                panic!("Parse returned unexpected error for --alg-params 0 {token}: {e}")
+            });
+            assert_eq!(
+                args.memory_limit_bytes,
+                Some(want),
+                "--alg-params 0 {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_memory_limit_as_first_value() {
+        // "100MB" alone is positionally val1 (the SelectVar
+        // selector), not val2, and is not a valid SelectVar value.
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "100MB",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_malformed_memory_limit() {
+        for bad in ["MB", "100XB", "100.5MB", ""] {
+            let result = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                "0",
+                bad,
+            ]);
+            assert!(
+                result.is_err(),
+                "expected error for malformed memory limit {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_non_positive_memory_limit() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "0",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cdcl_defaults_to_unbounded_memory() {
+        let args = Args::parse_from_args(["vibe_sat", "--input=problem.cnf", "--algorithm=cdcl"])
+            .expect("expected successful parse");
+        assert_eq!(args.memory_limit_bytes, None);
+    }
+
+    #[test]
     fn test_parse_alg_params_space_separated_multiple_values() {
-        // Tested against the tokenizer-level outcome (the raw parsed
-        // Vec) regardless of the hc-specific restriction on length,
-        // to confirm clap's num_args range collects up to three
-        // values; the business-rule rejection is covered separately
-        // above.
-        let args = Args::try_parse_from([
+        // Tested against RawArgs directly (the raw clap-parsed
+        // tokens) regardless of the hc-specific restriction on
+        // length, to confirm clap's num_args range collects up to
+        // three values; the business-rule rejection is covered
+        // separately above.
+        let raw = RawArgs::try_parse_from([
             "vibe_sat",
             "--input=problem.cnf",
             "--algorithm=hc",
@@ -624,7 +863,10 @@ mod tests {
             "3",
         ])
         .expect("expected successful clap parse");
-        assert_eq!(args.alg_params, Some(vec![1, 2, 3]));
+        assert_eq!(
+            raw.alg_params,
+            Some(vec!["1".to_string(), "2".to_string(), "3".to_string()])
+        );
     }
 
     #[test]
@@ -635,7 +877,7 @@ mod tests {
         // negative number-of-starts on business-rule grounds, which
         // is covered by test_parse_hc_rejects_non_positive_alg_param
         // below.)
-        let args = Args::try_parse_from([
+        let raw = RawArgs::try_parse_from([
             "vibe_sat",
             "--input=problem.cnf",
             "--algorithm=hc",
@@ -644,7 +886,7 @@ mod tests {
             "-5",
         ])
         .expect("expected successful clap parse");
-        assert_eq!(args.alg_params, Some(vec![-5]));
+        assert_eq!(raw.alg_params, Some(vec!["-5".to_string()]));
     }
 
     #[test]

@@ -27,6 +27,18 @@ type Args struct {
 	TimeLimitSecs   *int    // --time-limit-secs / -t : optional search time limit, in seconds
 	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
 	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
+
+	// MemoryLimitBytes is --alg-params/-p's second value for
+	// --algorithm=cdcl only (STAGE12.md): an optional learned-clause
+	// database memory limit, in bytes. Parsed by parseByteSize from
+	// either a plain integer (bytes) or an integer immediately
+	// followed by "k"/"kb"/"m"/"mb"/"g"/"gb" (case-insensitive; see
+	// --alg-params 0 100MB in the help text). nil if not given, in
+	// which case the database grows without bound, as it did before
+	// this stage. Kept separate from AlgParams (rather than as its
+	// third element) since it isn't a plain integer, unlike every
+	// other --alg-params value in this program.
+	MemoryLimitBytes *int64
 }
 
 // flagSpec describes one recognized flag: its long and short
@@ -193,6 +205,43 @@ func tokenize(argv []string) (map[string][]string, error) {
 	return rawValues, nil
 }
 
+// parseByteSize parses s as a byte count (STAGE12.md): either a plain
+// non-negative integer (a number of bytes), or such an integer
+// immediately followed by one of "k", "kb", "m", "mb", "g", or "gb"
+// (case-insensitive; e.g. "100MB", "100mb", and "100Mb" all parse the
+// same way), for kilobytes, megabytes, or gigabytes (each 1024 times
+// the previous unit, not 1000).
+func parseByteSize(s string) (int64, error) {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, fmt.Errorf("%q does not start with a number", s)
+	}
+
+	n, err := strconv.ParseInt(s[:i], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a valid byte size: %w", s, err)
+	}
+
+	var multiplier int64
+	switch strings.ToLower(s[i:]) {
+	case "":
+		multiplier = 1
+	case "k", "kb":
+		multiplier = 1024
+	case "m", "mb":
+		multiplier = 1024 * 1024
+	case "g", "gb":
+		multiplier = 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("%q has an unrecognized unit %q; expected one of k, kb, m, mb, g, gb", s, s[i:])
+	}
+
+	return n * multiplier, nil
+}
+
 // buildArgs converts the raw flag value tokens collected by tokenize
 // into a typed Args structure, reporting an error if any value cannot
 // be parsed as the type it is expected to have.
@@ -223,12 +272,38 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		args.TimeLimitSecs = &t
 	}
 	if values, ok := rawValues["alg-params"]; ok {
-		for _, value := range values {
-			p, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("invalid value for --alg-params: %q", value)
+		// --algorithm=cdcl's second --alg-params value is a memory
+		// size (STAGE12.md), not a plain integer like every other
+		// --alg-params value in this program, so it needs its own
+		// parsing path rather than the uniform strconv.ParseInt loop
+		// below; this is why buildArgs (usually algorithm-agnostic)
+		// branches on args.Algorithm here.
+		if args.Algorithm == "cdcl" {
+			if len(values) > 2 {
+				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most two values (0 or 1 selecting which SelectVar heuristic to use, and an optional learned-clause database memory limit)")
 			}
-			args.AlgParams = append(args.AlgParams, p)
+			if len(values) >= 1 {
+				p, err := strconv.ParseInt(values[0], 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid value for --alg-params: %q", values[0])
+				}
+				args.AlgParams = append(args.AlgParams, p)
+			}
+			if len(values) == 2 {
+				limit, err := parseByteSize(values[1])
+				if err != nil {
+					return nil, fmt.Errorf("invalid memory limit for --alg-params: %w", err)
+				}
+				args.MemoryLimitBytes = &limit
+			}
+		} else {
+			for _, value := range values {
+				p, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid value for --alg-params: %q", value)
+				}
+				args.AlgParams = append(args.AlgParams, p)
+			}
 		}
 	}
 	if _, ok := rawValues["no-preprocessing"]; ok {
@@ -294,11 +369,17 @@ func validate(args *Args, rawValues map[string][]string) error {
 		}
 
 	case "cdcl":
-		if len(args.AlgParams) > 1 {
-			return fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)")
-		}
+		// The at-most-two-values check and the memory limit's own
+		// syntax (plain integer, optionally with a k/kb/m/mb/g/gb
+		// suffix) were already enforced in buildArgs, since that's
+		// where the raw tokens are available; only the remaining
+		// business rules (variant is 0 or 1; the limit, if given, is
+		// positive) are checked here.
 		if len(args.AlgParams) == 1 && args.AlgParams[0] != 0 && args.AlgParams[0] != 1 {
-			return fmt.Errorf("for --algorithm=cdcl, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)")
+			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)")
+		}
+		if args.MemoryLimitBytes != nil && *args.MemoryLimitBytes < 1 {
+			return fmt.Errorf("for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
 			return fmt.Errorf("--time-limit-secs must be a positive integer")
