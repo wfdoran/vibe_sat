@@ -176,8 +176,27 @@ Options:
                      at no clause contents at all; much faster per
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
-          cdcl val1 = which SelectVar heuristic to use, same meaning
-                     and default as "dfs" above.
+          cdcl val1 = which SelectVar heuristic to use:
+                 0 = the weighted heuristic from STAGE5.md, same as
+                     "dfs"'s val1=0.
+                 1 = the cheap static-order heuristic from STAGE6.md,
+                     same as "dfs"'s val1=1.
+                 2 = VSIDS (STAGE13.md): scores each variable by how
+                     often it has recently appeared while resolving a
+                     conflict, decayed over time so recent conflicts
+                     count more than old ones.
+                 3 = LRB (STAGE13.md): scores each variable by how
+                     often it has recently *participated* in producing
+                     a learned clause, per conflict it has been
+                     assigned for (a "learning rate").
+               Optional; defaults to 2 (VSIDS) if --alg-params is not
+               given -- unlike "dfs", which defaults to 0. STAGE13.md
+               cites SAT Competition results where LRB outperforms
+               VSIDS, but this project's own benchmark comparison
+               (reports/REPORT13.md) found VSIDS clearly ahead of both
+               LRB and the older structural heuristics on this
+               project's actual (uniform random 3-SAT) benchmark set,
+               so that measurement is what this default follows.
                val2 = an optional learned-clause database memory
                      limit (STAGE12.md): once the estimated size of
                      the database exceeds this, the least "active"
@@ -186,10 +205,10 @@ Options:
                      a plain integer (a number of bytes) or an
                      integer immediately followed by one of "k",
                      "kb", "m", "mb", "g", or "gb" (case-insensitive),
-                     e.g. "--alg-params 0 100MB". Omitted by default,
+                     e.g. "--alg-params 2 100MB". Omitted by default,
                      in which case the database grows without bound.
                      Note: val1 must be given to set val2, even if
-                     val1 is just the default (0).
+                     val1 is just the default (2).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -414,14 +433,15 @@ fn validate(args: &Args) -> Result<(), String> {
             // k/kb/m/mb/g/gb suffix) were already enforced in
             // build_args, since that's where the raw tokens are
             // available; only the remaining business rules (variant
-            // is 0 or 1; the limit, if given, is positive) are
-            // checked here.
+            // is 0-3; the limit, if given, is positive) are checked
+            // here. STAGE13.md extends the first value's range from
+            // dfs's 0/1 (Weighted/Fast) to also allow 2 (VSIDS) and 3
+            // (LRB), both cdcl-only.
             if let Some(params) = &args.alg_params
-                && params[0] != 0
-                && params[0] != 1
+                && !(0..=3).contains(&params[0])
             {
                 return Err(
-                    "for --algorithm=cdcl, the first --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)"
+                    "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)"
                         .to_string(),
                 );
             }
@@ -719,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_accepts_select_var_variant() {
-        for variant in [0i64, 1i64] {
+        for variant in [0i64, 1i64, 2i64, 3i64] {
             let args = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",
@@ -736,13 +756,18 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_rejects_out_of_range_alg_params() {
-        let result = Args::parse_from_args([
-            "vibe_sat",
-            "--input=problem.cnf",
-            "--algorithm=cdcl",
-            "--alg-params=5",
-        ]);
-        assert!(result.is_err());
+        for variant in ["5", "-1", "4"] {
+            let result = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                &format!("--alg-params={variant}"),
+            ]);
+            assert!(
+                result.is_err(),
+                "expected error for --alg-params={variant} with --algorithm=cdcl"
+            );
+        }
     }
 
     #[test]

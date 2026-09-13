@@ -71,8 +71,27 @@ Options:
                      at no clause contents at all; much faster per
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
-          cdcl val1 = which SelectVar heuristic to use, same meaning
-                     and default as "dfs" above.
+          cdcl val1 = which SelectVar heuristic to use:
+                 0 = the weighted heuristic from STAGE5.md, same as
+                     "dfs"'s val1=0.
+                 1 = the cheap static-order heuristic from STAGE6.md,
+                     same as "dfs"'s val1=1.
+                 2 = VSIDS (STAGE13.md): scores each variable by how
+                     often it has recently appeared while resolving a
+                     conflict, decayed over time so recent conflicts
+                     count more than old ones.
+                 3 = LRB (STAGE13.md): scores each variable by how
+                     often it has recently *participated* in producing
+                     a learned clause, per conflict it has been
+                     assigned for (a "learning rate").
+               Optional; defaults to 2 (VSIDS) if --alg-params is not
+               given -- unlike "dfs", which defaults to 0. STAGE13.md
+               cites SAT Competition results where LRB outperforms
+               VSIDS, but this project's own benchmark comparison
+               (reports/REPORT13.md) found VSIDS clearly ahead of both
+               LRB and the older structural heuristics on this
+               project's actual (uniform random 3-SAT) benchmark set,
+               so that measurement is what this default follows.
                val2 = an optional learned-clause database memory
                      limit (STAGE12.md): once the estimated size of
                      the database exceeds this, the least "active"
@@ -81,10 +100,10 @@ Options:
                      a plain integer (a number of bytes) or an
                      integer immediately followed by one of "k",
                      "kb", "m", "mb", "g", or "gb" (case-insensitive),
-                     e.g. "--alg-params 0 100MB". Omitted by default,
+                     e.g. "--alg-params 2 100MB". Omitted by default,
                      in which case the database grows without bound.
                      Note: val1 must be given to set val2, even if
-                     val1 is just the default (0).
+                     val1 is just the default (2).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal

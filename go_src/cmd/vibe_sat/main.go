@@ -195,14 +195,16 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 // satisfying assignment was found. Like "dfs" (and unlike "hc"/"ws"),
 // a search that exhausts its space without a time limit produces a
 // proven UNSAT verdict, not just "not found". args.AlgParams[0] (if
-// given) selects the SelectVar variant, with the same meaning and
-// default as "dfs". args.MemoryLimitBytes (if given, via
-// --alg-params's second value: STAGE12.md) bounds the learned-clause
-// database's estimated size, past which the least active learned
-// clauses are periodically deleted; nil leaves it unbounded, as
-// before Stage 12. If preResult is non-nil, the found assignment is
-// reconstructed back to originalNumVars variables before being
-// written out.
+// given) selects the SelectVar variant: 0/1 match dfs's own Weighted/
+// Fast heuristics, and 2/3 (STAGE13.md) select cdcl's own VSIDS/LRB
+// heuristics; unlike dfs, cdcl defaults to VSIDS (cdcl.SelectVarVsids)
+// if --alg-params is omitted entirely, per cdcl's own package doc
+// comment. args.MemoryLimitBytes (if given, via --alg-params's second
+// value: STAGE12.md) bounds the learned-clause database's estimated
+// size, past which the least active learned clauses are periodically
+// deleted; nil leaves it unbounded, as before Stage 12. If preResult
+// is non-nil, the found assignment is reconstructed back to
+// originalNumVars variables before being written out.
 func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
 	rng := newSeededRand()
 
@@ -212,9 +214,18 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 		timeLimit = &limit
 	}
 
-	variant := dfs.SelectVarWeighted
-	if len(args.AlgParams) == 1 {
-		variant = dfs.SelectVarVariant(args.AlgParams[0])
+	// STAGE13.md leaves the default SelectVar variant for --algorithm=cdcl
+	// up to this implementation. The literature cited in internal/cdcl's
+	// package doc comment reports LRB beating VSIDS on SAT Competition
+	// instances, but this project's own benchmark comparison
+	// (REPORT13.md) found VSIDS clearly ahead of both LRB and Weighted
+	// on this project's actual (uniform random 3-SAT) benchmark set --
+	// real measurement on the relevant benchmarks wins out over a
+	// priori literature reasoning, so VSIDS is the default here
+	// (unlike dfs, which keeps its own Weighted default).
+	variant := cdcl.SelectVarVsids
+	if len(args.AlgParams) >= 1 {
+		variant = cdcl.SelectVarVariant(args.AlgParams[0])
 	}
 
 	result := cdcl.Run(problem, timeLimit, variant, args.MemoryLimitBytes, rng, args.Verbose)

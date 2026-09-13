@@ -231,13 +231,17 @@ fn run_dfs(
 /// unlike `run_hill_climb`/`run_walksat`), a search that exhausts its
 /// space without a time limit produces a proven UNSAT verdict, not
 /// just "not found". `args.alg_params[0]` (if given) selects the
-/// `SelectVar` variant, with the same meaning and default as `dfs`.
-/// `args.memory_limit_bytes` (if given, via `--alg-params`'s second
-/// value: STAGE12.md) bounds the learned-clause database's estimated
-/// size, past which the least active learned clauses are periodically
-/// deleted; `None` leaves it unbounded, as before Stage 12. If
-/// `preresult` is `Some`, the found assignment is reconstructed back
-/// to `original_num_vars` variables before being written out.
+/// `SelectVar` variant: 0/1 match dfs's own Weighted/Fast heuristics,
+/// and 2/3 (STAGE13.md) select cdcl's own VSIDS/LRB heuristics;
+/// unlike `dfs`, `cdcl` defaults to VSIDS (`cdcl::SelectVarVariant::Vsids`)
+/// if `--alg-params` is omitted entirely, per `cdcl`'s own module doc
+/// comment. `args.memory_limit_bytes` (if given, via `--alg-params`'s
+/// second value: STAGE12.md) bounds the learned-clause database's
+/// estimated size, past which the least active learned clauses are
+/// periodically deleted; `None` leaves it unbounded, as before
+/// Stage 12. If `preresult` is `Some`, the found assignment is
+/// reconstructed back to `original_num_vars` variables before being
+/// written out.
 fn run_cdcl(
     problem: &cnf::Problem,
     preresult: &Option<PreprocessResult>,
@@ -250,9 +254,22 @@ fn run_cdcl(
         .time_limit_secs
         .map(|secs| Duration::from_secs(secs as u64));
 
+    // STAGE13.md leaves the default SelectVar variant for
+    // --algorithm=cdcl up to this implementation. The literature
+    // cited in cdcl's module doc comment reports LRB beating VSIDS on
+    // SAT Competition instances, but this project's own benchmark
+    // comparison (reports/REPORT13.md) found VSIDS clearly ahead of
+    // both LRB and Weighted on this project's actual (uniform random
+    // 3-SAT) benchmark set -- real measurement on the relevant
+    // benchmarks wins out over a priori literature reasoning, so
+    // VSIDS is the default here (unlike dfs, which keeps its own
+    // Weighted default).
     let variant = match args.alg_params.as_deref() {
-        Some([1]) => dfs::SelectVarVariant::Fast,
-        _ => dfs::SelectVarVariant::Weighted,
+        Some([0]) => cdcl::SelectVarVariant::Weighted,
+        Some([1]) => cdcl::SelectVarVariant::Fast,
+        Some([2]) => cdcl::SelectVarVariant::Vsids,
+        Some([3]) => cdcl::SelectVarVariant::Lrb,
+        _ => cdcl::SelectVarVariant::Vsids,
     };
 
     let result = cdcl::run(

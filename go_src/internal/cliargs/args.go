@@ -373,10 +373,12 @@ func validate(args *Args, rawValues map[string][]string) error {
 		// syntax (plain integer, optionally with a k/kb/m/mb/g/gb
 		// suffix) were already enforced in buildArgs, since that's
 		// where the raw tokens are available; only the remaining
-		// business rules (variant is 0 or 1; the limit, if given, is
-		// positive) are checked here.
-		if len(args.AlgParams) == 1 && args.AlgParams[0] != 0 && args.AlgParams[0] != 1 {
-			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)")
+		// business rules (variant is 0-3; the limit, if given, is
+		// positive) are checked here. STAGE13.md extends the first
+		// value's range from dfs's 0/1 (Weighted/Fast) to also allow
+		// 2 (VSIDS) and 3 (LRB), both cdcl-only.
+		if len(args.AlgParams) == 1 && (args.AlgParams[0] < 0 || args.AlgParams[0] > 3) {
+			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)")
 		}
 		if args.MemoryLimitBytes != nil && *args.MemoryLimitBytes < 1 {
 			return fmt.Errorf("for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes")

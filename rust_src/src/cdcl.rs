@@ -42,15 +42,151 @@
 //! learned clauses that are safe to delete (see its doc comment),
 //! MiniSat-style (Eén & Sörensson, "An Extensible SAT-solver," SAT
 //! 2003).
+//!
+//! STAGE13.md adds two modern activity-based [`SelectVarVariant`]
+//! values that only make sense once conflicts exist to learn from, so
+//! unlike `Weighted`/`Fast` (still delegated to dfs's identical
+//! heuristics), they are implemented here rather than in `dfs`:
+//!
+//! - `Vsids`: classic VSIDS (Moskewicz et al., Chaff, DAC 2001).
+//!   Every variable touched while resolving a conflict (see
+//!   [`analyze`]) has its activity bumped ([`VsidsState`]); the
+//!   highest-activity unassigned variable is picked at each decision.
+//! - `Lrb`: a simplified Learning Rate Branching (Liang, Ganesh,
+//!   Poupart & Czarnecki, "Learning Rate Based Branching Heuristic
+//!   for SAT Solvers," SAT 2016), which the paper reports beating
+//!   both VSIDS and the Conflict History-Based heuristic on SAT
+//!   Competition 2009-2014 instances (1279 vs. 1179 vs. 1235 solved).
+//!   Every variable's "learning rate" -- how often it has recently
+//!   participated in producing a learned clause, per conflict it has
+//!   been assigned for -- is tracked ([`LrbState`]) and used as its
+//!   score instead. This implementation omits the paper's "reason
+//!   side rate" bonus and its annealed learning-rate schedule for the
+//!   Q-value update itself (kept at a fixed `LRB_ALPHA` instead); see
+//!   [`backtrack_to`]'s doc comment for exactly what is and isn't
+//!   implemented.
+//!
+//! Per STAGE13.md, `SelectVarVariant::Vsids` is the default for
+//! `--algorithm=cdcl` (see [`run`]'s doc comment for why: the paper
+//! above favors LRB on SAT Competition instances, but this project's
+//! own benchmark comparison, `reports/REPORT13.md`, found VSIDS
+//! clearly ahead of both LRB and the older structural heuristics on
+//! this project's actual, uniform random 3-SAT benchmark set).
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
-use crate::dfs::{SelectVarVariant, select_var, select_var_fast_pick};
+use crate::dfs::{select_var, select_var_fast_pick};
 use crate::occurrence::{self, Lists};
 use crate::preprocess;
+
+/// Identifies which heuristic [`run`] should use to pick the next
+/// branching variable. `Weighted`/`Fast` match
+/// [`dfs::SelectVarVariant`] exactly (and are delegated to
+/// [`select_var`]/[`select_var_fast_pick`] unchanged); `Vsids`/`Lrb`
+/// are STAGE13.md's new activity-based heuristics, which only exist
+/// here since they require conflict-driven learning's bookkeeping to
+/// have anything to work from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectVarVariant {
+    /// Matches [`dfs::SelectVarVariant::Weighted`]: STAGE5.md's
+    /// clause-weighted heuristic, delegated to [`select_var`]
+    /// unchanged.
+    Weighted,
+    /// Matches [`dfs::SelectVarVariant::Fast`]: the cheap static-order
+    /// heuristic, delegated to [`select_var_fast_pick`] unchanged.
+    Fast,
+    /// STAGE13.md's VSIDS heuristic (see the module doc comment);
+    /// this is [`run`]'s default.
+    Vsids,
+    /// STAGE13.md's (simplified) LRB heuristic (see the module doc
+    /// comment).
+    Lrb,
+}
+
+/// `VAR_ACTIVITY_DECAY` is `SelectVarVariant::Vsids`'s per-variable
+/// analogue of `CLAUSE_ACTIVITY_DECAY` (see [`VsidsState`]); VSIDS
+/// conventionally decays faster than clause activity does (MiniSat's
+/// own defaults: 0.95 for variables, 0.999 for clauses), which is why
+/// this is a separate constant rather than reusing
+/// `CLAUSE_ACTIVITY_DECAY`.
+const VAR_ACTIVITY_DECAY: f64 = 0.95;
+
+/// `LRB_ALPHA` is the fixed learning-rate weight `SelectVarVariant::Lrb`
+/// uses when updating a variable's Q-value (see [`backtrack_to`]'s doc
+/// comment): the paper anneals this over the course of the search,
+/// starting high and decaying toward a floor; this implementation
+/// keeps it fixed at a value from within that range instead, as a
+/// documented simplification (see the module doc comment).
+const LRB_ALPHA: f64 = 0.4;
+
+/// Per-variable VSIDS bookkeeping (`SelectVarVariant::Vsids` only):
+/// `activity[v]` is bumped by `increment` every time variable `v` is
+/// touched while resolving a conflict (see [`analyze`]); `increment`
+/// itself grows once per conflict (see [`run`]) rather than decaying
+/// every entry of `activity` individually, the same O(1) trick
+/// `CLAUSE_ACTIVITY_DECAY` uses.
+struct VsidsState {
+    activity: Vec<f64>,
+    increment: f64,
+}
+
+/// Per-variable LRB bookkeeping (`SelectVarVariant::Lrb` only): `q[v]`
+/// is variable `v`'s current learning-rate score; `participated[v]`
+/// counts how many conflicts it has contributed a literal to since it
+/// was last assigned; `assigned_at_conflict[v]` records how many
+/// conflicts had occurred when it was last assigned, so
+/// [`backtrack_to`] can compute how many elapsed while it was
+/// assigned. See [`backtrack_to`]'s doc comment for the update rule.
+struct LrbState {
+    q: Vec<f64>,
+    participated: Vec<usize>,
+    assigned_at_conflict: Vec<usize>,
+}
+
+impl VsidsState {
+    fn new(num_vars: usize) -> Self {
+        VsidsState {
+            activity: vec![0.0; num_vars + 1],
+            increment: 1.0,
+        }
+    }
+}
+
+impl LrbState {
+    fn new(num_vars: usize) -> Self {
+        LrbState {
+            q: vec![0.0; num_vars + 1],
+            participated: vec![0; num_vars + 1],
+            assigned_at_conflict: vec![0; num_vars + 1],
+        }
+    }
+}
+
+/// Returns the unassigned variable with the highest score in `scores`
+/// (a linear scan, same asymptotic cost class as `Weighted`'s clause
+/// scan; ties keep whichever variable was found first). `scores` is
+/// `vsids.activity` for `SelectVarVariant::Vsids`, or `lrb.q` for
+/// `SelectVarVariant::Lrb`. Before any conflicts have occurred, every
+/// score is still 0, so this falls back to the lowest-numbered
+/// unassigned variable -- the same choice `SelectVarVariant::Fast`
+/// would make.
+fn select_var_by_activity(scores: &[f64], x: &Assignment, num_vars: usize) -> usize {
+    let mut best: Option<usize> = None;
+    let mut best_score = 0.0;
+    for v in 1..=num_vars {
+        if x[v] != Value::Unassigned {
+            continue;
+        }
+        if best.is_none() || scores[v] > best_score {
+            best = Some(v);
+            best_score = scores[v];
+        }
+    }
+    best.expect("at least one unassigned variable must exist when select_var_by_activity is called")
+}
 
 /// How often the time limit is checked, in number of decisions plus
 /// conflicts processed, matching [`crate::dfs::TIME_CHECK_INTERVAL`]
@@ -70,7 +206,7 @@ const TIME_CHECK_INTERVAL: usize = 0xfff;
 const BYTES_PER_LITERAL: i64 = 4;
 const PER_CLAUSE_OVERHEAD_BYTES: i64 = 40;
 
-/// `CLAUSE_ACTIVITY_DECAY` and `CLAUSE_ACTIVITY_RESCALE_THRESHOLD`
+/// `CLAUSE_ACTIVITY_DECAY` and `ACTIVITY_RESCALE_THRESHOLD`
 /// implement MiniSat's clause activity bookkeeping (see
 /// [`analyze`]'s activity bump): rather than multiplying every
 /// clause's activity by `CLAUSE_ACTIVITY_DECAY` after every conflict
@@ -78,12 +214,12 @@ const PER_CLAUSE_OVERHEAD_BYTES: i64 = 40;
 /// clause-activity-increment is grown by `1/CLAUSE_ACTIVITY_DECAY`
 /// instead, which has the same relative effect (older bumps count
 /// for less compared to newer ones) at O(1) cost. If the increment
-/// ever grows past `CLAUSE_ACTIVITY_RESCALE_THRESHOLD`, every
+/// ever grows past `ACTIVITY_RESCALE_THRESHOLD`, every
 /// clause's activity and the increment itself are divided back down
 /// by the same factor, to stay well within f64's range over a very
 /// long run.
 const CLAUSE_ACTIVITY_DECAY: f64 = 0.999;
-const CLAUSE_ACTIVITY_RESCALE_THRESHOLD: f64 = 1e100;
+const ACTIVITY_RESCALE_THRESHOLD: f64 = 1e100;
 
 /// Estimates `clause`'s contribution to the clause database's memory
 /// footprint; see `BYTES_PER_LITERAL`/`PER_CLAUSE_OVERHEAD_BYTES`.
@@ -117,23 +253,34 @@ pub struct SolveResult {
 /// conflicts while at decision level 0 (nothing left to backjump to),
 /// the problem is proven unsatisfiable.
 ///
-/// `variant` selects which of [`crate::dfs::select_var`]/
-/// [`crate::dfs::select_var_fast_pick`] is used to pick the branching
+/// `variant` selects which heuristic is used to pick the branching
 /// variable at every decision (see [`SelectVarVariant`]); per
 /// STAGE11.md, this is the first algorithm parameter `cdcl` accepts,
-/// same as `dfs`. `memory_limit_bytes` is the second, optional,
-/// STAGE12.md algorithm parameter: once the estimated size of the
-/// learned-clause database exceeds it, the least active learned
-/// clauses are periodically deleted (see [`reduce_clause_database`]);
-/// `None` means unbounded, matching `cdcl`'s original (Stage 11)
-/// behavior.
+/// same as `dfs`, but STAGE13.md extends the range `dfs`'s own values
+/// don't cover (`Vsids`, `Lrb`). STAGE13.md leaves the default up to
+/// this implementation: it is `SelectVarVariant::Vsids`. The paper
+/// cited in the module doc comment reports LRB solving more instances
+/// than VSIDS on SAT Competition instances, but this project's own
+/// benchmark comparison (`reports/REPORT13.md`) found VSIDS clearly
+/// ahead of both LRB and the older, purely structural heuristics this
+/// project started with in Stages 5-6 on this project's actual
+/// (uniform random 3-SAT) benchmark set -- real measurement on the
+/// relevant benchmarks wins out over a priori literature reasoning
+/// here. Callers that want one of the others still get it by passing
+/// `Weighted`, `Fast`, or `Lrb` explicitly.
+///
+/// `memory_limit_bytes` is the second, optional, STAGE12.md algorithm
+/// parameter: once the estimated size of the learned-clause database
+/// exceeds it, the least active learned clauses are periodically
+/// deleted (see [`reduce_clause_database`]); `None` means unbounded,
+/// matching `cdcl`'s original (Stage 11) behavior.
 ///
 /// If `time_limit` is `Some`, the search gives up and reports an
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
 /// once it is exceeded, checked only periodically (see
 /// [`TIME_CHECK_INTERVAL`]). `rng` supplies the randomness
-/// `select_var` uses to break ties, and `verbose` controls progress
-/// output, matching [`crate::dfs::run`].
+/// `SelectVarVariant::Weighted` uses to break ties, and `verbose`
+/// controls progress output, matching [`crate::dfs::run`].
 pub fn run<R: Rng>(
     problem: &Problem,
     time_limit: Option<Duration>,
@@ -197,9 +344,15 @@ pub fn run<R: Rng>(
     // deleted; only clauses at or above it are learned, and so are
     // eligible for reduce_clause_database to consider (STAGE12.md).
     let num_original_clauses = working_problem.clauses.len();
-    let mut activity = vec![0.0f64; num_original_clauses];
+    let mut clause_activity = vec![0.0f64; num_original_clauses];
     let mut clause_activity_increment = 1.0f64;
     let mut estimated_bytes: i64 = working_problem.clauses.iter().map(clause_byte_cost).sum();
+
+    // STAGE13.md's VSIDS/LRB bookkeeping; always allocated (cheap,
+    // O(num_vars)) but only ever read or written when variant
+    // actually calls for it.
+    let mut vsids = VsidsState::new(problem.num_vars);
+    let mut lrb = LrbState::new(problem.num_vars);
 
     let start_time = Instant::now();
     let mut step: usize = 0;
@@ -232,6 +385,9 @@ pub fn run<R: Rng>(
             current_level,
             &mut level,
             &mut reason,
+            variant,
+            num_conflicts,
+            &mut lrb,
         );
 
         if let Some(c) = confl {
@@ -258,9 +414,12 @@ pub fn run<R: Rng>(
                 &x,
                 &mut seen,
                 current_level,
-                &mut activity,
+                &mut clause_activity,
                 clause_activity_increment,
                 num_original_clauses,
+                variant,
+                &mut vsids,
+                &mut lrb,
             );
             backtrack_to(
                 backtrack_level,
@@ -269,6 +428,9 @@ pub fn run<R: Rng>(
                 &mut x,
                 &mut q_head,
                 &mut current_level,
+                variant,
+                num_conflicts,
+                &mut lrb,
             );
             let new_clause = add_learned_clause(
                 &learned,
@@ -276,7 +438,7 @@ pub fn run<R: Rng>(
                 &mut lists,
                 &mut watch,
                 &level,
-                &mut activity,
+                &mut clause_activity,
                 &mut estimated_bytes,
             );
             assign_literal(
@@ -287,6 +449,9 @@ pub fn run<R: Rng>(
                 &mut level,
                 &mut reason,
                 &mut trail,
+                variant,
+                num_conflicts,
+                &mut lrb,
             );
 
             // Once per conflict (matching MiniSat's claDecayActivity),
@@ -294,11 +459,20 @@ pub fn run<R: Rng>(
             // relatively more than past ones -- the O(1) equivalent of
             // decaying every clause's activity individually.
             clause_activity_increment /= CLAUSE_ACTIVITY_DECAY;
-            if clause_activity_increment > CLAUSE_ACTIVITY_RESCALE_THRESHOLD {
-                for a in activity.iter_mut() {
-                    *a /= CLAUSE_ACTIVITY_RESCALE_THRESHOLD;
+            if clause_activity_increment > ACTIVITY_RESCALE_THRESHOLD {
+                for a in clause_activity.iter_mut() {
+                    *a /= ACTIVITY_RESCALE_THRESHOLD;
                 }
-                clause_activity_increment /= CLAUSE_ACTIVITY_RESCALE_THRESHOLD;
+                clause_activity_increment /= ACTIVITY_RESCALE_THRESHOLD;
+            }
+            if variant == SelectVarVariant::Vsids {
+                vsids.increment /= VAR_ACTIVITY_DECAY;
+                if vsids.increment > ACTIVITY_RESCALE_THRESHOLD {
+                    for a in vsids.activity.iter_mut() {
+                        *a /= ACTIVITY_RESCALE_THRESHOLD;
+                    }
+                    vsids.increment /= ACTIVITY_RESCALE_THRESHOLD;
+                }
             }
 
             if let Some(limit) = memory_limit_bytes
@@ -308,7 +482,7 @@ pub fn run<R: Rng>(
                     &mut working_problem.clauses,
                     &mut lists,
                     &mut watch,
-                    &mut activity,
+                    &mut clause_activity,
                     &mut estimated_bytes,
                     &x,
                     &mut reason,
@@ -332,21 +506,28 @@ pub fn run<R: Rng>(
         }
 
         // Decide: pick the next branching variable (see
-        // SelectVarVariant; this is the same heuristic dfs uses, and
-        // -- since working_problem.clauses grows to include learned
-        // clauses -- the Weighted variant does see learned clauses
-        // when scoring, since it scans every not-yet-satisfied clause
-        // in working_problem.clauses; Fast ignores clause contents
-        // entirely either way). Always try False first, matching the
-        // order dfs's branch loop uses; CDCL doesn't get to try both
-        // polarities at one level the way dfs does -- if False turns
-        // out wrong, conflict analysis is what corrects it, by
+        // SelectVarVariant; this is the same heuristic dfs uses for
+        // Weighted/Fast, and -- since working_problem.clauses grows
+        // to include learned clauses -- the Weighted variant does see
+        // learned clauses when scoring, since it scans every
+        // not-yet-satisfied clause in working_problem.clauses; Fast
+        // ignores clause contents entirely either way. Vsids/Lrb
+        // (STAGE13.md) pick the highest-scoring unassigned variable
+        // by their own per-variable bookkeeping instead (see
+        // select_var_by_activity). Always try False first, matching
+        // the order dfs's branch loop uses; CDCL doesn't get to try
+        // both polarities at one level the way dfs does -- if False
+        // turns out wrong, conflict analysis is what corrects it, by
         // deriving a clause that forces True once it backjumps here
         // again.
         num_decisions += 1;
         let v = match variant {
             SelectVarVariant::Fast => select_var_fast_pick(&working_problem, &x),
             SelectVarVariant::Weighted => select_var(&working_problem, &x, rng),
+            SelectVarVariant::Vsids => {
+                select_var_by_activity(&vsids.activity, &x, problem.num_vars)
+            }
+            SelectVarVariant::Lrb => select_var_by_activity(&lrb.q, &x, problem.num_vars),
         };
         current_level += 1;
         trail_lim.push(trail.len());
@@ -358,6 +539,9 @@ pub fn run<R: Rng>(
             &mut level,
             &mut reason,
             &mut trail,
+            variant,
+            num_conflicts,
+            &mut lrb,
         );
     }
 }
@@ -394,7 +578,12 @@ fn bootstrap(problem: &Problem) -> Option<(Problem, Vec<[Literal; 2]>, Assignmen
 }
 
 /// Records `lit` as true (setting its variable's value, decision
-/// level, and reason accordingly) and appends it to `trail`.
+/// level, and reason accordingly) and appends it to `trail`. For
+/// `SelectVarVariant::Lrb` (STAGE13.md), it also records the current
+/// conflict count in `lrb.assigned_at_conflict`, so [`backtrack_to`]
+/// can later tell how many conflicts elapsed while this variable was
+/// assigned.
+#[allow(clippy::too_many_arguments)]
 fn assign_literal(
     lit: Literal,
     level_now: usize,
@@ -403,6 +592,9 @@ fn assign_literal(
     level: &mut [usize],
     reason: &mut [Option<usize>],
     trail: &mut Vec<usize>,
+    variant: SelectVarVariant,
+    num_conflicts: usize,
+    lrb: &mut LrbState,
 ) {
     let v = cnf::literal_var(lit);
     x[v] = if cnf::literal_is_negative(lit) {
@@ -413,6 +605,9 @@ fn assign_literal(
     level[v] = level_now;
     reason[v] = reason_now;
     trail.push(v);
+    if variant == SelectVarVariant::Lrb {
+        lrb.assigned_at_conflict[v] = num_conflicts;
+    }
 }
 
 /// Applies boolean constraint propagation via watched literals (see
@@ -440,6 +635,9 @@ fn propagate(
     current_level: usize,
     level: &mut [usize],
     reason: &mut [Option<usize>],
+    variant: SelectVarVariant,
+    num_conflicts: usize,
+    lrb: &mut LrbState,
 ) -> Option<usize> {
     while *q_head < trail.len() {
         let v = trail[*q_head];
@@ -477,7 +675,18 @@ fn propagate(
             }
             let forced_var = cnf::literal_var(other_watch);
             if x[forced_var] == Value::Unassigned {
-                assign_literal(other_watch, current_level, Some(c), x, level, reason, trail);
+                assign_literal(
+                    other_watch,
+                    current_level,
+                    Some(c),
+                    x,
+                    level,
+                    reason,
+                    trail,
+                    variant,
+                    num_conflicts,
+                    lrb,
+                );
             }
             // Otherwise other_watch is already true: the clause is
             // satisfied through it, and there is nothing to do.
@@ -509,11 +718,20 @@ fn propagate(
 ///
 /// As a side effect (STAGE12.md), every learned clause visited along
 /// the way (every `reason_clause` at index >= `num_original_clauses`)
-/// has its activity (in `activity`) bumped by
-/// `clause_activity_increment`, MiniSat's measure of how useful a
-/// clause has recently been to conflict analysis -- this is what
-/// [`reduce_clause_database`] later uses to decide which learned
-/// clauses to keep.
+/// has its activity bumped by `clause_activity_increment`, MiniSat's
+/// measure of how useful a clause has recently been to conflict
+/// analysis -- this is what [`reduce_clause_database`] later uses to
+/// decide which learned clauses to keep.
+///
+/// As a second side effect (STAGE13.md), every *variable* newly
+/// marked seen here also has its `SelectVarVariant::Vsids`/`Lrb`
+/// bookkeeping updated, whichever `variant` calls for: VSIDS bumps
+/// `vsids.activity` by `vsids.increment` (the same increment-growth
+/// trick as clause activity, decayed once per conflict in [`run`]);
+/// LRB increments `lrb.participated`, counting this as one more
+/// conflict the variable has contributed to since it was last
+/// assigned (see [`backtrack_to`] for where that turns into an
+/// updated Q-value).
 #[allow(clippy::too_many_arguments)]
 fn analyze(
     confl: usize,
@@ -524,9 +742,12 @@ fn analyze(
     x: &Assignment,
     seen: &mut [bool],
     current_level: usize,
-    activity: &mut [f64],
+    clause_activity: &mut [f64],
     clause_activity_increment: f64,
     num_original_clauses: usize,
+    variant: SelectVarVariant,
+    vsids: &mut VsidsState,
+    lrb: &mut LrbState,
 ) -> (Clause, usize) {
     for s in seen.iter_mut() {
         *s = false;
@@ -540,7 +761,7 @@ fn analyze(
 
     loop {
         if reason_clause >= num_original_clauses {
-            activity[reason_clause] += clause_activity_increment;
+            clause_activity[reason_clause] += clause_activity_increment;
         }
         for &lit in &clauses[reason_clause] {
             if let Some(pl) = p
@@ -553,6 +774,11 @@ fn analyze(
                 continue;
             }
             seen[v] = true;
+            match variant {
+                SelectVarVariant::Vsids => vsids.activity[v] += vsids.increment,
+                SelectVarVariant::Lrb => lrb.participated[v] += 1,
+                _ => {}
+            }
             if level[v] == current_level {
                 counter += 1;
             } else {
@@ -616,6 +842,22 @@ fn literal_assigned_true(v: usize, x: &Assignment) -> Literal {
 /// a single persistent trail instead of dfs's cloned-per-branch
 /// approach (see STAGE9.md's `WatchState` doc comment for the tension
 /// this resolves).
+///
+/// For `SelectVarVariant::Lrb` (STAGE13.md), the moment a variable
+/// becomes unassigned is also exactly when its learning rate can be
+/// computed: the "interval" is how many conflicts occurred while it
+/// was assigned (`num_conflicts` now, minus its value when the
+/// variable was last assigned, recorded by [`assign_literal`] in
+/// `lrb.assigned_at_conflict`), and the reward `r` is how many of
+/// those conflicts it actually participated in
+/// (`lrb.participated[v]`) divided by that interval. Its Q-value is
+/// then nudged toward `r` by `LRB_ALPHA` (an exponential moving
+/// average), and `lrb.participated` is reset to 0 for its next stint
+/// as an assigned variable. This is the paper's core learning-rate
+/// idea; the "reason side rate" bonus and the annealed (rather than
+/// fixed) alpha it also describes are both omitted here (see the
+/// module doc comment).
+#[allow(clippy::too_many_arguments)]
 fn backtrack_to(
     level_target: usize,
     trail: &mut Vec<usize>,
@@ -623,9 +865,20 @@ fn backtrack_to(
     x: &mut Assignment,
     q_head: &mut usize,
     current_level: &mut usize,
+    variant: SelectVarVariant,
+    num_conflicts: usize,
+    lrb: &mut LrbState,
 ) {
     let cut = trail_lim[level_target + 1];
     for &v in &trail[cut..] {
+        if variant == SelectVarVariant::Lrb {
+            let interval = num_conflicts - lrb.assigned_at_conflict[v];
+            if interval > 0 {
+                let r = lrb.participated[v] as f64 / interval as f64;
+                lrb.q[v] = (1.0 - LRB_ALPHA) * lrb.q[v] + LRB_ALPHA * r;
+            }
+            lrb.participated[v] = 0;
+        }
         x[v] = Value::Unassigned;
     }
     trail.truncate(cut);
@@ -652,7 +905,7 @@ fn add_learned_clause(
     lists: &mut Lists,
     watch: &mut Vec<[Literal; 2]>,
     level: &[usize],
-    activity: &mut Vec<f64>,
+    clause_activity: &mut Vec<f64>,
     estimated_bytes: &mut i64,
 ) -> Option<usize> {
     if learned.len() == 1 {
@@ -661,7 +914,7 @@ fn add_learned_clause(
 
     let idx = clauses.len();
     clauses.push(learned.clone());
-    activity.push(0.0);
+    clause_activity.push(0.0);
     *estimated_bytes += clause_byte_cost(learned);
     for &lit in learned {
         let v = cnf::literal_var(lit);
@@ -714,7 +967,7 @@ fn reduce_clause_database(
     clauses: &mut Vec<Clause>,
     lists: &mut Lists,
     watch: &mut Vec<[Literal; 2]>,
-    activity: &mut Vec<f64>,
+    clause_activity: &mut Vec<f64>,
     estimated_bytes: &mut i64,
     x: &Assignment,
     reason: &mut [Option<usize>],
@@ -732,7 +985,7 @@ fn reduce_clause_database(
     let mut eligible: Vec<usize> = (num_original_clauses..clauses.len())
         .filter(|&idx| !locked[idx])
         .collect();
-    eligible.sort_by(|&a, &b| activity[a].partial_cmp(&activity[b]).unwrap());
+    eligible.sort_by(|&a, &b| clause_activity[a].partial_cmp(&clause_activity[b]).unwrap());
 
     let num_to_delete = eligible.len() / 2;
     if num_to_delete == 0 {
@@ -754,7 +1007,7 @@ fn reduce_clause_database(
         old_to_new[idx] = Some(new_clauses.len());
         new_clauses.push(clause.clone());
         new_watch.push(watch[idx]);
-        new_activity.push(activity[idx]);
+        new_activity.push(clause_activity[idx]);
     }
 
     for (v, &value) in x.iter().enumerate().skip(1) {
@@ -773,7 +1026,7 @@ fn reduce_clause_database(
     *lists = occurrence::build(&temp_problem);
     *clauses = temp_problem.clauses;
     *watch = new_watch;
-    *activity = new_activity;
+    *clause_activity = new_activity;
 }
 
 /// Scans `clause` for a literal that is not false under `assignment`
@@ -814,6 +1067,8 @@ fn describe_params(time_limit: Option<Duration>, variant: SelectVarVariant) -> S
     let variant_code = match variant {
         SelectVarVariant::Weighted => 0,
         SelectVarVariant::Fast => 1,
+        SelectVarVariant::Vsids => 2,
+        SelectVarVariant::Lrb => 3,
     };
     match time_limit {
         Some(limit) => format!(
@@ -882,8 +1137,20 @@ mod tests {
         let mut reason: Vec<Option<usize>> = vec![None; 4];
         let mut trail: Vec<usize> = Vec::new();
         let mut q_head = 0usize;
+        let mut lrb = LrbState::new(3);
 
-        assign_literal(1, 1, None, &mut x, &mut level, &mut reason, &mut trail);
+        assign_literal(
+            1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        );
         let confl = propagate(
             &working_problem.clauses,
             &lists,
@@ -894,6 +1161,9 @@ mod tests {
             1,
             &mut level,
             &mut reason,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
         );
 
         assert_eq!(confl, None);
@@ -940,8 +1210,21 @@ mod tests {
         let mut trail: Vec<usize> = Vec::new();
         let mut q_head = 0usize;
         let mut seen = vec![false; 5];
+        let mut vsids = VsidsState::new(4);
+        let mut lrb = LrbState::new(4);
 
-        assign_literal(-1, 1, None, &mut x, &mut level, &mut reason, &mut trail);
+        assign_literal(
+            -1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        );
         let confl = propagate(
             &working_problem.clauses,
             &lists,
@@ -952,10 +1235,13 @@ mod tests {
             1,
             &mut level,
             &mut reason,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
         )
         .expect("expected clause {-2,-4} to be falsified");
 
-        let mut activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
 
         let (learned, backtrack_level) = analyze(
             confl,
@@ -966,9 +1252,12 @@ mod tests {
             &x,
             &mut seen,
             1,
-            &mut activity,
+            &mut clause_activity,
             1.0,
             working_problem.clauses.len(),
+            SelectVarVariant::Weighted,
+            &mut vsids,
+            &mut lrb,
         );
 
         assert_eq!(backtrack_level, 0);
@@ -985,7 +1274,7 @@ mod tests {
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let level = vec![0usize; 3];
-        let mut activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut estimated_bytes = 0i64;
         let before = working_problem.clauses.len();
 
@@ -995,7 +1284,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
         );
 
@@ -1015,7 +1304,7 @@ mod tests {
         let mut level = vec![0usize; 4];
         level[2] = 1;
         level[3] = 3; // higher than variable 2's level
-        let mut activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut estimated_bytes = 0i64;
 
         let idx = add_learned_clause(
@@ -1024,7 +1313,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause for a length-3 learned clause");
@@ -1039,7 +1328,12 @@ mod tests {
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
 
-        for variant in [SelectVarVariant::Weighted, SelectVarVariant::Fast] {
+        for variant in [
+            SelectVarVariant::Weighted,
+            SelectVarVariant::Fast,
+            SelectVarVariant::Vsids,
+            SelectVarVariant::Lrb,
+        ] {
             let mut rng = StdRng::seed_from_u64(1);
             let result = run(&problem, None, variant, None, &mut rng, 0);
             assert!(
@@ -1077,7 +1371,12 @@ mod tests {
             ],
         };
 
-        for variant in [SelectVarVariant::Weighted, SelectVarVariant::Fast] {
+        for variant in [
+            SelectVarVariant::Weighted,
+            SelectVarVariant::Fast,
+            SelectVarVariant::Vsids,
+            SelectVarVariant::Lrb,
+        ] {
             let mut rng = StdRng::seed_from_u64(1);
             let result = run(&problem, None, variant, None, &mut rng, 0);
             assert!(
@@ -1117,7 +1416,7 @@ mod tests {
         let mut lists = occurrence::build(&working_problem);
         let level = vec![0usize; 6];
         let num_original_clauses = working_problem.clauses.len();
-        let mut activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 6];
 
@@ -1127,7 +1426,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -1137,7 +1436,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -1147,12 +1446,12 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
-        activity[idx_low] = 1.0;
-        activity[idx_high] = 100.0;
+        clause_activity[idx_low] = 1.0;
+        clause_activity[idx_high] = 100.0;
 
         x[4] = Value::True;
         reason[4] = Some(idx_locked);
@@ -1162,7 +1461,7 @@ mod tests {
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -1206,7 +1505,7 @@ mod tests {
         let mut lists = occurrence::build(&working_problem);
         let level = vec![0usize; 3];
         let num_original_clauses = working_problem.clauses.len();
-        let mut activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 3];
 
@@ -1216,7 +1515,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &level,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -1228,7 +1527,7 @@ mod tests {
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
-            &mut activity,
+            &mut clause_activity,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -1291,6 +1590,198 @@ mod tests {
                 .any(|&lit| assignment::literal_is_true(&result.assignment, lit));
             assert!(satisfied, "clause {ci} ({clause:?}) not satisfied");
         }
+    }
+
+    /// Verifies the shared VSIDS/LRB selection helper directly: it
+    /// must skip already-assigned variables and pick the highest
+    /// score among the rest, ignoring ties in favor of whichever it
+    /// finds first.
+    #[test]
+    fn test_select_var_by_activity_picks_highest_scoring_unassigned_variable() {
+        let mut x = assignment::new(4);
+        x[1] = Value::True; // no longer a candidate
+        let scores = vec![0.0, 5.0, 9.0, 9.0, 3.0];
+
+        let got = select_var_by_activity(&scores, &x, 4);
+        assert_eq!(
+            got, 2,
+            "select_var_by_activity() = {got}, want 2 (highest score among unassigned variables)"
+        );
+    }
+
+    /// Checks that resolving through a conflict under
+    /// SelectVarVariant::Vsids bumps every variable touched along the
+    /// way, using the same hand-verified formula as
+    /// test_analyze_derives_unit_clause_independent_of_decision.
+    #[test]
+    fn test_analyze_bumps_vsids_activity() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![
+                vec![1, 2],
+                vec![-1, 3],
+                vec![-1, -3],
+                vec![-2, 4],
+                vec![-2, -4],
+            ],
+        };
+        let (working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let lists = occurrence::build(&working_problem);
+        let mut level = vec![0usize; 5];
+        let mut reason: Vec<Option<usize>> = vec![None; 5];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut q_head = 0usize;
+        let mut seen = vec![false; 5];
+        let mut vsids = VsidsState::new(4);
+        let mut lrb = LrbState::new(4);
+
+        assign_literal(
+            -1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Vsids,
+            0,
+            &mut lrb,
+        );
+        let confl = propagate(
+            &working_problem.clauses,
+            &lists,
+            &mut watch,
+            &mut x,
+            &mut trail,
+            &mut q_head,
+            1,
+            &mut level,
+            &mut reason,
+            SelectVarVariant::Vsids,
+            0,
+            &mut lrb,
+        )
+        .expect("expected clause {-2,-4} to be falsified");
+
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        analyze(
+            confl,
+            &working_problem.clauses,
+            &trail,
+            &level,
+            &reason,
+            &x,
+            &mut seen,
+            1,
+            &mut clause_activity,
+            1.0,
+            working_problem.clauses.len(),
+            SelectVarVariant::Vsids,
+            &mut vsids,
+            &mut lrb,
+        );
+
+        assert!(
+            vsids.activity[2] > 0.0,
+            "activity[2] = {}, want > 0 (variable 2 is touched while resolving this conflict)",
+            vsids.activity[2]
+        );
+        assert!(
+            vsids.activity[4] > 0.0,
+            "activity[4] = {}, want > 0 (variable 4 is touched while resolving this conflict)",
+            vsids.activity[4]
+        );
+    }
+
+    /// Verifies LRB's core update directly: a variable assigned when
+    /// num_conflicts was 5, that participated in 3 of the 5 conflicts
+    /// that occurred before it was unassigned at num_conflicts=10,
+    /// should get Q = LRB_ALPHA * (3.0/5.0) (starting from Q=0, so
+    /// the exponential moving average's "old value" term drops out),
+    /// and its participated counter should reset to 0.
+    #[test]
+    fn test_backtrack_to_updates_lrb_q() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (_working_problem, _watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 3];
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut trail_lim: Vec<usize> = vec![0, 0];
+        let mut current_level = 1usize;
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(2);
+
+        assign_literal(
+            1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Lrb,
+            5,
+            &mut lrb,
+        );
+        lrb.participated[1] = 3;
+
+        backtrack_to(
+            0,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Lrb,
+            10,
+            &mut lrb,
+        );
+
+        let want_q = LRB_ALPHA * (3.0 / 5.0);
+        assert!(
+            (lrb.q[1] - want_q).abs() < 1e-9,
+            "lrb.q[1] = {}, want {}",
+            lrb.q[1],
+            want_q
+        );
+        assert_eq!(
+            lrb.participated[1], 0,
+            "lrb.participated[1] = {}, want 0 (reset on unassignment)",
+            lrb.participated[1]
+        );
+    }
+
+    /// test_run_with_vsids_proves_unsatisfiable_pigeonhole and
+    /// test_run_with_lrb_proves_unsatisfiable_pigeonhole check the new
+    /// heuristics end to end against a problem the older variants are
+    /// already verified against (test_run_proves_unsatisfiable_pigeonhole),
+    /// confirming they don't just avoid crashing but reach the correct
+    /// verdict.
+    #[test]
+    fn test_run_with_vsids_proves_unsatisfiable_pigeonhole() {
+        let problem = pigeonhole_problem(4, 3);
+        let mut rng = StdRng::seed_from_u64(9);
+
+        let result = run(&problem, None, SelectVarVariant::Vsids, None, &mut rng, 0);
+
+        assert!(!result.satisfiable);
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn test_run_with_lrb_proves_unsatisfiable_pigeonhole() {
+        let problem = pigeonhole_problem(4, 3);
+        let mut rng = StdRng::seed_from_u64(9);
+
+        let result = run(&problem, None, SelectVarVariant::Lrb, None, &mut rng, 0);
+
+        assert!(!result.satisfiable);
+        assert!(!result.timed_out);
     }
 
     /// Builds the standard CNF encoding of "num_pigeons pigeons cannot

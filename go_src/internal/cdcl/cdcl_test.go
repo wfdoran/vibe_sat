@@ -2,13 +2,13 @@ package cdcl
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"testing"
 	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
-	"vibe_sat/internal/dfs"
 )
 
 // TestChooseWatchSkipsFalseLiterals verifies that chooseWatch never
@@ -53,7 +53,7 @@ func TestNewSolverDetectsBootstrapContradiction(t *testing.T) {
 		NumVars: 1,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
 	}
-	_, ok := newSolver(problem, nil)
+	_, ok := newSolver(problem, nil, SelectVarWeighted)
 	if ok {
 		t.Errorf("newSolver() reported ok = true for a contradictory unit-clause pair")
 	}
@@ -67,7 +67,7 @@ func TestPropagatePropagatesUnitChain(t *testing.T) {
 		NumVars: 3,
 		Clauses: []cnf.Clause{{cnf.Literal(-1), cnf.Literal(-2)}, {cnf.Literal(2), cnf.Literal(3)}},
 	}
-	s, ok := newSolver(problem, nil)
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -116,7 +116,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-4)},
 		},
 	}
-	s, ok := newSolver(problem, nil)
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -145,7 +145,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 // none: it becomes a permanent level-0 fact instead).
 func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil)
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -166,7 +166,7 @@ func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 // highest decision level.
 func TestAddLearnedClauseWatchesAssertingLiteralAndHighestLevel(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil)
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -192,7 +192,7 @@ func TestRunFindsSatisfiableFormula(t *testing.T) {
 		Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}, {cnf.Literal(-1), cnf.Literal(3)}, {cnf.Literal(-2), cnf.Literal(-3)}},
 	}
 
-	for _, variant := range []dfs.SelectVarVariant{dfs.SelectVarWeighted, dfs.SelectVarFast} {
+	for _, variant := range []SelectVarVariant{SelectVarWeighted, SelectVarFast, SelectVarVsids, SelectVarLrb} {
 		rng := rand.New(rand.NewPCG(1, 2))
 		result := Run(problem, nil, variant, nil, rng, 0)
 		if !result.Satisfiable {
@@ -232,7 +232,7 @@ func TestRunProvesUnsatisfiableSmallFormula(t *testing.T) {
 		},
 	}
 
-	for _, variant := range []dfs.SelectVarVariant{dfs.SelectVarWeighted, dfs.SelectVarFast} {
+	for _, variant := range []SelectVarVariant{SelectVarWeighted, SelectVarFast, SelectVarVsids, SelectVarLrb} {
 		rng := rand.New(rand.NewPCG(1, 2))
 		result := Run(problem, nil, variant, nil, rng, 0)
 		if result.Satisfiable {
@@ -253,7 +253,7 @@ func TestRunProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(4, 3)
 	rng := rand.New(rand.NewPCG(9, 9))
 
-	result := Run(problem, nil, dfs.SelectVarFast, nil, rng, 0)
+	result := Run(problem, nil, SelectVarFast, nil, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -268,13 +268,13 @@ func TestRunHandlesZeroVariableProblems(t *testing.T) {
 	rng := rand.New(rand.NewPCG(6, 6))
 
 	satProblem := &cnf.Problem{NumVars: 0, Clauses: nil}
-	result := Run(satProblem, nil, dfs.SelectVarWeighted, nil, rng, 0)
+	result := Run(satProblem, nil, SelectVarWeighted, nil, rng, 0)
 	if !result.Satisfiable {
 		t.Error("Run() reported unsatisfiable for an empty problem")
 	}
 
 	unsatProblem := &cnf.Problem{NumVars: 0, Clauses: []cnf.Clause{{}}}
-	result = Run(unsatProblem, nil, dfs.SelectVarWeighted, nil, rng, 0)
+	result = Run(unsatProblem, nil, SelectVarWeighted, nil, rng, 0)
 	if result.Satisfiable {
 		t.Error("Run() reported satisfiable for a problem with an empty clause")
 	}
@@ -288,7 +288,7 @@ func TestRunRespectsTimeLimit(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
 	tiny := time.Duration(1)
 
-	result := Run(problem, &tiny, dfs.SelectVarWeighted, nil, rng, 0)
+	result := Run(problem, &tiny, SelectVarWeighted, nil, rng, 0)
 
 	if !result.TimedOut {
 		t.Error("expected TimedOut = true with a 1ns time limit")
@@ -316,7 +316,7 @@ func TestClauseByteCost(t *testing.T) {
 // lists) must still be correct afterward.
 func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 5, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil)
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -324,8 +324,8 @@ func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 	idxLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)})
 	idxLocked := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)})
 	idxHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-3), cnf.Literal(5)})
-	s.activity[idxLow] = 1.0
-	s.activity[idxHigh] = 100.0
+	s.clauseActivity[idxLow] = 1.0
+	s.clauseActivity[idxHigh] = 100.0
 
 	s.x[4] = assign.True
 	s.reason[4] = idxLocked
@@ -364,7 +364,7 @@ func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 // panic) when every learned clause is currently locked.
 func TestReduceClauseDatabaseNoOpWhenNothingEligible(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil)
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -393,7 +393,7 @@ func TestRunWithTinyMemoryLimitStillProvesUnsatisfiablePigeonhole(t *testing.T) 
 	rng := rand.New(rand.NewPCG(9, 9))
 	limit := int64(200)
 
-	result := Run(problem, nil, dfs.SelectVarFast, &limit, rng, 0)
+	result := Run(problem, nil, SelectVarFast, &limit, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -414,7 +414,7 @@ func TestRunWithMemoryLimitStillFindsSatisfiableFormula(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	limit := int64(64)
 
-	result := Run(problem, nil, dfs.SelectVarWeighted, &limit, rng, 0)
+	result := Run(problem, nil, SelectVarWeighted, &limit, rng, 0)
 
 	if !result.Satisfiable {
 		t.Fatal("Run() reported unsatisfiable for a satisfiable formula")
@@ -430,6 +430,127 @@ func TestRunWithMemoryLimitStillFindsSatisfiableFormula(t *testing.T) {
 		if !satisfied {
 			t.Errorf("clause %d (%v) not satisfied by %v", ci, clause, result.Assignment)
 		}
+	}
+}
+
+// TestSelectVarByActivityPicksHighestScoringUnassignedVariable
+// verifies the shared VSIDS/LRB selection helper directly: it must
+// skip already-assigned variables and pick the highest score among
+// the rest, ignoring ties in favor of whichever it finds first.
+func TestSelectVarByActivityPicksHighestScoringUnassignedVariable(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarVsids)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.x[1] = assign.True // no longer a candidate
+	scores := []float64{0, 5.0, 9.0, 9.0, 3.0}
+
+	got := s.selectVarByActivity(scores)
+	if got != 2 {
+		t.Errorf("selectVarByActivity() = %d, want 2 (highest score among unassigned variables)", got)
+	}
+}
+
+// TestAnalyzeBumpsVsidsActivity checks that resolving through a
+// conflict under SelectVarVsids bumps every variable touched along
+// the way, using the same hand-verified formula as
+// TestAnalyzeDerivesUnitClauseIndependentOfDecision.
+func TestAnalyzeBumpsVsidsActivity(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 4,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1), cnf.Literal(2)},
+			{cnf.Literal(-1), cnf.Literal(3)},
+			{cnf.Literal(-1), cnf.Literal(-3)},
+			{cnf.Literal(-2), cnf.Literal(4)},
+			{cnf.Literal(-2), cnf.Literal(-4)},
+		},
+	}
+	s, ok := newSolver(problem, nil, SelectVarVsids)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.currentLevel = 1
+	s.trailLim = append(s.trailLim, len(s.trail))
+	s.assignLiteral(cnf.Literal(-1), s.currentLevel, noReason)
+
+	confl := s.propagate()
+	if confl == noReason {
+		t.Fatalf("propagate() found no conflict; expected clause {-2,-4} to be falsified")
+	}
+	s.analyze(confl)
+
+	if s.varActivity[2] <= 0 {
+		t.Errorf("varActivity[2] = %v, want > 0 (variable 2 is touched while resolving this conflict)", s.varActivity[2])
+	}
+	if s.varActivity[4] <= 0 {
+		t.Errorf("varActivity[4] = %v, want > 0 (variable 4 is touched while resolving this conflict)", s.varActivity[4])
+	}
+}
+
+// TestBacktrackToUpdatesLrbQ verifies LRB's core update directly: a
+// variable assigned when numConflicts was 5, that participated in 3
+// of the 5 conflicts that occurred before it was unassigned at
+// numConflicts=10, should get Q = lrbAlpha * (3.0/5.0) (starting from
+// Q=0, so the exponential moving average's "old value" term drops
+// out), and its participated counter should reset to 0.
+func TestBacktrackToUpdatesLrbQ(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarLrb)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	s.currentLevel = 1
+	s.trailLim = append(s.trailLim, len(s.trail))
+	s.numConflicts = 5
+	s.assignLiteral(cnf.Literal(1), s.currentLevel, noReason)
+	s.lrbParticipated[1] = 3
+	s.numConflicts = 10
+
+	s.backtrackTo(0)
+
+	wantQ := lrbAlpha * (3.0 / 5.0)
+	if math.Abs(s.lrbQ[1]-wantQ) > 1e-9 {
+		t.Errorf("lrbQ[1] = %v, want %v", s.lrbQ[1], wantQ)
+	}
+	if s.lrbParticipated[1] != 0 {
+		t.Errorf("lrbParticipated[1] = %d, want 0 (reset on unassignment)", s.lrbParticipated[1])
+	}
+}
+
+// TestRunWithVsidsProvesUnsatisfiablePigeonhole and
+// TestRunWithLrbProvesUnsatisfiablePigeonhole check the new
+// heuristics end to end against a problem the older variants are
+// already verified against (TestRunProvesUnsatisfiablePigeonhole),
+// confirming they don't just avoid crashing but reach the correct
+// verdict.
+func TestRunWithVsidsProvesUnsatisfiablePigeonhole(t *testing.T) {
+	problem := pigeonholeProblem(4, 3)
+	rng := rand.New(rand.NewPCG(9, 9))
+
+	result := Run(problem, nil, SelectVarVsids, nil, rng, 0)
+
+	if result.Satisfiable {
+		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
+	}
+	if result.TimedOut {
+		t.Error("Run() timed out with no time limit set")
+	}
+}
+
+func TestRunWithLrbProvesUnsatisfiablePigeonhole(t *testing.T) {
+	problem := pigeonholeProblem(4, 3)
+	rng := rand.New(rand.NewPCG(9, 9))
+
+	result := Run(problem, nil, SelectVarLrb, nil, rng, 0)
+
+	if result.Satisfiable {
+		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
+	}
+	if result.TimedOut {
+		t.Error("Run() timed out with no time limit set")
 	}
 }
 

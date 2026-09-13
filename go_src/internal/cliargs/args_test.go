@@ -337,10 +337,11 @@ func TestParseCDCLAcceptsTimeLimit(t *testing.T) {
 }
 
 // TestParseCDCLAcceptsSelectVarVariant verifies that --algorithm=cdcl
-// accepts a single --alg-params value of 0 or 1, selecting which
-// SelectVar heuristic to use, same as --algorithm=dfs (STAGE11.md).
+// accepts a single --alg-params value of 0, 1, 2, or 3, selecting
+// which SelectVar heuristic to use: 0/1 match --algorithm=dfs
+// (STAGE11.md); 2 (VSIDS) and 3 (LRB) are cdcl-only (STAGE13.md).
 func TestParseCDCLAcceptsSelectVarVariant(t *testing.T) {
-	for _, variant := range []int64{0, 1} {
+	for _, variant := range []int64{0, 1, 2, 3} {
 		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", strconv.FormatInt(variant, 10)})
 		if err != nil {
 			t.Fatalf("Parse returned unexpected error for --alg-params=%d: %v", variant, err)
@@ -352,11 +353,13 @@ func TestParseCDCLAcceptsSelectVarVariant(t *testing.T) {
 }
 
 // TestParseCDCLRejectsOutOfRangeAlgParams verifies that
-// --algorithm=cdcl rejects an --alg-params value other than 0 or 1.
+// --algorithm=cdcl rejects an --alg-params value outside 0-3.
 func TestParseCDCLRejectsOutOfRangeAlgParams(t *testing.T) {
-	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params=5"})
-	if err == nil {
-		t.Fatalf("expected error for an out-of-range --alg-params value with --algorithm=cdcl")
+	for _, variant := range []string{"5", "-1", "4"} {
+		_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params=" + variant})
+		if err == nil {
+			t.Errorf("expected error for --alg-params=%s with --algorithm=cdcl", variant)
+		}
 	}
 }
 

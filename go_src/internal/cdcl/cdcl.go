@@ -33,6 +33,36 @@
 // the least "active" half of the learned clauses that are safe to
 // delete (see its doc comment), MiniSat-style (Eén & Sörensson,
 // "An Extensible SAT-solver," SAT 2003).
+//
+// STAGE13.md adds two modern activity-based SelectVar variants that
+// only make sense once conflicts exist to learn from, so unlike
+// SelectVarWeighted/SelectVarFast (still delegated to dfs's identical
+// heuristics), they are implemented here rather than in dfs:
+//
+//   - SelectVarVsids: classic VSIDS (Moskewicz et al., Chaff, DAC
+//     2001). Every variable touched while resolving a conflict (see
+//     analyze) has its activity bumped; the highest-activity
+//     unassigned variable is picked at each decision.
+//   - SelectVarLrb: a simplified Learning Rate Branching (Liang,
+//     Ganesh, Poupart & Czarnecki, "Learning Rate Based Branching
+//     Heuristic for SAT Solvers," SAT 2016), which the paper reports
+//     beating both VSIDS and the Conflict History-Based heuristic on
+//     SAT Competition 2009-2014 instances (1279 vs. 1179 vs. 1235
+//     solved). Every variable's "learning rate" -- how often it has
+//     recently participated in producing a learned clause, per
+//     conflict it has been assigned for -- is tracked and used as its
+//     score instead. This implementation omits the paper's "reason
+//     side rate" bonus and its annealed learning-rate schedule for
+//     the Q-value update itself (kept at a fixed alpha instead); see
+//     backtrackTo's doc comment for exactly what is and isn't
+//     implemented.
+//
+// Per STAGE13.md, SelectVarVsids is the default for --algorithm=cdcl
+// (see Run's doc comment for why: the paper above favors LRB on SAT
+// Competition instances, but this project's own benchmark comparison,
+// reports/REPORT13.md, found VSIDS clearly ahead of both LRB and the
+// older structural heuristics on this project's actual, uniform
+// random 3-SAT benchmark set).
 package cdcl
 
 import (
@@ -74,20 +104,57 @@ const (
 	perClauseOverheadBytes = 40
 )
 
-// clauseActivityDecay and clauseActivityRescaleThreshold implement
-// MiniSat's clause activity bookkeeping (see solver's activity
+// clauseActivityDecay and activityRescaleThreshold implement
+// MiniSat's clause activity bookkeeping (see solver's clauseActivity
 // field): rather than multiplying every clause's activity by
 // clauseActivityDecay after every conflict (an O(clauses) cost per
 // conflict), the single clauseActivityIncrement is grown by
 // 1/clauseActivityDecay instead, which has the same relative effect
 // (older bumps count for less compared to newer ones) at O(1) cost.
-// If the increment ever grows past clauseActivityRescaleThreshold,
-// every clause's activity and the increment itself are divided back
-// down by the same factor, to stay well within float64's range over
-// a very long run.
+// If the increment ever grows past activityRescaleThreshold, every
+// clause's activity and the increment itself are divided back down by
+// the same factor, to stay well within float64's range over a very
+// long run. varActivityDecay is the analogous decay rate for
+// SelectVarVsids's per-variable activity (solver's varActivity
+// field); VSIDS conventionally decays faster than clause activity
+// does (MiniSat's own defaults: 0.95 for variables, 0.999 for
+// clauses), which is why these are two separate constants rather than
+// one shared rate.
 const (
-	clauseActivityDecay            = 0.999
-	clauseActivityRescaleThreshold = 1e100
+	clauseActivityDecay      = 0.999
+	varActivityDecay         = 0.95
+	activityRescaleThreshold = 1e100
+)
+
+// lrbAlpha is the fixed learning-rate weight SelectVarLrb uses when
+// updating a variable's Q-value (see backtrackTo's doc comment): the
+// paper anneals this over the course of the search, starting high and
+// decaying toward a floor; this implementation keeps it fixed at a
+// value from within that range instead, as a documented
+// simplification (see the package doc comment).
+const lrbAlpha = 0.4
+
+// SelectVarVariant identifies which heuristic Run should use to pick
+// the next branching variable. Values 0 and 1 match dfs.SelectVarVariant
+// exactly (and are delegated to dfs.SelectVar/dfs.SelectVarFastPick
+// unchanged); 2 and 3 are STAGE13.md's new activity-based heuristics,
+// which only exist here since they require conflict-driven learning's
+// bookkeeping to have anything to work from.
+type SelectVarVariant int
+
+const (
+	// SelectVarWeighted matches dfs.SelectVarWeighted: STAGE5.md's
+	// clause-weighted heuristic, delegated to dfs.SelectVar unchanged.
+	SelectVarWeighted SelectVarVariant = 0
+	// SelectVarFast matches dfs.SelectVarFast: the cheap static-order
+	// heuristic, delegated to dfs.SelectVarFastPick unchanged.
+	SelectVarFast SelectVarVariant = 1
+	// SelectVarVsids is STAGE13.md's VSIDS heuristic (see the package
+	// doc comment); this is Run's default.
+	SelectVarVsids SelectVarVariant = 2
+	// SelectVarLrb is STAGE13.md's (simplified) LRB heuristic (see
+	// the package doc comment).
+	SelectVarLrb SelectVarVariant = 3
 )
 
 // Result describes the outcome of a CDCL search.
@@ -128,11 +195,11 @@ type solver struct {
 	// of reduction passes without needing to be updated.
 	numOriginalClauses int
 
-	// activity holds one MiniSat-style "activity" score per clause
-	// (see clauseActivityDecay), parallel to clauses; only entries at
-	// index >= numOriginalClauses are ever read or written, since
-	// original clauses are never deletion candidates.
-	activity                []float64
+	// clauseActivity holds one MiniSat-style "activity" score per
+	// clause (see clauseActivityDecay), parallel to clauses; only
+	// entries at index >= numOriginalClauses are ever read or
+	// written, since original clauses are never deletion candidates.
+	clauseActivity          []float64
 	clauseActivityIncrement float64
 
 	// estimatedBytes tracks clauseByteCost summed over every current
@@ -146,6 +213,29 @@ type solver struct {
 	// (STAGE12.md); nil means "no limit" (STAGE11.md's original,
 	// unbounded behavior).
 	memoryLimitBytes *int64
+
+	// variant selects which SelectVar heuristic decide uses
+	// (STAGE13.md); fixed for the lifetime of one solver/Run call.
+	variant SelectVarVariant
+
+	// varActivity holds one VSIDS activity score per variable
+	// (SelectVarVsids only), sized numVars+1, bumped in analyze and
+	// decayed in learnAndBackjump exactly like clauseActivity, but
+	// with its own increment and decay rate (see varActivityDecay).
+	varActivity          []float64
+	varActivityIncrement float64
+
+	// lrbQ holds one learning-rate score per variable (SelectVarLrb
+	// only), sized numVars+1: see backtrackTo's doc comment for how
+	// it's updated. lrbParticipated counts, for each variable
+	// currently assigned, how many conflicts it has contributed a
+	// literal to since it was last assigned; lrbAssignedAtConflict
+	// records numConflicts's value at the moment each variable was
+	// last assigned, so backtrackTo can compute how many conflicts
+	// elapsed while it was assigned.
+	lrbQ                  []float64
+	lrbParticipated       []int
+	lrbAssignedAtConflict []int
 
 	x            assign.Assignment // current (partial) assignment
 	level        []int             // level[v] = decision level at which v was assigned (meaningless if x[v] is Unassigned)
@@ -173,9 +263,10 @@ func clauseByteCost(clause cnf.Clause) int64 {
 // preprocessing already does this by default), followed by initial
 // watch state for whatever clauses survive it. memoryLimitBytes is
 // the optional learned-clause database memory limit (STAGE12.md); nil
-// means unbounded. ok is false if this bootstrap alone already proves
+// means unbounded. variant is the SelectVar heuristic to use
+// (STAGE13.md). ok is false if this bootstrap alone already proves
 // problem unsatisfiable.
-func newSolver(problem *cnf.Problem, memoryLimitBytes *int64) (s *solver, ok bool) {
+func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant) (s *solver, ok bool) {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	x := assign.New(problem.NumVars)
 	if unsat, _ := preprocess.UnitPropagate(&clauses, x); unsat {
@@ -208,10 +299,16 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64) (s *solver, ok boo
 		watch:                   watch,
 		lists:                   occurrence.Build(&cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}),
 		numOriginalClauses:      len(clauses),
-		activity:                make([]float64, len(clauses)),
+		clauseActivity:          make([]float64, len(clauses)),
 		clauseActivityIncrement: 1.0,
 		estimatedBytes:          estimatedBytes,
 		memoryLimitBytes:        memoryLimitBytes,
+		variant:                 variant,
+		varActivity:             make([]float64, problem.NumVars+1),
+		varActivityIncrement:    1.0,
+		lrbQ:                    make([]float64, problem.NumVars+1),
+		lrbParticipated:         make([]int, problem.NumVars+1),
+		lrbAssignedAtConflict:   make([]int, problem.NumVars+1),
 		x:                       x,
 		level:                   make([]int, problem.NumVars+1),
 		reason:                  reason,
@@ -228,22 +325,34 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64) (s *solver, ok boo
 // conflicts while at decision level 0 (nothing left to backjump to),
 // the problem is proven unsatisfiable.
 //
-// variant selects which of dfs.SelectVar/dfs.SelectVarFastPick is
-// used to pick the branching variable at every decision (see
-// dfs.SelectVarVariant); per STAGE11.md, this is the first algorithm
-// parameter cdcl accepts, same as dfs. memoryLimitBytes is the
-// second, optional, STAGE12.md algorithm parameter: once the
-// estimated size of the learned-clause database exceeds it, the
-// least active learned clauses are periodically deleted (see
-// reduceClauseDatabase); nil means unbounded, matching cdcl's
-// original (Stage 11) behavior.
+// variant selects which SelectVar heuristic is used to pick the
+// branching variable at every decision (see SelectVarVariant); per
+// STAGE11.md, this is the first algorithm parameter cdcl accepts,
+// same as dfs, but STAGE13.md extends the range dfs's own values
+// don't cover (2 = VSIDS, 3 = LRB). STAGE13.md leaves the default up
+// to this implementation: it is SelectVarVsids. The paper cited in
+// the package doc comment reports LRB solving more instances than
+// VSIDS on SAT Competition instances, but this project's own
+// benchmark comparison (reports/REPORT13.md) found VSIDS clearly
+// ahead of both LRB and the older, purely structural heuristics this
+// project started with in Stages 5-6 on this project's actual
+// (uniform random 3-SAT) benchmark set -- real measurement on the
+// relevant benchmarks wins out over a priori literature reasoning
+// here. Callers that want one of the others still get it by passing
+// 0, 1, or 3 explicitly.
+//
+// memoryLimitBytes is the second, optional, STAGE12.md algorithm
+// parameter: once the estimated size of the learned-clause database
+// exceeds it, the least active learned clauses are periodically
+// deleted (see reduceClauseDatabase); nil means unbounded, matching
+// cdcl's original (Stage 11) behavior.
 //
 // If timeLimit is non-nil, the search gives up and reports an
 // inconclusive result (Satisfiable == false, TimedOut == true) once
 // it is exceeded, checked only periodically (see timeCheckInterval).
-// rng supplies the randomness SelectVar uses to break ties, and
-// verbose controls progress output, matching dfs.Run.
-func Run(problem *cnf.Problem, timeLimit *time.Duration, variant dfs.SelectVarVariant, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
+// rng supplies the randomness SelectVarWeighted uses to break ties,
+// and verbose controls progress output, matching dfs.Run.
+func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
 		fmt.Println("cdcl:", describeParams(timeLimit, variant)+describeMemoryLimit(memoryLimitBytes))
 	}
@@ -256,7 +365,7 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant dfs.SelectVarVa
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	s, ok := newSolver(problem, memoryLimitBytes)
+	s, ok := newSolver(problem, memoryLimitBytes, variant)
 	if !ok {
 		if verbose >= 1 {
 			fmt.Println("UNSAT")
@@ -295,7 +404,7 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant dfs.SelectVarVa
 			return Result{Satisfiable: true, Assignment: s.x, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts}
 		}
 
-		s.decide(variant, rng)
+		s.decide(rng)
 	}
 }
 
@@ -310,28 +419,32 @@ func (s *solver) allAssigned() bool {
 	return true
 }
 
-// decide chooses the next branching variable via SelectVar/
-// SelectVarFastPick (matching dfs's variant selection exactly) and
-// pushes it onto the trail as a new decision level, always trying
+// decide chooses the next branching variable according to s.variant
+// and pushes it onto the trail as a new decision level, always trying
 // False first -- the same order dfs's branch loop uses, chosen here
 // for consistency rather than any phase-saving heuristic (CDCL
 // doesn't get to try both polarities at one level the way dfs does;
 // if False turns out wrong, conflict analysis is what corrects it, by
 // deriving a clause that forces True once it backjumps here again).
-func (s *solver) decide(variant dfs.SelectVarVariant, rng *rand.Rand) {
-	// Rebuilding this on every decision (rather than caching it) keeps
-	// it trivially correct as s.clauses grows via learned clauses --
-	// this is also the answer to STAGE11.md's question of whether
-	// learned clauses feed back into SelectVar: yes, for the weighted
-	// variant, since it scans every not-yet-satisfied clause,
-	// including learned ones (SelectVarFast ignores clause contents
-	// entirely either way).
-	workingProblem := &cnf.Problem{NumVars: s.numVars, Clauses: s.clauses}
-
+func (s *solver) decide(rng *rand.Rand) {
 	var v int
-	if variant == dfs.SelectVarFast {
-		v = dfs.SelectVarFastPick(workingProblem, s.x)
-	} else {
+	switch s.variant {
+	case SelectVarFast:
+		// Delegated to dfs unchanged; dfs.SelectVarFastPick ignores
+		// clause contents entirely, so it needs no *cnf.Problem wrapper.
+		v = dfs.SelectVarFastPick(&cnf.Problem{NumVars: s.numVars}, s.x)
+	case SelectVarVsids:
+		v = s.selectVarByActivity(s.varActivity)
+	case SelectVarLrb:
+		v = s.selectVarByActivity(s.lrbQ)
+	default: // SelectVarWeighted
+		// Rebuilding this on every decision (rather than caching it)
+		// keeps it trivially correct as s.clauses grows via learned
+		// clauses -- this is also the answer to STAGE11.md's question
+		// of whether learned clauses feed back into SelectVar: yes,
+		// for the weighted variant, since it scans every
+		// not-yet-satisfied clause, including learned ones.
+		workingProblem := &cnf.Problem{NumVars: s.numVars, Clauses: s.clauses}
 		v = dfs.SelectVar(workingProblem, s.x, rng)
 	}
 
@@ -341,8 +454,32 @@ func (s *solver) decide(variant dfs.SelectVarVariant, rng *rand.Rand) {
 	s.assignLiteral(cnf.Literal(-v), s.currentLevel, noReason)
 }
 
+// selectVarByActivity returns the unassigned variable with the
+// highest score in scores (a linear scan, same asymptotic cost class
+// as SelectVarWeighted's clause scan; ties keep whichever variable
+// was found first). scores is s.varActivity for SelectVarVsids, or
+// s.lrbQ for SelectVarLrb. Before any conflicts have occurred, every
+// score is still 0, so this falls back to the lowest-numbered
+// unassigned variable -- the same choice SelectVarFast would make.
+func (s *solver) selectVarByActivity(scores []float64) int {
+	best := -1
+	bestScore := 0.0
+	for v := 1; v <= s.numVars; v++ {
+		if s.x[v] != assign.Unassigned {
+			continue
+		}
+		if best == -1 || scores[v] > bestScore {
+			best, bestScore = v, scores[v]
+		}
+	}
+	return best
+}
+
 // assignLiteral records lit as true (setting its variable's value,
-// level, and reason accordingly) and appends it to the trail.
+// level, and reason accordingly) and appends it to the trail. For
+// SelectVarLrb (STAGE13.md), it also records the current conflict
+// count, so backtrackTo can later tell how many conflicts elapsed
+// while this variable was assigned.
 func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 	v := lit.Var()
 	if lit.IsNegative() {
@@ -353,6 +490,9 @@ func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 	s.level[v] = level
 	s.reason[v] = reason
 	s.trail = append(s.trail, v)
+	if s.variant == SelectVarLrb {
+		s.lrbAssignedAtConflict[v] = s.numConflicts
+	}
 }
 
 // propagate applies boolean constraint propagation via watched
@@ -433,11 +573,21 @@ func (s *solver) learnAndBackjump(confl int) {
 	s.assignLiteral(learned[0], backtrackLevel, newClause)
 
 	s.clauseActivityIncrement /= clauseActivityDecay
-	if s.clauseActivityIncrement > clauseActivityRescaleThreshold {
-		for i := range s.activity {
-			s.activity[i] /= clauseActivityRescaleThreshold
+	if s.clauseActivityIncrement > activityRescaleThreshold {
+		for i := range s.clauseActivity {
+			s.clauseActivity[i] /= activityRescaleThreshold
 		}
-		s.clauseActivityIncrement /= clauseActivityRescaleThreshold
+		s.clauseActivityIncrement /= activityRescaleThreshold
+	}
+
+	if s.variant == SelectVarVsids {
+		s.varActivityIncrement /= varActivityDecay
+		if s.varActivityIncrement > activityRescaleThreshold {
+			for v := range s.varActivity {
+				s.varActivity[v] /= activityRescaleThreshold
+			}
+			s.varActivityIncrement /= activityRescaleThreshold
+		}
 	}
 
 	if s.memoryLimitBytes != nil && s.estimatedBytes > *s.memoryLimitBytes {
@@ -470,6 +620,15 @@ func (s *solver) learnAndBackjump(confl int) {
 // of how useful a clause has recently been to conflict analysis --
 // this is what reduceClauseDatabase later uses to decide which
 // learned clauses to keep.
+//
+// As a second side effect (STAGE13.md), every *variable* newly marked
+// seen here also has its SelectVarVsids/SelectVarLrb bookkeeping
+// updated, whichever s.variant calls for: VSIDS bumps varActivity by
+// varActivityIncrement (the same increment-growth trick as clause
+// activity, decayed once per conflict in learnAndBackjump); LRB
+// increments lrbParticipated, counting this as one more conflict the
+// variable has contributed to since it was last assigned (see
+// backtrackTo for where that turns into an updated Q-value).
 func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
 	for i := range s.seen {
 		s.seen[i] = false
@@ -482,7 +641,7 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
 
 	for {
 		if reasonClause >= s.numOriginalClauses {
-			s.activity[reasonClause] += s.clauseActivityIncrement
+			s.clauseActivity[reasonClause] += s.clauseActivityIncrement
 		}
 		for _, lit := range s.clauses[reasonClause] {
 			if p != 0 && lit.Var() == p.Var() {
@@ -493,6 +652,12 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
 				continue
 			}
 			s.seen[v] = true
+			switch s.variant {
+			case SelectVarVsids:
+				s.varActivity[v] += s.varActivityIncrement
+			case SelectVarLrb:
+				s.lrbParticipated[v]++
+			}
 			if s.level[v] == s.currentLevel {
 				counter++
 			} else {
@@ -556,10 +721,31 @@ func literalAssignedTrue(v int, x assign.Assignment) cnf.Literal {
 // backtracking, and is why cdcl uses a single persistent trail
 // instead of dfs's cloned-per-branch approach (see STAGE9.md's
 // watchState doc comment for the tension this resolves).
+//
+// For SelectVarLrb (STAGE13.md), the moment a variable becomes
+// unassigned is also exactly when its learning rate can be computed:
+// the "interval" is how many conflicts occurred while it was assigned
+// (s.numConflicts now, minus its value when the variable was last
+// assigned, recorded by assignLiteral), and the reward r is how many
+// of those conflicts it actually participated in
+// (s.lrbParticipated[v]) divided by that interval. Its Q-value is
+// then nudged toward r by lrbAlpha (an exponential moving average),
+// and lrbParticipated is reset to 0 for its next stint as an assigned
+// variable. This is the paper's core learning-rate idea; the "reason
+// side rate" bonus and the annealed (rather than fixed) alpha it also
+// describes are both omitted here (see the package doc comment).
 func (s *solver) backtrackTo(level int) {
 	cut := s.trailLim[level+1]
 	for i := len(s.trail) - 1; i >= cut; i-- {
-		s.x[s.trail[i]] = assign.Unassigned
+		v := s.trail[i]
+		if s.variant == SelectVarLrb {
+			if interval := s.numConflicts - s.lrbAssignedAtConflict[v]; interval > 0 {
+				r := float64(s.lrbParticipated[v]) / float64(interval)
+				s.lrbQ[v] = (1-lrbAlpha)*s.lrbQ[v] + lrbAlpha*r
+			}
+			s.lrbParticipated[v] = 0
+		}
+		s.x[v] = assign.Unassigned
 	}
 	s.trail = s.trail[:cut]
 	s.trailLim = s.trailLim[:level+1]
@@ -583,7 +769,7 @@ func (s *solver) addLearnedClause(learned cnf.Clause) int {
 
 	idx := len(s.clauses)
 	s.clauses = append(s.clauses, learned)
-	s.activity = append(s.activity, 0.0)
+	s.clauseActivity = append(s.clauseActivity, 0.0)
 	s.estimatedBytes += clauseByteCost(learned)
 	for _, lit := range learned {
 		v := lit.Var()
@@ -645,7 +831,7 @@ func (s *solver) reduceClauseDatabase() {
 		}
 	}
 	sort.Slice(eligible, func(i, j int) bool {
-		return s.activity[eligible[i]] < s.activity[eligible[j]]
+		return s.clauseActivity[eligible[i]] < s.clauseActivity[eligible[j]]
 	})
 
 	numToDelete := len(eligible) / 2
@@ -669,7 +855,7 @@ func (s *solver) reduceClauseDatabase() {
 		oldToNew[idx] = len(newClauses)
 		newClauses = append(newClauses, clause)
 		newWatch = append(newWatch, s.watch[idx])
-		newActivity = append(newActivity, s.activity[idx])
+		newActivity = append(newActivity, s.clauseActivity[idx])
 	}
 
 	for v := 1; v <= s.numVars; v++ {
@@ -680,7 +866,7 @@ func (s *solver) reduceClauseDatabase() {
 
 	s.clauses = newClauses
 	s.watch = newWatch
-	s.activity = newActivity
+	s.clauseActivity = newActivity
 	s.lists = occurrence.Build(&cnf.Problem{NumVars: s.numVars, Clauses: newClauses})
 
 	s.estimatedBytes = 0
@@ -723,7 +909,7 @@ func isFalse(lit cnf.Literal, assignment assign.Assignment) bool {
 
 // describeParams formats the configured time limit and SelectVar
 // variant for the "cdcl:" announcement printed at verbose level 1.
-func describeParams(timeLimit *time.Duration, variant dfs.SelectVarVariant) string {
+func describeParams(timeLimit *time.Duration, variant SelectVarVariant) string {
 	description := fmt.Sprintf("select_var=%d", variant)
 	if timeLimit != nil {
 		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
