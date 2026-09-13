@@ -63,6 +63,14 @@
 // reports/REPORT13.md, found VSIDS clearly ahead of both LRB and the
 // older structural heuristics on this project's actual, uniform
 // random 3-SAT benchmark set).
+//
+// STAGE14.md adds phase saving (see solver's savedPhase field, and
+// decide/backtrackTo, which read and write it respectively): a
+// consistently measured win in MiniSat-lineage solvers, per
+// Pipatsrisawat & Darwiche's discussion of component caching and
+// related techniques (2007-era MiniSat/RSat literature) cited there.
+// Unconditionally on for every SelectVarVariant, since STAGE14.md
+// asks that it always be, with no --alg-params toggle.
 package cdcl
 
 import (
@@ -237,6 +245,16 @@ type solver struct {
 	lrbParticipated       []int
 	lrbAssignedAtConflict []int
 
+	// savedPhase holds, for every variable, the value it last held
+	// before becoming unassigned (STAGE14.md), sized numVars+1;
+	// decide consults this to guess the same polarity again next time
+	// that variable is chosen, rather than always guessing False. Its
+	// zero value is assign.False (see assign.Value's declaration
+	// order), which is exactly the polarity a variable that has never
+	// been assigned before should default to, so no separate
+	// initialization is needed.
+	savedPhase assign.Assignment
+
 	x            assign.Assignment // current (partial) assignment
 	level        []int             // level[v] = decision level at which v was assigned (meaningless if x[v] is Unassigned)
 	reason       []int             // reason[v] = index into clauses of the clause that forced v, or noReason for a decision or a level-0 fact
@@ -309,6 +327,7 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		lrbQ:                    make([]float64, problem.NumVars+1),
 		lrbParticipated:         make([]int, problem.NumVars+1),
 		lrbAssignedAtConflict:   make([]int, problem.NumVars+1),
+		savedPhase:              make(assign.Assignment, problem.NumVars+1),
 		x:                       x,
 		level:                   make([]int, problem.NumVars+1),
 		reason:                  reason,
@@ -420,12 +439,14 @@ func (s *solver) allAssigned() bool {
 }
 
 // decide chooses the next branching variable according to s.variant
-// and pushes it onto the trail as a new decision level, always trying
-// False first -- the same order dfs's branch loop uses, chosen here
-// for consistency rather than any phase-saving heuristic (CDCL
-// doesn't get to try both polarities at one level the way dfs does;
-// if False turns out wrong, conflict analysis is what corrects it, by
-// deriving a clause that forces True once it backjumps here again).
+// and pushes it onto the trail as a new decision level, guessing its
+// saved phase (STAGE14.md, see solver.savedPhase's doc comment) as
+// the polarity to try -- False, for a variable that has never been
+// assigned before, matching the fixed order earlier stages always
+// used. CDCL doesn't get to try both polarities at one level the way
+// dfs does; if the guessed polarity turns out wrong, conflict
+// analysis is what corrects it, by deriving a clause that forces the
+// other one once it backjumps here again.
 func (s *solver) decide(rng *rand.Rand) {
 	var v int
 	switch s.variant {
@@ -451,7 +472,11 @@ func (s *solver) decide(rng *rand.Rand) {
 	s.numDecisions++
 	s.currentLevel++
 	s.trailLim = append(s.trailLim, len(s.trail))
-	s.assignLiteral(cnf.Literal(-v), s.currentLevel, noReason)
+	lit := cnf.Literal(-v)
+	if s.savedPhase[v] == assign.True {
+		lit = cnf.Literal(v)
+	}
+	s.assignLiteral(lit, s.currentLevel, noReason)
 }
 
 // selectVarByActivity returns the unassigned variable with the
@@ -734,6 +759,13 @@ func literalAssignedTrue(v int, x assign.Assignment) cnf.Literal {
 // variable. This is the paper's core learning-rate idea; the "reason
 // side rate" bonus and the annealed (rather than fixed) alpha it also
 // describes are both omitted here (see the package doc comment).
+//
+// For every variable, regardless of s.variant, the moment it becomes
+// unassigned is also when its phase is saved (STAGE14.md): whatever
+// value it held (s.x[v], True or False) right before this loop
+// overwrites it with Unassigned is remembered in s.savedPhase[v], so
+// decide can guess the same polarity again next time this variable is
+// chosen, rather than always guessing False.
 func (s *solver) backtrackTo(level int) {
 	cut := s.trailLim[level+1]
 	for i := len(s.trail) - 1; i >= cut; i-- {
@@ -745,6 +777,7 @@ func (s *solver) backtrackTo(level int) {
 			}
 			s.lrbParticipated[v] = 0
 		}
+		s.savedPhase[v] = s.x[v] // STAGE14.md: remember this polarity for decide's next guess
 		s.x[v] = assign.Unassigned
 	}
 	s.trail = s.trail[:cut]

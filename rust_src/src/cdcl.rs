@@ -72,6 +72,14 @@
 //! own benchmark comparison, `reports/REPORT13.md`, found VSIDS
 //! clearly ahead of both LRB and the older structural heuristics on
 //! this project's actual, uniform random 3-SAT benchmark set).
+//!
+//! STAGE14.md adds phase saving (see [`run`]'s `saved_phase` local
+//! and [`backtrack_to`], which reads and writes it respectively): a
+//! consistently measured win in MiniSat-lineage solvers, per
+//! Pipatsrisawat & Darwiche's discussion of component caching and
+//! related techniques (2007-era MiniSat/RSat literature) cited there.
+//! Unconditionally on for every `SelectVarVariant`, since STAGE14.md
+//! asks that it always be, with no `--alg-params` toggle.
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -354,6 +362,12 @@ pub fn run<R: Rng>(
     let mut vsids = VsidsState::new(problem.num_vars);
     let mut lrb = LrbState::new(problem.num_vars);
 
+    // STAGE14.md's phase saving: the value each variable last held
+    // before becoming unassigned. Starts all `Value::False`, which is
+    // exactly the polarity a variable that has never been assigned
+    // before should default to (see backtrack_to's doc comment).
+    let mut saved_phase = vec![Value::False; problem.num_vars + 1];
+
     let start_time = Instant::now();
     let mut step: usize = 0;
 
@@ -431,6 +445,7 @@ pub fn run<R: Rng>(
                 variant,
                 num_conflicts,
                 &mut lrb,
+                &mut saved_phase,
             );
             let new_clause = add_learned_clause(
                 &learned,
@@ -514,12 +529,14 @@ pub fn run<R: Rng>(
         // ignores clause contents entirely either way. Vsids/Lrb
         // (STAGE13.md) pick the highest-scoring unassigned variable
         // by their own per-variable bookkeeping instead (see
-        // select_var_by_activity). Always try False first, matching
-        // the order dfs's branch loop uses; CDCL doesn't get to try
-        // both polarities at one level the way dfs does -- if False
-        // turns out wrong, conflict analysis is what corrects it, by
-        // deriving a clause that forces True once it backjumps here
-        // again.
+        // select_var_by_activity). The polarity guessed is its saved
+        // phase (STAGE14.md; see backtrack_to's doc comment) -- False
+        // for a variable that has never been assigned before,
+        // matching the fixed order earlier stages always used. CDCL
+        // doesn't get to try both polarities at one level the way dfs
+        // does -- if the guessed polarity turns out wrong, conflict
+        // analysis is what corrects it, by deriving a clause that
+        // forces the other one once it backjumps here again.
         num_decisions += 1;
         let v = match variant {
             SelectVarVariant::Fast => select_var_fast_pick(&working_problem, &x),
@@ -532,7 +549,7 @@ pub fn run<R: Rng>(
         current_level += 1;
         trail_lim.push(trail.len());
         assign_literal(
-            -(v as Literal),
+            decision_literal(v, &saved_phase),
             current_level,
             None,
             &mut x,
@@ -828,6 +845,20 @@ fn literal_assigned_true(v: usize, x: &Assignment) -> Literal {
     }
 }
 
+/// Returns the literal [`run`]'s decision step should assign when
+/// branching on variable `v` (STAGE14.md): its saved phase, i.e.
+/// whatever polarity it held the last time it was assigned before
+/// becoming unassigned again, or `False` if `saved_phase[v]` is still
+/// its default (a variable that has never been assigned before),
+/// matching the fixed order earlier stages always used.
+fn decision_literal(v: usize, saved_phase: &[Value]) -> Literal {
+    if saved_phase[v] == Value::True {
+        v as Literal
+    } else {
+        -(v as Literal)
+    }
+}
+
 /// Undoes every assignment made after decision level `level_target`,
 /// resetting the trail, trail limits, and propagation queue
 /// accordingly. Unlike dfs's per-branch clones, `cdcl`'s watch state
@@ -857,6 +888,13 @@ fn literal_assigned_true(v: usize, x: &Assignment) -> Literal {
 /// idea; the "reason side rate" bonus and the annealed (rather than
 /// fixed) alpha it also describes are both omitted here (see the
 /// module doc comment).
+///
+/// For every variable, regardless of `variant`, the moment it becomes
+/// unassigned is also when its phase is saved (STAGE14.md): whatever
+/// value it held (`x[v]`, `True` or `False`) right before this loop
+/// overwrites it with `Unassigned` is remembered in `saved_phase[v]`,
+/// so [`run`]'s decision step can guess the same polarity again next
+/// time this variable is chosen, rather than always guessing `False`.
 #[allow(clippy::too_many_arguments)]
 fn backtrack_to(
     level_target: usize,
@@ -868,6 +906,7 @@ fn backtrack_to(
     variant: SelectVarVariant,
     num_conflicts: usize,
     lrb: &mut LrbState,
+    saved_phase: &mut [Value],
 ) {
     let cut = trail_lim[level_target + 1];
     for &v in &trail[cut..] {
@@ -879,6 +918,7 @@ fn backtrack_to(
             }
             lrb.participated[v] = 0;
         }
+        saved_phase[v] = x[v];
         x[v] = Value::Unassigned;
     }
     trail.truncate(cut);
@@ -1715,6 +1755,7 @@ mod tests {
         let mut current_level = 1usize;
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut saved_phase = vec![Value::False; 3];
 
         assign_literal(
             1,
@@ -1740,6 +1781,7 @@ mod tests {
             SelectVarVariant::Lrb,
             10,
             &mut lrb,
+            &mut saved_phase,
         );
 
         let want_q = LRB_ALPHA * (3.0 / 5.0);
@@ -1754,6 +1796,71 @@ mod tests {
             "lrb.participated[1] = {}, want 0 (reset on unassignment)",
             lrb.participated[1]
         );
+    }
+
+    /// Verifies STAGE14.md's core mechanism directly: a variable
+    /// assigned True and then backtracked over should have its phase
+    /// saved as True, regardless of SelectVar variant.
+    #[test]
+    fn test_backtrack_to_saves_phase() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (_working_problem, _watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 3];
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut trail_lim: Vec<usize> = vec![0, 0];
+        let mut current_level = 1usize;
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(2);
+        let mut saved_phase = vec![Value::False; 3];
+
+        assign_literal(
+            1, // x1 = True
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        );
+
+        backtrack_to(
+            0,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+            &mut saved_phase,
+        );
+
+        assert_eq!(saved_phase[1], Value::True);
+    }
+
+    /// Verifies that decision_literal consults saved_phase rather
+    /// than always guessing False.
+    #[test]
+    fn test_decision_literal_uses_saved_phase() {
+        let saved_phase = vec![Value::False, Value::True];
+        assert_eq!(decision_literal(1, &saved_phase), 1);
+    }
+
+    /// Verifies the fallback: a variable that has never been assigned
+    /// before (saved_phase still its default) is guessed False.
+    #[test]
+    fn test_decision_literal_defaults_to_false() {
+        let saved_phase = vec![Value::False, Value::False];
+        assert_eq!(decision_literal(1, &saved_phase), -1);
     }
 
     /// test_run_with_vsids_proves_unsatisfiable_pigeonhole and

@@ -520,6 +520,67 @@ func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 	}
 }
 
+// TestBacktrackToSavesPhase verifies STAGE14.md's core mechanism
+// directly: a variable assigned True and then backtracked over
+// should have its phase saved as True, regardless of SelectVar
+// variant.
+func TestBacktrackToSavesPhase(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	s.currentLevel = 1
+	s.trailLim = append(s.trailLim, len(s.trail))
+	s.assignLiteral(cnf.Literal(1), s.currentLevel, noReason) // x1 = True
+
+	s.backtrackTo(0)
+
+	if s.savedPhase[1] != assign.True {
+		t.Errorf("savedPhase[1] = %v, want True", s.savedPhase[1])
+	}
+}
+
+// TestDecideGuessesSavedPhase verifies that decide consults
+// savedPhase rather than always guessing False: with savedPhase[1]
+// pre-set to True (as if variable 1 had previously been unassigned
+// while True), the next decision on variable 1 (forced via
+// SelectVarFast, which always picks the lowest-numbered unassigned
+// variable) must assign it True, not False.
+func TestDecideGuessesSavedPhase(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarFast)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.savedPhase[1] = assign.True
+
+	s.decide(nil)
+
+	if s.x[1] != assign.True {
+		t.Errorf("x[1] = %v, want True (guessed from savedPhase)", s.x[1])
+	}
+}
+
+// TestDecideDefaultsToFalseWithNoSavedPhase verifies the fallback: a
+// variable that has never been assigned before (savedPhase still its
+// zero value) is guessed False, matching every earlier stage's fixed
+// decision order.
+func TestDecideDefaultsToFalseWithNoSavedPhase(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarFast)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	s.decide(nil)
+
+	if s.x[1] != assign.False {
+		t.Errorf("x[1] = %v, want False (no saved phase yet)", s.x[1])
+	}
+}
+
 // TestRunWithVsidsProvesUnsatisfiablePigeonhole and
 // TestRunWithLrbProvesUnsatisfiablePigeonhole check the new
 // heuristics end to end against a problem the older variants are
