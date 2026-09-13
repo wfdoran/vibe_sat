@@ -1,8 +1,9 @@
 // Command vibe_sat is a command line SAT solver. The program reads a
 // DIMACS CNF file into memory and attempts to solve it with the
 // selected algorithm (a basic hill-climb local search, "hc"; WalkSAT,
-// "ws"; or a complete depth-first search, "dfs"), optionally printing
-// progress and writing out a satisfying assignment if one is found.
+// "ws"; a complete depth-first search, "dfs"; or conflict-driven
+// clause learning, "cdcl"), optionally printing progress and writing
+// out a satisfying assignment if one is found.
 package main
 
 import (
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"vibe_sat/internal/assign"
+	"vibe_sat/internal/cdcl"
 	"vibe_sat/internal/cliargs"
 	"vibe_sat/internal/cnf"
 	"vibe_sat/internal/dfs"
@@ -73,6 +75,8 @@ func main() {
 		runWalkSat(problem, preResult, originalNumVars, args)
 	case "dfs":
 		runDFS(problem, preResult, originalNumVars, args)
+	case "cdcl":
+		runCDCL(problem, preResult, originalNumVars, args)
 	}
 
 	os.Exit(0)
@@ -179,6 +183,37 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 	}
 
 	result := dfs.Run(problem, lists, timeLimit, variant, rng, args.Verbose)
+
+	if result.Satisfiable {
+		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)
+	}
+}
+
+// runCDCL runs the conflict-driven clause learning algorithm (STAGE11.md)
+// against problem using the optional time limit, SelectVar variant, and
+// verbosity level given in args, then writes out the result if a
+// satisfying assignment was found. Like "dfs" (and unlike "hc"/"ws"),
+// a search that exhausts its space without a time limit produces a
+// proven UNSAT verdict, not just "not found". args.AlgParams[0] (if
+// given) selects the SelectVar variant, with the same meaning and
+// default as "dfs" -- STAGE11.md adds no algorithm parameters of its
+// own. If preResult is non-nil, the found assignment is reconstructed
+// back to originalNumVars variables before being written out.
+func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
+	rng := newSeededRand()
+
+	var timeLimit *time.Duration
+	if args.TimeLimitSecs != nil {
+		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		timeLimit = &limit
+	}
+
+	variant := dfs.SelectVarWeighted
+	if len(args.AlgParams) == 1 {
+		variant = dfs.SelectVarVariant(args.AlgParams[0])
+	}
+
+	result := cdcl.Run(problem, timeLimit, variant, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

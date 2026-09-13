@@ -311,6 +311,64 @@ func TestParseDFSRejectsMultipleAlgParams(t *testing.T) {
 	}
 }
 
+// TestParseCDCLNeedsNoStoppingCriterion verifies that --algorithm=cdcl
+// is accepted with neither --alg-params nor --time-limit-secs, same
+// as --algorithm=dfs (STAGE11.md).
+func TestParseCDCLNeedsNoStoppingCriterion(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if args.TimeLimitSecs != nil {
+		t.Errorf("TimeLimitSecs = %v, want nil", args.TimeLimitSecs)
+	}
+}
+
+// TestParseCDCLAcceptsTimeLimit verifies that --algorithm=cdcl accepts
+// an optional --time-limit-secs.
+func TestParseCDCLAcceptsTimeLimit(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--time-limit-secs=10"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if args.TimeLimitSecs == nil || *args.TimeLimitSecs != 10 {
+		t.Errorf("TimeLimitSecs = %v, want 10", args.TimeLimitSecs)
+	}
+}
+
+// TestParseCDCLAcceptsSelectVarVariant verifies that --algorithm=cdcl
+// accepts a single --alg-params value of 0 or 1, selecting which
+// SelectVar heuristic to use, same as --algorithm=dfs (STAGE11.md).
+func TestParseCDCLAcceptsSelectVarVariant(t *testing.T) {
+	for _, variant := range []int64{0, 1} {
+		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", strconv.FormatInt(variant, 10)})
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error for --alg-params=%d: %v", variant, err)
+		}
+		if len(args.AlgParams) != 1 || args.AlgParams[0] != variant {
+			t.Errorf("AlgParams = %v, want [%d]", args.AlgParams, variant)
+		}
+	}
+}
+
+// TestParseCDCLRejectsOutOfRangeAlgParams verifies that
+// --algorithm=cdcl rejects an --alg-params value other than 0 or 1.
+func TestParseCDCLRejectsOutOfRangeAlgParams(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params=5"})
+	if err == nil {
+		t.Fatalf("expected error for an out-of-range --alg-params value with --algorithm=cdcl")
+	}
+}
+
+// TestParseCDCLRejectsMultipleAlgParams verifies that --algorithm=cdcl
+// rejects more than one --alg-params value.
+func TestParseCDCLRejectsMultipleAlgParams(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "1"})
+	if err == nil {
+		t.Fatalf("expected error for more than one alg-param with algorithm=cdcl")
+	}
+}
+
 // TestParseNoPreprocessingDefaultsFalse verifies that preprocessing is
 // enabled by default (NoPreprocessing is false when the flag is not
 // given).

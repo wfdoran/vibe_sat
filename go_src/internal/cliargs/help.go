@@ -27,6 +27,12 @@ Options:
                (STAGE5.md). Unlike "hc"/"ws", dfs can prove UNSAT: it
                reports "UNSAT" (not "UNKNOWN") when the search space
                is exhausted without finding a solution.
+          cdcl Conflict-driven clause learning with non-chronological
+               backtracking (STAGE11.md): on every conflict, derives
+               and adds a new clause explaining it, then jumps
+               directly back to the decision level where that clause
+               is useful, instead of dfs's "try the other branch, one
+               level up." Also proves UNSAT, like "dfs".
 
   --output=<filename>, -o <filename>
         Where to write a satisfying solution, in DIMACS solution
@@ -65,6 +71,9 @@ Options:
                      at no clause contents at all; much faster per
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
+          cdcl val1 = which SelectVar heuristic to use, same meaning
+                     and default as "dfs" above (STAGE11.md adds no
+                     new algorithm parameters of its own).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal

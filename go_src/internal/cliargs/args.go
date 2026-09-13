@@ -22,7 +22,7 @@ type Args struct {
 	Help            bool    // --help / -h : print usage information and exit
 	InputFile       string  // --input / -i : path to the DIMACS CNF file to read (required)
 	Verbose         int     // --verbose / -v : verbosity level, default 0
-	Algorithm       string  // --algorithm / -a : solving algorithm to use (required; only "hc" is supported)
+	Algorithm       string  // --algorithm / -a : solving algorithm to use (required; "hc", "ws", "dfs", or "cdcl")
 	OutputFile      string  // --output / -o : where to write the solution, if any ("" means unset)
 	TimeLimitSecs   *int    // --time-limit-secs / -t : optional search time limit, in seconds
 	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
@@ -293,8 +293,19 @@ func validate(args *Args, rawValues map[string][]string) error {
 			return fmt.Errorf("--time-limit-secs must be a positive integer")
 		}
 
+	case "cdcl":
+		if len(args.AlgParams) > 1 {
+			return fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)")
+		}
+		if len(args.AlgParams) == 1 && args.AlgParams[0] != 0 && args.AlgParams[0] != 1 {
+			return fmt.Errorf("for --algorithm=cdcl, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)")
+		}
+		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
+			return fmt.Errorf("--time-limit-secs must be a positive integer")
+		}
+
 	default:
-		return fmt.Errorf("unsupported --algorithm value %q; only \"hc\", \"ws\", and \"dfs\" are currently supported", args.Algorithm)
+		return fmt.Errorf("unsupported --algorithm value %q; only \"hc\", \"ws\", \"dfs\", and \"cdcl\" are currently supported", args.Algorithm)
 	}
 
 	return nil

@@ -31,7 +31,7 @@ pub struct Args {
     #[arg(long = "verbose", short = 'v', default_value_t = 0)]
     pub verbose: i32,
 
-    /// Solving algorithm to use (required; "hc", "ws", or "dfs").
+    /// Solving algorithm to use (required; "hc", "ws", "dfs", or "cdcl").
     #[arg(long = "algorithm", short = 'a')]
     pub algorithm: String,
 
@@ -89,6 +89,12 @@ Options:
                (STAGE5.md). Unlike "hc"/"ws", dfs can prove UNSAT: it
                reports "UNSAT" (not "UNKNOWN") when the search space
                is exhausted without finding a solution.
+          cdcl Conflict-driven clause learning with non-chronological
+               backtracking (STAGE11.md): on every conflict, derives
+               and adds a new clause explaining it, then jumps
+               directly back to the decision level where that clause
+               is useful, instead of dfs's "try the other branch, one
+               level up." Also proves UNSAT, like "dfs".
 
   --output=<filename>, -o <filename>
         Where to write a satisfying solution, in DIMACS solution
@@ -127,6 +133,9 @@ Options:
                      at no clause contents at all; much faster per
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
+          cdcl val1 = which SelectVar heuristic to use, same meaning
+                     and default as "dfs" above (STAGE11.md adds no
+                     new algorithm parameters of its own).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -258,8 +267,31 @@ fn validate(args: &Args) -> Result<(), String> {
             Ok(())
         }
 
+        "cdcl" => {
+            if let Some(params) = &args.alg_params {
+                if params.len() > 1 {
+                    return Err(
+                        "for --algorithm=cdcl, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)"
+                            .to_string(),
+                    );
+                }
+                if params[0] != 0 && params[0] != 1 {
+                    return Err(
+                        "for --algorithm=cdcl, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)"
+                            .to_string(),
+                    );
+                }
+            }
+            if let Some(limit) = args.time_limit_secs
+                && limit < 1
+            {
+                return Err("--time-limit-secs must be a positive integer".to_string());
+            }
+            Ok(())
+        }
+
         other => Err(format!(
-            "unsupported --algorithm value \"{other}\"; only \"hc\", \"ws\", and \"dfs\" are currently supported"
+            "unsupported --algorithm value \"{other}\"; only \"hc\", \"ws\", \"dfs\", and \"cdcl\" are currently supported"
         )),
     }
 }
@@ -508,6 +540,66 @@ mod tests {
             "vibe_sat",
             "--input=problem.cnf",
             "--algorithm=dfs",
+            "--alg-params",
+            "0",
+            "1",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cdcl_needs_no_stopping_criterion() {
+        let args = Args::parse_from_args(["vibe_sat", "--input=problem.cnf", "--algorithm=cdcl"])
+            .expect("expected successful parse");
+        assert_eq!(args.time_limit_secs, None);
+    }
+
+    #[test]
+    fn test_parse_cdcl_accepts_time_limit() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--time-limit-secs=10",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.time_limit_secs, Some(10));
+    }
+
+    #[test]
+    fn test_parse_cdcl_accepts_select_var_variant() {
+        for variant in [0i64, 1i64] {
+            let args = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                &variant.to_string(),
+            ])
+            .unwrap_or_else(|e| {
+                panic!("Parse returned unexpected error for --alg-params={variant}: {e}")
+            });
+            assert_eq!(args.alg_params, Some(vec![variant]));
+        }
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_out_of_range_alg_params() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params=5",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_multiple_alg_params() {
+        let result = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
             "--alg-params",
             "0",
             "1",

@@ -1,10 +1,12 @@
 //! vibe_sat is a command line SAT solver. The program reads a DIMACS
 //! CNF file into memory and attempts to solve it with the selected
 //! algorithm (a basic hill-climb local search, "hc"; WalkSAT, "ws";
-//! or a complete depth-first search, "dfs"), optionally printing
-//! progress and writing out a satisfying assignment if one is found.
+//! a complete depth-first search, "dfs"; or conflict-driven clause
+//! learning, "cdcl"), optionally printing progress and writing out a
+//! satisfying assignment if one is found.
 
 mod assignment;
+mod cdcl;
 mod cliargs;
 mod cnf;
 mod dfs;
@@ -82,6 +84,7 @@ fn main() -> ExitCode {
         "hc" => run_hill_climb(&problem, &preresult, original_num_vars, &args),
         "ws" => run_walksat(&problem, &preresult, original_num_vars, &args),
         "dfs" => run_dfs(&problem, &preresult, original_num_vars, &args),
+        "cdcl" => run_cdcl(&problem, &preresult, original_num_vars, &args),
         _ => Ok(()),
     };
     if let Err(message) = run_result {
@@ -212,6 +215,44 @@ fn run_dfs(
     };
 
     let result = dfs::run(problem, &lists, time_limit, variant, &mut rng, args.verbose);
+
+    if result.satisfiable {
+        let assignment = reconstructed_assignment(&result.assignment, preresult);
+        write_solution(&assignment, original_num_vars, args)?;
+    }
+
+    Ok(())
+}
+
+/// Runs the conflict-driven clause learning algorithm (STAGE11.md)
+/// against `problem` using the optional time limit, `SelectVar`
+/// variant, and verbosity level given in `args`, then writes out the
+/// result if a satisfying assignment was found. Like `run_dfs` (and
+/// unlike `run_hill_climb`/`run_walksat`), a search that exhausts its
+/// space without a time limit produces a proven UNSAT verdict, not
+/// just "not found". `args.alg_params[0]` (if given) selects the
+/// `SelectVar` variant, with the same meaning and default as `dfs` --
+/// STAGE11.md adds no algorithm parameters of its own. If `preresult`
+/// is `Some`, the found assignment is reconstructed back to
+/// `original_num_vars` variables before being written out.
+fn run_cdcl(
+    problem: &cnf::Problem,
+    preresult: &Option<PreprocessResult>,
+    original_num_vars: usize,
+    args: &Args,
+) -> Result<(), String> {
+    let mut rng = StdRng::from_rng(&mut rand::rng());
+
+    let time_limit = args
+        .time_limit_secs
+        .map(|secs| Duration::from_secs(secs as u64));
+
+    let variant = match args.alg_params.as_deref() {
+        Some([1]) => dfs::SelectVarVariant::Fast,
+        _ => dfs::SelectVarVariant::Weighted,
+    };
+
+    let result = cdcl::run(problem, time_limit, variant, &mut rng, args.verbose);
 
     if result.satisfiable {
         let assignment = reconstructed_assignment(&result.assignment, preresult);
