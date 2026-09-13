@@ -6,7 +6,7 @@ side, one stage at a time.
 
 ## Background and philosophy
 
-The goal of this project (see `PROMPT.md`) is to build two
+The goal of this project (see `prompts/PROMPT.md`) is to build two
 functionally identical SAT solvers, one in Go and one in Rust, in
 order to directly compare the two languages' strengths and weaknesses
 on the same problem: parsing input, representing a CNF formula,
@@ -16,7 +16,7 @@ dependencies (Go's "avoid external packages" constraint vs. Rust's
 "crates are inevitable" reality).
 
 Development proceeds in stages, described by the `STAGEx.md` files in
-this directory: each stage adds one feature or algorithm at a time,
+`prompts/`: each stage adds one feature or algorithm at a time,
 and both language versions must keep accepting the exact same command
 line arguments and producing equivalent results for the same input,
 even when the two implementations' internal code organization differs
@@ -65,7 +65,7 @@ cargo test
 ## Project layout
 
 ```
-/            PROMPT.md and STAGEx.md files describing each development stage
+/prompts     PROMPT.md and STAGEx.md files describing each development stage
 /go_src      Go source code
 /rust_src    Rust source code
 /reports     REPORTx.md write-ups, one per stage
