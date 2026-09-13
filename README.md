@@ -71,3 +71,11 @@ cargo test
 /reports     REPORTx.md write-ups, one per stage
 /benchmark   sample DIMACS CNF problems used for testing
 ```
+
+## Credit
+
+All of the code in repo was written by Sonnet 5.  This is my first
+attempt at a completely vibe code project.
+
+The sample benchmark problems were taken from the
+[SATLIB Benchmark Problems](https://www.cs.ubc.ca/~hoos/SATLIB/benchm.html) page.
