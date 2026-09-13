@@ -10,9 +10,11 @@ mod cnf;
 mod dfs;
 mod hillclimb;
 mod occurrence;
+mod preprocess;
 mod solution;
 
 use assignment::Assignment;
+use preprocess::PreprocessResult;
 
 use std::fs::File;
 use std::io;
@@ -55,10 +57,31 @@ fn main() -> ExitCode {
         cnf::print_summary(&problem);
     }
 
+    let original_num_vars = problem.num_vars;
+    let mut preresult: Option<PreprocessResult> = None;
+    let mut problem = problem;
+    if !args.no_preprocessing {
+        let mut result = preprocess::run(&problem, args.verbose);
+        if result.unsat {
+            // Preprocessing alone already proves the original problem
+            // has no solution, regardless of which algorithm was
+            // requested; there is nothing left to search for.
+            if args.verbose >= 1 {
+                println!("UNSAT");
+            }
+            return ExitCode::from(0);
+        }
+        problem = result
+            .problem
+            .take()
+            .expect("problem is Some when not unsat");
+        preresult = Some(result);
+    }
+
     let run_result = match args.algorithm.as_str() {
-        "hc" => run_hill_climb(&problem, &args),
-        "ws" => run_walksat(&problem, &args),
-        "dfs" => run_dfs(&problem, &args),
+        "hc" => run_hill_climb(&problem, &preresult, original_num_vars, &args),
+        "ws" => run_walksat(&problem, &preresult, original_num_vars, &args),
+        "dfs" => run_dfs(&problem, &preresult, original_num_vars, &args),
         _ => Ok(()),
     };
     if let Err(message) = run_result {
@@ -69,10 +92,31 @@ fn main() -> ExitCode {
     ExitCode::from(0)
 }
 
+/// Returns the assignment to write out for a found solution:
+/// `assignment` as-is if preprocessing was skipped (`preresult` is
+/// `None`), or reconstructed back to the original problem's variable
+/// numbering otherwise (see [`PreprocessResult::reconstruct`]).
+fn reconstructed_assignment(
+    assignment: &Assignment,
+    preresult: &Option<PreprocessResult>,
+) -> Assignment {
+    match preresult {
+        Some(result) => result.reconstruct(assignment),
+        None => assignment.clone(),
+    }
+}
+
 /// Runs the hill-climbing algorithm against `problem` using the
 /// restart/time limits and verbosity level given in `args`, then
-/// reports and/or writes out the result.
-fn run_hill_climb(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
+/// reports and/or writes out the result. If `preresult` is `Some`,
+/// the found assignment is reconstructed back to `original_num_vars`
+/// variables before being written out.
+fn run_hill_climb(
+    problem: &cnf::Problem,
+    preresult: &Option<PreprocessResult>,
+    original_num_vars: usize,
+    args: &Args,
+) -> Result<(), String> {
     let lists = occurrence::build(problem);
     let mut rng = StdRng::from_rng(&mut rand::rng());
 
@@ -89,7 +133,8 @@ fn run_hill_climb(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     let result = hillclimb::run(problem, &lists, params, &mut rng, args.verbose);
 
     if result.satisfiable {
-        write_solution(&result.assignment, problem.num_vars, args)?;
+        let assignment = reconstructed_assignment(&result.assignment, preresult);
+        write_solution(&assignment, original_num_vars, args)?;
     }
 
     Ok(())
@@ -99,8 +144,15 @@ fn run_hill_climb(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
 /// tries/max-flips/noise/time-limit settings and verbosity level
 /// given in `args`, then reports and/or writes out the result. See
 /// `cliargs::help_text` for how `args.alg_params` maps onto WalkSAT's
-/// parameters.
-fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
+/// parameters. If `preresult` is `Some`, the found assignment is
+/// reconstructed back to `original_num_vars` variables before being
+/// written out.
+fn run_walksat(
+    problem: &cnf::Problem,
+    preresult: &Option<PreprocessResult>,
+    original_num_vars: usize,
+    args: &Args,
+) -> Result<(), String> {
     let lists = occurrence::build(problem);
     let mut rng = StdRng::from_rng(&mut rand::rng());
 
@@ -123,7 +175,8 @@ fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     let result = hillclimb::walksat::run_walksat(problem, &lists, params, &mut rng, args.verbose);
 
     if result.satisfiable {
-        write_solution(&result.assignment, problem.num_vars, args)?;
+        let assignment = reconstructed_assignment(&result.assignment, preresult);
+        write_solution(&assignment, original_num_vars, args)?;
     }
 
     Ok(())
@@ -137,8 +190,15 @@ fn run_walksat(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
 /// verdict, not just "not found". Per STAGE6.md, `args.alg_params[0]`
 /// (if given) selects the `SelectVar` variant: 0 (the default) for the
 /// weighted heuristic from STAGE5.md, 1 for the cheaper static-order
-/// heuristic from STAGE6.md.
-fn run_dfs(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
+/// heuristic from STAGE6.md. If `preresult` is `Some`, the found
+/// assignment is reconstructed back to `original_num_vars` variables
+/// before being written out.
+fn run_dfs(
+    problem: &cnf::Problem,
+    preresult: &Option<PreprocessResult>,
+    original_num_vars: usize,
+    args: &Args,
+) -> Result<(), String> {
     let lists = occurrence::build(problem);
     let mut rng = StdRng::from_rng(&mut rand::rng());
 
@@ -154,7 +214,8 @@ fn run_dfs(problem: &cnf::Problem, args: &Args) -> Result<(), String> {
     let result = dfs::run(problem, &lists, time_limit, variant, &mut rng, args.verbose);
 
     if result.satisfiable {
-        write_solution(&result.assignment, problem.num_vars, args)?;
+        let assignment = reconstructed_assignment(&result.assignment, preresult);
+        write_solution(&assignment, original_num_vars, args)?;
     }
 
     Ok(())

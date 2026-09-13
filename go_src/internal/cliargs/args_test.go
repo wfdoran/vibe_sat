@@ -56,7 +56,7 @@ func TestHelpTextMentionsEveryFlag(t *testing.T) {
 	for _, flag := range []string{
 		"--input", "-i", "--verbose", "-v", "--algorithm", "-a",
 		"--output", "-o", "--time-limit-secs", "-t", "--alg-params", "-p",
-		"--help", "-h",
+		"--no-preprocessing", "-x", "--help", "-h",
 	} {
 		if !strings.Contains(text, flag) {
 			t.Errorf("HelpText() does not mention %q", flag)
@@ -308,6 +308,68 @@ func TestParseDFSRejectsMultipleAlgParams(t *testing.T) {
 	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=dfs", "--alg-params", "0", "1"})
 	if err == nil {
 		t.Fatalf("expected error for more than one alg-param with algorithm=dfs")
+	}
+}
+
+// TestParseNoPreprocessingDefaultsFalse verifies that preprocessing is
+// enabled by default (NoPreprocessing is false when the flag is not
+// given).
+func TestParseNoPreprocessingDefaultsFalse(t *testing.T) {
+	args, err := Parse(baseHCArgs())
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if args.NoPreprocessing {
+		t.Errorf("NoPreprocessing = true, want false by default")
+	}
+}
+
+// TestParseNoPreprocessingLongForm verifies that --no-preprocessing
+// sets NoPreprocessing, with no value expected.
+func TestParseNoPreprocessingLongForm(t *testing.T) {
+	args, err := Parse(baseHCArgs("--no-preprocessing"))
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if !args.NoPreprocessing {
+		t.Errorf("NoPreprocessing = false, want true")
+	}
+}
+
+// TestParseNoPreprocessingShortForm verifies that -x is equivalent to
+// --no-preprocessing.
+func TestParseNoPreprocessingShortForm(t *testing.T) {
+	args, err := Parse(baseHCArgs("-x"))
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if !args.NoPreprocessing {
+		t.Errorf("NoPreprocessing = false, want true")
+	}
+}
+
+// TestParseNoPreprocessingRejectsValue verifies that
+// --no-preprocessing does not accept an inline value.
+func TestParseNoPreprocessingRejectsValue(t *testing.T) {
+	_, err := Parse(baseHCArgs("--no-preprocessing=true"))
+	if err == nil {
+		t.Fatalf("expected error for --no-preprocessing=true (it takes no value)")
+	}
+}
+
+// TestParseNoPreprocessingDoesNotConsumeFollowingFlag verifies that,
+// being a zero-value flag, --no-preprocessing does not swallow the
+// next token as if it were a value.
+func TestParseNoPreprocessingDoesNotConsumeFollowingFlag(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=hc", "--no-preprocessing", "--alg-params=10"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if !args.NoPreprocessing {
+		t.Errorf("NoPreprocessing = false, want true")
+	}
+	if len(args.AlgParams) != 1 || args.AlgParams[0] != 10 {
+		t.Errorf("AlgParams = %v, want [10]", args.AlgParams)
 	}
 }
 

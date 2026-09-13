@@ -47,6 +47,10 @@ pub struct Args {
     /// [`help_text`] for what each value means per algorithm.
     #[arg(long = "alg-params", short = 'p', num_args = 1..=3, allow_negative_numbers = true)]
     pub alg_params: Option<Vec<i64>>,
+
+    /// Skip preprocessing (STAGE8.md); default is to run it.
+    #[arg(long = "no-preprocessing", short = 'x')]
+    pub no_preprocessing: bool,
 }
 
 /// Returns true if `argv` contains a `--help` or `-h` token anywhere.
@@ -123,6 +127,13 @@ Options:
                      at no clause contents at all; much faster per
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
+
+  --no-preprocessing, -x
+        Skip preprocessing (STAGE8.md: unit propagation, pure literal
+        elimination, subsumption elimination, and bounded variable
+        elimination), and hand the CNF file to the chosen algorithm
+        exactly as read. Preprocessing runs by default; this flag
+        takes no value.
 
   --help, -h
         Print this help message and exit.
@@ -619,10 +630,48 @@ mod tests {
             "-t",
             "--alg-params",
             "-p",
+            "--no-preprocessing",
+            "-x",
             "--help",
             "-h",
         ] {
             assert!(text.contains(flag), "help_text() does not mention {flag}");
         }
+    }
+
+    #[test]
+    fn test_parse_no_preprocessing_defaults_false() {
+        let args = Args::parse_from_args(base_hc_args()).expect("expected successful parse");
+        assert!(!args.no_preprocessing);
+    }
+
+    #[test]
+    fn test_parse_no_preprocessing_long_form() {
+        let mut argv = base_hc_args();
+        argv.push("--no-preprocessing");
+        let args = Args::parse_from_args(argv).expect("expected successful parse");
+        assert!(args.no_preprocessing);
+    }
+
+    #[test]
+    fn test_parse_no_preprocessing_short_form() {
+        let mut argv = base_hc_args();
+        argv.push("-x");
+        let args = Args::parse_from_args(argv).expect("expected successful parse");
+        assert!(args.no_preprocessing);
+    }
+
+    #[test]
+    fn test_parse_no_preprocessing_does_not_consume_following_flag() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=hc",
+            "--no-preprocessing",
+            "--alg-params=10",
+        ])
+        .expect("expected successful parse");
+        assert!(args.no_preprocessing);
+        assert_eq!(args.alg_params, Some(vec![10]));
     }
 }

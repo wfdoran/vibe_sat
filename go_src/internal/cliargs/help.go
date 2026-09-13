@@ -66,6 +66,13 @@ Options:
                      node, but tends to grow the search tree.
                Optional; defaults to 0 if --alg-params is not given.
 
+  --no-preprocessing, -x
+        Skip preprocessing (STAGE8.md: unit propagation, pure literal
+        elimination, subsumption elimination, and bounded variable
+        elimination), and hand the CNF file to the chosen algorithm
+        exactly as read. Preprocessing runs by default; this flag
+        takes no value.
+
   --help, -h
         Print this help message and exit.
 `

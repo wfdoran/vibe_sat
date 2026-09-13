@@ -19,19 +19,22 @@ import (
 
 // Args holds the parsed command line arguments for vibe_sat.
 type Args struct {
-	Help          bool    // --help / -h : print usage information and exit
-	InputFile     string  // --input / -i : path to the DIMACS CNF file to read (required)
-	Verbose       int     // --verbose / -v : verbosity level, default 0
-	Algorithm     string  // --algorithm / -a : solving algorithm to use (required; only "hc" is supported)
-	OutputFile    string  // --output / -o : where to write the solution, if any ("" means unset)
-	TimeLimitSecs *int    // --time-limit-secs / -t : optional search time limit, in seconds
-	AlgParams     []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
+	Help            bool    // --help / -h : print usage information and exit
+	InputFile       string  // --input / -i : path to the DIMACS CNF file to read (required)
+	Verbose         int     // --verbose / -v : verbosity level, default 0
+	Algorithm       string  // --algorithm / -a : solving algorithm to use (required; only "hc" is supported)
+	OutputFile      string  // --output / -o : where to write the solution, if any ("" means unset)
+	TimeLimitSecs   *int    // --time-limit-secs / -t : optional search time limit, in seconds
+	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
+	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
 }
 
 // flagSpec describes one recognized flag: its long and short
 // spellings, and the maximum number of value tokens it consumes when
-// given in the space-separated form (e.g. "-p 10 20"). Every flag
-// except --alg-params/-p consumes exactly one value.
+// given in the space-separated form (e.g. "-p 10 20"). A maxValues of
+// 0 marks a boolean flag that takes no value at all (e.g.
+// --no-preprocessing); every other flag here consumes exactly one
+// value, except --alg-params/-p, which takes up to three.
 type flagSpec struct {
 	long      string
 	short     string
@@ -46,6 +49,7 @@ var flagSpecs = []flagSpec{
 	{long: "output", short: "o", maxValues: 1},
 	{long: "time-limit-secs", short: "t", maxValues: 1},
 	{long: "alg-params", short: "p", maxValues: 3},
+	{long: "no-preprocessing", short: "x", maxValues: 0},
 }
 
 // findSpec returns the flagSpec whose long or short spelling matches
@@ -156,6 +160,15 @@ func tokenize(argv []string) (map[string][]string, error) {
 			return nil, fmt.Errorf("unrecognized flag %q", token)
 		}
 
+		if spec.maxValues == 0 {
+			if hasInline {
+				return nil, fmt.Errorf("flag %q does not take a value", token)
+			}
+			i++
+			rawValues[spec.long] = []string{}
+			continue
+		}
+
 		var collected []string
 		if hasInline {
 			collected = []string{inlineValue}
@@ -217,6 +230,9 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 			}
 			args.AlgParams = append(args.AlgParams, p)
 		}
+	}
+	if _, ok := rawValues["no-preprocessing"]; ok {
+		args.NoPreprocessing = true
 	}
 
 	return args, nil

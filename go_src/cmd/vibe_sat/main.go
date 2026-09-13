@@ -19,6 +19,7 @@ import (
 	"vibe_sat/internal/dfs"
 	"vibe_sat/internal/hillclimb"
 	"vibe_sat/internal/occurrence"
+	"vibe_sat/internal/preprocess"
 	"vibe_sat/internal/solution"
 )
 
@@ -49,22 +50,51 @@ func main() {
 		cnf.PrintSummary(problem)
 	}
 
+	originalNumVars := problem.NumVars
+	var preResult *preprocess.Result
+	if !args.NoPreprocessing {
+		preResult = preprocess.Run(problem, args.Verbose)
+		if preResult.Unsat {
+			// Preprocessing alone already proves the original problem
+			// has no solution, regardless of which algorithm was
+			// requested; there is nothing left to search for.
+			if args.Verbose >= 1 {
+				fmt.Println("UNSAT")
+			}
+			os.Exit(0)
+		}
+		problem = preResult.Problem
+	}
+
 	switch args.Algorithm {
 	case "hc":
-		runHillClimb(problem, args)
+		runHillClimb(problem, preResult, originalNumVars, args)
 	case "ws":
-		runWalkSat(problem, args)
+		runWalkSat(problem, preResult, originalNumVars, args)
 	case "dfs":
-		runDFS(problem, args)
+		runDFS(problem, preResult, originalNumVars, args)
 	}
 
 	os.Exit(0)
 }
 
+// reconstructedAssignment returns the assignment to write out for a
+// found solution: assignment as-is if preprocessing was skipped
+// (preResult == nil), or reconstructed back to the original problem's
+// variable numbering otherwise (see preprocess.Result.Reconstruct).
+func reconstructedAssignment(assignment assign.Assignment, preResult *preprocess.Result) assign.Assignment {
+	if preResult == nil {
+		return assignment
+	}
+	return preResult.Reconstruct(assignment)
+}
+
 // runHillClimb runs the hill-climbing algorithm against problem using
 // the restart/time limits and verbosity level given in args, then
-// reports and/or writes out the result.
-func runHillClimb(problem *cnf.Problem, args *cliargs.Args) {
+// reports and/or writes out the result. If preResult is non-nil, the
+// found assignment is reconstructed back to originalNumVars variables
+// before being written out.
+func runHillClimb(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
 	lists := occurrence.Build(problem)
 	rng := newSeededRand()
 
@@ -81,7 +111,7 @@ func runHillClimb(problem *cnf.Problem, args *cliargs.Args) {
 	result := hillclimb.Run(problem, lists, params, rng, args.Verbose)
 
 	if result.Satisfiable {
-		writeSolution(result.Assignment, problem.NumVars, args)
+		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)
 	}
 }
 
@@ -89,8 +119,10 @@ func runHillClimb(problem *cnf.Problem, args *cliargs.Args) {
 // tries/max-flips/noise/time-limit settings and verbosity level given
 // in args, then reports and/or writes out the result. See
 // internal/cliargs/help.go for how args.AlgParams maps onto WalkSAT's
-// parameters.
-func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
+// parameters. If preResult is non-nil, the found assignment is
+// reconstructed back to originalNumVars variables before being
+// written out.
+func runWalkSat(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
 	lists := occurrence.Build(problem)
 	rng := newSeededRand()
 
@@ -116,7 +148,7 @@ func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
 	result := hillclimb.RunWalkSat(problem, lists, params, rng, args.Verbose)
 
 	if result.Satisfiable {
-		writeSolution(result.Assignment, problem.NumVars, args)
+		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)
 	}
 }
 
@@ -128,8 +160,10 @@ func runWalkSat(problem *cnf.Problem, args *cliargs.Args) {
 // verdict, not just "not found". Per STAGE6.md, args.AlgParams[0] (if
 // given) selects the SelectVar variant: 0 (the default) for the
 // weighted heuristic from STAGE5.md, 1 for the cheaper static-order
-// heuristic from STAGE6.md.
-func runDFS(problem *cnf.Problem, args *cliargs.Args) {
+// heuristic from STAGE6.md. If preResult is non-nil, the found
+// assignment is reconstructed back to originalNumVars variables
+// before being written out.
+func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
 	lists := occurrence.Build(problem)
 	rng := newSeededRand()
 
@@ -147,7 +181,7 @@ func runDFS(problem *cnf.Problem, args *cliargs.Args) {
 	result := dfs.Run(problem, lists, timeLimit, variant, rng, args.Verbose)
 
 	if result.Satisfiable {
-		writeSolution(result.Assignment, problem.NumVars, args)
+		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)
 	}
 }
 
