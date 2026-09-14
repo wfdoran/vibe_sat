@@ -28,6 +28,16 @@ type Args struct {
 	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
 	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
 
+	// NumThreads is --num-threads/-z (STAGE17.md): the number of
+	// concurrent worker threads to use, currently honored only by
+	// --algorithm=hc/ws (see main's runHillClimb/runWalkSat). Defaults
+	// to 1 (single-threaded, matching every algorithm's behavior
+	// before Stage 17) if not given. Deliberately unbounded above --
+	// a value larger than the machine's core count is allowed
+	// (oversubscription); main prints a one-line warning at
+	// --verbose >= 1 if it looks large enough to be unintentional.
+	NumThreads int
+
 	// MemoryLimitBytes is --alg-params/-p's third value for
 	// --algorithm=cdcl only (STAGE12.md; shifted from the second value
 	// to the third by STAGE15.md, which inserted the restart strategy
@@ -64,6 +74,7 @@ var flagSpecs = []flagSpec{
 	{long: "time-limit-secs", short: "t", maxValues: 1},
 	{long: "alg-params", short: "p", maxValues: 3},
 	{long: "no-preprocessing", short: "x", maxValues: 0},
+	{long: "num-threads", short: "z", maxValues: 1},
 }
 
 // findSpec returns the flagSpec whose long or short spelling matches
@@ -248,7 +259,7 @@ func parseByteSize(s string) (int64, error) {
 // into a typed Args structure, reporting an error if any value cannot
 // be parsed as the type it is expected to have.
 func buildArgs(rawValues map[string][]string) (*Args, error) {
-	args := &Args{}
+	args := &Args{NumThreads: 1}
 
 	if values, ok := rawValues["input"]; ok {
 		args.InputFile = values[0]
@@ -320,6 +331,13 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 	if _, ok := rawValues["no-preprocessing"]; ok {
 		args.NoPreprocessing = true
 	}
+	if values, ok := rawValues["num-threads"]; ok {
+		n, err := strconv.Atoi(values[0])
+		if err != nil {
+			return nil, fmt.Errorf("invalid value for --num-threads: %q", values[0])
+		}
+		args.NumThreads = n
+	}
 
 	return args, nil
 }
@@ -334,6 +352,9 @@ func validate(args *Args, rawValues map[string][]string) error {
 	}
 	if _, ok := rawValues["algorithm"]; !ok {
 		return fmt.Errorf("missing required argument: --algorithm=<string> (or -a <string>)")
+	}
+	if args.NumThreads < 1 {
+		return fmt.Errorf("--num-threads must be a positive integer")
 	}
 
 	switch args.Algorithm {

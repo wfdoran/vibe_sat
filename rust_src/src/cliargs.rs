@@ -48,6 +48,9 @@ struct RawArgs {
 
     #[arg(long = "no-preprocessing", short = 'x')]
     no_preprocessing: bool,
+
+    #[arg(long = "num-threads", short = 'z', default_value_t = 1)]
+    num_threads: usize,
 }
 
 /// Command line arguments accepted by vibe_sat, after
@@ -98,6 +101,16 @@ pub struct Args {
     /// given, in which case the database grows without bound, as it
     /// did before Stage 12.
     pub memory_limit_bytes: Option<i64>,
+
+    /// `--num-threads`/`-z` (STAGE17.md): the number of concurrent
+    /// worker threads to use, currently honored only by
+    /// `--algorithm=hc`/`ws` (see `main`'s `run_hill_climb`/
+    /// `run_walksat`). Defaults to 1 (single-threaded, matching every
+    /// algorithm's behavior before Stage 17). Deliberately unbounded
+    /// above -- a value larger than the machine's core count is
+    /// allowed (oversubscription); `main` prints a one-line warning at
+    /// `--verbose >= 1` if it looks large enough to be unintentional.
+    pub num_threads: usize,
 }
 
 /// Returns true if `argv` contains a `--help` or `-h` token anywhere.
@@ -249,6 +262,19 @@ Options:
         exactly as read. Preprocessing runs by default; this flag
         takes no value.
 
+  --num-threads=<integer>, -z <integer>
+        Number of concurrent worker threads to use (STAGE17.md).
+        Default is 1 (single-threaded). Currently honored only by
+        "hc"/"ws"; ignored by "dfs"/"cdcl" for now. If --alg-params
+        gives a restart/try count, it is split as evenly as possible
+        across the threads (each doing ceil(count/num-threads));
+        --time-limit-secs, if given, is handed to every thread in
+        full rather than divided, since the threads search
+        concurrently. A value larger than the machine's core count is
+        allowed (oversubscription); a warning is printed at
+        --verbose=1 or higher if --num-threads is at least twice the
+        core count, in case that's unintentional.
+
   --help, -h
         Print this help message and exit.
 "#
@@ -335,6 +361,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         },
         no_preprocessing: raw.no_preprocessing,
         memory_limit_bytes,
+        num_threads: raw.num_threads,
     })
 }
 
@@ -376,6 +403,10 @@ fn parse_byte_size(s: &str) -> Result<i64, String> {
 /// `--alg-params` value (the number of restarts), both of which must
 /// be positive if given.
 fn validate(args: &Args) -> Result<(), String> {
+    if args.num_threads < 1 {
+        return Err("--num-threads must be a positive integer".to_string());
+    }
+
     match args.algorithm.as_str() {
         "hc" => {
             if let Some(params) = &args.alg_params {

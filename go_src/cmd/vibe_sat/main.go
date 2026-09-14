@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"time"
 
 	"vibe_sat/internal/assign"
@@ -31,6 +32,8 @@ import (
 // status 0 on success (whether or not a solution was found) or a
 // non-zero status if any error occurs.
 func main() {
+	startTime := time.Now()
+
 	args, err := cliargs.Parse(os.Args[1:])
 	if err != nil {
 		fmt.Println(err)
@@ -41,6 +44,8 @@ func main() {
 		fmt.Print(cliargs.HelpText())
 		os.Exit(0)
 	}
+
+	warnIfOversubscribed(args)
 
 	problem, err := cnf.ReadDIMACS(args.InputFile, args.Verbose)
 	if err != nil {
@@ -63,7 +68,7 @@ func main() {
 			if args.Verbose >= 1 {
 				fmt.Println("UNSAT")
 			}
-			os.Exit(0)
+			exit(startTime, args.Verbose)
 		}
 		problem = preResult.Problem
 	}
@@ -79,7 +84,38 @@ func main() {
 		runCDCL(problem, preResult, originalNumVars, args)
 	}
 
+	exit(startTime, args.Verbose)
+}
+
+// exit prints the total wall-clock time used since startTime (per
+// STAGE17.md, at verbose >= 1, so that this shows up alongside every
+// other piece of progress output, only when it was actually asked
+// for) and then exits the process with status 0. Every successful
+// run of vibe_sat ends by calling this exactly once, so the timing
+// line always reflects the whole run (argument parsing, reading the
+// CNF file, preprocessing, and searching), not just the search
+// itself.
+func exit(startTime time.Time, verbose int) {
+	if verbose >= 1 {
+		fmt.Println("wall clock time:", time.Since(startTime))
+	}
 	os.Exit(0)
+}
+
+// warnIfOversubscribed prints a one-line warning at verbose >= 1
+// (STAGE17.md) if args.NumThreads is at least twice the number of
+// logical cores this machine reports -- oversubscription is allowed
+// (see Args.NumThreads's doc comment), but a request that large is
+// more likely to be a mistake than a deliberate choice, so it's worth
+// flagging rather than silently accepting.
+func warnIfOversubscribed(args *cliargs.Args) {
+	if args.Verbose < 1 {
+		return
+	}
+	numCores := runtime.NumCPU()
+	if args.NumThreads >= 2*numCores {
+		fmt.Printf("warning: --num-threads=%d is at least twice this machine's %d logical cores\n", args.NumThreads, numCores)
+	}
 }
 
 // reconstructedAssignment returns the assignment to write out for a
@@ -95,7 +131,10 @@ func reconstructedAssignment(assignment assign.Assignment, preResult *preprocess
 
 // runHillClimb runs the hill-climbing algorithm against problem using
 // the restart/time limits and verbosity level given in args, then
-// reports and/or writes out the result. If preResult is non-nil, the
+// reports and/or writes out the result. Per STAGE17.md, the search is
+// split across args.NumThreads concurrent workers (1 by default,
+// which is exactly today's single-threaded behavior -- see
+// hillclimb.RunParallel's doc comment). If preResult is non-nil, the
 // found assignment is reconstructed back to originalNumVars variables
 // before being written out.
 func runHillClimb(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
@@ -112,7 +151,7 @@ func runHillClimb(problem *cnf.Problem, preResult *preprocess.Result, originalNu
 		params.TimeLimit = &limit
 	}
 
-	result := hillclimb.Run(problem, lists, params, rng, args.Verbose)
+	result := hillclimb.RunParallel(problem, lists, params, args.NumThreads, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)
@@ -123,9 +162,12 @@ func runHillClimb(problem *cnf.Problem, preResult *preprocess.Result, originalNu
 // tries/max-flips/noise/time-limit settings and verbosity level given
 // in args, then reports and/or writes out the result. See
 // internal/cliargs/help.go for how args.AlgParams maps onto WalkSAT's
-// parameters. If preResult is non-nil, the found assignment is
-// reconstructed back to originalNumVars variables before being
-// written out.
+// parameters. Per STAGE17.md, the search is split across
+// args.NumThreads concurrent workers (1 by default, identical to
+// today's single-threaded behavior -- see
+// hillclimb.RunWalkSatParallel's doc comment). If preResult is
+// non-nil, the found assignment is reconstructed back to
+// originalNumVars variables before being written out.
 func runWalkSat(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
 	lists := occurrence.Build(problem)
 	rng := newSeededRand()
@@ -149,7 +191,7 @@ func runWalkSat(problem *cnf.Problem, preResult *preprocess.Result, originalNumV
 		params.TimeLimit = &limit
 	}
 
-	result := hillclimb.RunWalkSat(problem, lists, params, rng, args.Verbose)
+	result := hillclimb.RunWalkSatParallel(problem, lists, params, args.NumThreads, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

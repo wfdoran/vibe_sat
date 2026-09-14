@@ -10,9 +10,13 @@
 //! specifically so it can share [`super::ClimbState`]'s private
 //! fields and methods (see that module's doc comment).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use rand::{Rng, RngExt};
+use rand::rngs::StdRng;
+use rand::{Rng, RngExt, SeedableRng};
 
 use super::ClimbState;
 use crate::assignment;
@@ -26,7 +30,13 @@ pub const DEFAULT_MAX_FLIPS_PER_TRY: usize = 10000;
 pub const DEFAULT_NOISE_PERCENT: u32 = 50;
 
 /// Configures a single call to [`run_walksat`].
-#[derive(Debug, Clone, Copy)]
+///
+/// `stop` and `best_score` (STAGE17.md) play exactly the same role
+/// here as they do in [`super::Params`] -- see its doc comment -- and
+/// are `None` for every single-threaded caller, including
+/// [`run_walksat`] itself. Not `Copy` (unlike before Stage 17)
+/// because `Arc` isn't; `Clone` still is.
+#[derive(Debug, Clone)]
 pub struct WalkSatParams {
     /// Number of random restarts ("tries") to attempt. `None` means
     /// unlimited, relying on `time_limit` instead to decide when to
@@ -42,6 +52,10 @@ pub struct WalkSatParams {
     /// How long to keep searching. `None` means unlimited, relying on
     /// `num_tries` instead.
     pub time_limit: Option<Duration>,
+    /// See [`super::Params::stop`].
+    pub stop: Option<Arc<AtomicBool>>,
+    /// See [`super::Params::best_score`].
+    pub best_score: Option<Arc<AtomicI64>>,
 }
 
 impl Default for WalkSatParams {
@@ -51,6 +65,8 @@ impl Default for WalkSatParams {
             max_flips_per_try: DEFAULT_MAX_FLIPS_PER_TRY,
             noise_percent: DEFAULT_NOISE_PERCENT,
             time_limit: None,
+            stop: None,
+            best_score: None,
         }
     }
 }
@@ -70,16 +86,135 @@ pub fn run_walksat<R: Rng>(
     verbose: i32,
 ) -> super::SolveResult {
     if verbose >= 1 {
-        println!("walksat: {}", describe_params(params));
+        println!("walksat: {}", describe_params(&params, None));
+    }
+    let result = walksat_loop(problem, lists, params, rng, verbose);
+    if verbose >= 1 {
+        println!("{}", super::verdict(result.satisfiable));
+    }
+    result
+}
+
+/// Runs the same search as [`run_walksat`], split across
+/// `num_threads` concurrent workers (STAGE17.md), exactly as
+/// [`super::run_parallel`] does for [`super::run`] -- see its doc
+/// comment for the full behavior (start splitting, unshared time
+/// limit, per-worker RNG derivation, and the single-winner
+/// stop/report protocol); everything there applies here unchanged,
+/// just for WalkSAT's `num_tries` instead of `num_starts`.
+pub fn run_walksat_parallel<R: Rng>(
+    problem: &Problem,
+    lists: &Lists,
+    params: WalkSatParams,
+    num_threads: usize,
+    rng: &mut R,
+    verbose: i32,
+) -> super::SolveResult {
+    if num_threads <= 1 {
+        return run_walksat(problem, lists, params, rng, verbose);
     }
 
+    if verbose >= 1 {
+        println!("walksat: {}", describe_params(&params, Some(num_threads)));
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let best_score = Arc::new(AtomicI64::new(-1));
+    let mut sub_rngs: Vec<StdRng> = (0..num_threads)
+        .map(|_| StdRng::seed_from_u64(rng.random::<u64>()))
+        .collect();
+
+    let mut total_starts = 0usize;
+    let mut winner: Option<super::SolveResult> = None;
+
+    thread::scope(|scope| {
+        let handles: Vec<_> = sub_rngs
+            .iter_mut()
+            .map(|sub_rng| {
+                let mut worker_params = params.clone();
+                worker_params.stop = Some(Arc::clone(&stop));
+                worker_params.best_score = Some(Arc::clone(&best_score));
+                if let Some(n) = params.num_tries {
+                    worker_params.num_tries = Some(super::ceil_div(n, num_threads));
+                }
+                let stop_for_worker = Arc::clone(&stop);
+
+                scope.spawn(move || {
+                    let result = walksat_loop(problem, lists, worker_params, sub_rng, verbose);
+                    let won = result.satisfiable
+                        && stop_for_worker
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok();
+                    (won, result)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (won, result) = handle.join().expect("walksat worker thread panicked");
+            total_starts += result.starts;
+            if won {
+                winner = Some(result);
+            }
+        }
+    });
+
+    let final_result = match winner {
+        Some(result) => super::SolveResult {
+            satisfiable: true,
+            assignment: result.assignment,
+            score: result.score,
+            starts: total_starts,
+        },
+        None => super::SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            score: 0,
+            starts: total_starts,
+        },
+    };
+
+    if verbose >= 1 {
+        println!("{}", super::verdict(final_result.satisfiable));
+    }
+    final_result
+}
+
+/// [`run_walksat`]'s search loop, without the "walksat:
+/// ..."/"SAT"/"UNKNOWN" announcements -- see [`super::run_loop`]'s
+/// doc comment for why ([`run_walksat_parallel`] prints one combined
+/// announcement/verdict instead of one per worker).
+fn walksat_loop<R: Rng>(
+    problem: &Problem,
+    lists: &Lists,
+    params: WalkSatParams,
+    rng: &mut R,
+    verbose: i32,
+) -> super::SolveResult {
     let start_time = Instant::now();
     let num_clauses = problem.num_clauses();
-    let mut best_score: i64 = -1;
+    let mut local_best_score: i64 = -1;
 
     let mut record_if_best = |score: usize| {
-        if score as i64 > best_score {
-            best_score = score as i64;
+        if let Some(shared) = &params.best_score {
+            loop {
+                let old = shared.load(Ordering::SeqCst);
+                if score as i64 <= old {
+                    return;
+                }
+                if shared
+                    .compare_exchange(old, score as i64, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    if verbose >= 2 {
+                        println!("new best score: {score}/{num_clauses}");
+                    }
+                    return;
+                }
+            }
+        }
+        if score as i64 > local_best_score {
+            local_best_score = score as i64;
             if verbose >= 2 {
                 println!("new best score: {score}/{num_clauses}");
             }
@@ -88,6 +223,11 @@ pub fn run_walksat<R: Rng>(
 
     let mut tries = 0usize;
     loop {
+        if let Some(stop) = &params.stop
+            && stop.load(Ordering::SeqCst)
+        {
+            break;
+        }
         if let Some(limit) = params.num_tries
             && tries >= limit
         {
@@ -114,9 +254,6 @@ pub fn run_walksat<R: Rng>(
         }
 
         if state.score == num_clauses {
-            if verbose >= 1 {
-                println!("SAT");
-            }
             return super::SolveResult {
                 satisfiable: true,
                 assignment: state.assignment,
@@ -133,9 +270,6 @@ pub fn run_walksat<R: Rng>(
         }
     }
 
-    if verbose >= 1 {
-        println!("UNKNOWN");
-    }
     super::SolveResult {
         satisfiable: false,
         assignment: assignment::new(problem.num_vars),
@@ -187,12 +321,18 @@ fn choose_flip_variable<R: Rng>(
 }
 
 /// Formats the configured limits/noise for the "walksat:"
-/// announcement printed at verbose level 1.
-fn describe_params(params: WalkSatParams) -> String {
+/// announcement printed at verbose level 1. `num_threads` is the
+/// worker count to report ([`run_walksat_parallel`]'s
+/// `num_threads=N` prefix), or `None` for [`run_walksat`]'s
+/// single-threaded case, which omits the prefix entirely.
+fn describe_params(params: &WalkSatParams, num_threads: Option<usize>) -> String {
     let mut description = format!(
         "max_flips_per_try={} noise_percent={}",
         params.max_flips_per_try, params.noise_percent
     );
+    if let Some(n) = num_threads {
+        description = format!("num_threads={n} {description}");
+    }
     if let Some(n) = params.num_tries {
         description += &format!(" num_tries={n}");
     }
@@ -315,5 +455,92 @@ mod tests {
 
         assert!(!result.satisfiable);
         assert_eq!(result.starts, 5);
+    }
+
+    /// STAGE17.md's core compatibility guarantee, WalkSAT's analog of
+    /// `super::tests::test_run_parallel_with_one_thread_matches_run`:
+    /// `run_walksat_parallel(num_threads=1)` must behave identically
+    /// to `run_walksat`.
+    #[test]
+    fn test_run_walksat_parallel_with_one_thread_matches_run_walksat() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3], vec![4]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = WalkSatParams {
+            num_tries: Some(3),
+            ..WalkSatParams::default()
+        };
+
+        let want = run_walksat(
+            &problem,
+            &lists,
+            params.clone(),
+            &mut StdRng::seed_from_u64(21),
+            0,
+        );
+        let got = run_walksat_parallel(
+            &problem,
+            &lists,
+            params,
+            1,
+            &mut StdRng::seed_from_u64(21),
+            0,
+        );
+
+        assert_eq!(got.satisfiable, want.satisfiable);
+        assert_eq!(got.score, want.score);
+        assert_eq!(got.starts, want.starts);
+        if got.satisfiable {
+            assert_eq!(got.assignment, want.assignment);
+        }
+    }
+
+    /// Verifies that splitting a WalkSAT search across several
+    /// concurrent workers still finds a genuine satisfying
+    /// assignment.
+    #[test]
+    fn test_run_walksat_parallel_finds_satisfiable_formula() {
+        let problem = Problem {
+            num_vars: 5,
+            clauses: vec![vec![1], vec![2], vec![3], vec![4], vec![5]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = WalkSatParams {
+            num_tries: Some(8),
+            ..WalkSatParams::default()
+        };
+        let mut rng = StdRng::seed_from_u64(22);
+
+        let result = run_walksat_parallel(&problem, &lists, params, 4, &mut rng, 0);
+
+        assert!(
+            result.satisfiable,
+            "score {}/{}",
+            result.score,
+            problem.num_clauses()
+        );
+        assert_eq!(result.score, problem.num_clauses());
+    }
+
+    /// `walksat_loop`'s analog of
+    /// `super::tests::test_run_loop_stops_immediately_when_stop_is_already_set`.
+    #[test]
+    fn test_walksat_loop_stops_immediately_when_stop_is_already_set() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = WalkSatParams {
+            stop: Some(Arc::new(AtomicBool::new(true))),
+            ..WalkSatParams::default()
+        };
+
+        let result = walksat_loop(&problem, &lists, params, &mut StdRng::seed_from_u64(23), 0);
+
+        assert_eq!(result.starts, 0);
+        assert!(!result.satisfiable);
     }
 }

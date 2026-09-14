@@ -24,10 +24,14 @@
 
 pub mod walksat;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::{Rng, RngExt, SeedableRng};
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{Clause, Problem};
@@ -37,10 +41,38 @@ use crate::occurrence::Lists;
 /// attempt, how long to keep searching, or both (in which case the
 /// search stops as soon as either limit is reached). `None` means
 /// that limit does not apply.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `stop` and `best_score` (STAGE17.md) exist to let [`run_parallel`]
+/// coordinate several concurrently running instances of the same
+/// search; every single-threaded caller (including [`run`] itself)
+/// leaves them `None`, in which case they have no effect whatsoever
+/// and behavior is identical to before Stage 17. Not `Copy` (unlike
+/// before Stage 17) because `Arc` isn't; `Clone` still is, and every
+/// existing caller only ever needs one owned copy anyway.
+#[derive(Debug, Clone, Default)]
 pub struct Params {
     pub num_starts: Option<usize>,
     pub time_limit: Option<Duration>,
+
+    /// If `Some`, checked before every restart; if it is already
+    /// `true`, the search stops immediately, exactly as if
+    /// `num_starts`/`time_limit` had been reached. [`run_parallel`]
+    /// gives every worker a clone of the same `Arc<AtomicBool>`, so
+    /// that the moment any one of them finds a satisfying assignment,
+    /// every other worker notices at its next restart and stops
+    /// promptly instead of continuing to search for a solution that
+    /// is no longer needed.
+    pub stop: Option<Arc<AtomicBool>>,
+
+    /// If `Some`, replaces `run`'s own local best-score tracking:
+    /// instead of comparing against a private variable,
+    /// `record_if_best` compare-and-swaps against this shared value,
+    /// so that several concurrently running instances
+    /// ([`run_parallel`]'s workers) track one global best score
+    /// between them, and each only prints "new best score"
+    /// (`verbose >= 2`) when it actually raised that global maximum --
+    /// not merely its own, possibly stale, local one.
+    pub best_score: Option<Arc<AtomicI64>>,
 }
 
 /// Describes the outcome of a hill-climbing run.
@@ -253,7 +285,7 @@ fn random_permutation<R: Rng>(num_vars: usize, rng: &mut R) -> Vec<usize> {
 
 /// Formats the configured restart/time limits for the "hillclimb:"
 /// announcement printed at verbose level 1.
-fn describe_params(params: Params) -> String {
+fn describe_params(params: &Params) -> String {
     let mut parts = Vec::new();
     if let Some(n) = params.num_starts {
         parts.push(format!("num_starts={n}"));
@@ -266,6 +298,31 @@ fn describe_params(params: Params) -> String {
     } else {
         parts.join(" ")
     }
+}
+
+/// [`describe_params`], extended with the worker count, for
+/// [`run_parallel`]'s "hillclimb: ..." announcement.
+fn describe_parallel_params(params: &Params, num_threads: usize) -> String {
+    format!("num_threads={num_threads} {}", describe_params(params))
+}
+
+/// Returns "SAT" or "UNKNOWN", matching what [`run`]/[`walksat::run_walksat`]
+/// print at verbose level 1 once a search concludes.
+fn verdict(satisfiable: bool) -> &'static str {
+    if satisfiable { "SAT" } else { "UNKNOWN" }
+}
+
+/// Draws a fresh `u64` from `rng` to seed a new, independent
+/// [`StdRng`]. Used by [`run_parallel`]/[`walksat::run_walksat_parallel`]
+/// to give every worker its own generator (drained sequentially from
+/// the caller's `rng`, before any worker thread starts, so the whole
+/// sequence of derived seeds is itself deterministic given `rng`'s
+/// own state) rather than sharing one generator across threads, which
+/// would need a lock (contention, and still scheduling-dependent
+/// nondeterminism) or simply wouldn't compile (`Rng`'s methods take
+/// `&mut self`).
+fn new_sub_rng<R: Rng>(rng: &mut R) -> StdRng {
+    StdRng::seed_from_u64(rng.random::<u64>())
 }
 
 /// Performs the hill-climbing search described by STAGE2.md:
@@ -290,16 +347,170 @@ pub fn run<R: Rng>(
     verbose: i32,
 ) -> SolveResult {
     if verbose >= 1 {
-        println!("hillclimb: {}", describe_params(params));
+        println!("hillclimb: {}", describe_params(&params));
+    }
+    let result = run_loop(problem, lists, params, rng, verbose);
+    if verbose >= 1 {
+        println!("{}", verdict(result.satisfiable));
+    }
+    result
+}
+
+/// Runs the same search as [`run`], split across `num_threads`
+/// concurrent workers (STAGE17.md). `num_threads <= 1` delegates
+/// straight to [`run`], with `rng` used exactly as it always has
+/// been -- so behavior (including every random choice made) is
+/// bit-for-bit identical to calling [`run`] directly whenever
+/// multithreading isn't actually in use.
+///
+/// If `params.num_starts` is given, it is split as evenly as
+/// possible across the workers (each doing
+/// `ceil(num_starts/num_threads)` starts, so the total may run a few
+/// more starts than asked for, never fewer); `params.time_limit`, if
+/// given, is handed to every worker unchanged rather than divided,
+/// since the workers run concurrently and dividing it would just
+/// shorten the wall-clock time spent without letting any more work
+/// fit in it. `rng` is used, before any worker starts, to derive one
+/// independent [`StdRng`] per worker (see [`new_sub_rng`]), so the
+/// overall result is fully reproducible given `(rng`'s state,
+/// `num_threads)` even though which worker's answer wins a race to a
+/// solution is not.
+///
+/// The moment any worker finds a satisfying assignment, it signals
+/// every other worker to stop at its next restart (see
+/// `Params::stop`), and that worker's result -- and only that
+/// worker's -- is the one `run_parallel` reports; every other
+/// worker's own result, even a simultaneously-successful one, is
+/// discarded, so exactly one solution is ever reported, per
+/// STAGE17.md. `SolveResult::starts` is the sum of every worker's own
+/// start count, win or lose.
+pub fn run_parallel<R: Rng>(
+    problem: &Problem,
+    lists: &Lists,
+    params: Params,
+    num_threads: usize,
+    rng: &mut R,
+    verbose: i32,
+) -> SolveResult {
+    if num_threads <= 1 {
+        return run(problem, lists, params, rng, verbose);
     }
 
+    if verbose >= 1 {
+        println!(
+            "hillclimb: {}",
+            describe_parallel_params(&params, num_threads)
+        );
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let best_score = Arc::new(AtomicI64::new(-1));
+    // Sub-generators are derived sequentially from rng up front (not
+    // inside the scope below), so the whole sequence is deterministic
+    // given rng's own state regardless of thread scheduling.
+    let mut sub_rngs: Vec<StdRng> = (0..num_threads).map(|_| new_sub_rng(rng)).collect();
+
+    let mut total_starts = 0usize;
+    let mut winner: Option<SolveResult> = None;
+
+    // A scoped spawn (rather than thread::spawn) is what lets each
+    // worker closure below borrow problem/lists/sub_rngs directly
+    // instead of requiring 'static + owned copies of them: the scope
+    // guarantees every spawned thread has finished before it returns,
+    // so those borrows can never outlive what they point to.
+    thread::scope(|scope| {
+        let handles: Vec<_> = sub_rngs
+            .iter_mut()
+            .enumerate()
+            .map(|(i, sub_rng)| {
+                let mut worker_params = params.clone();
+                worker_params.stop = Some(Arc::clone(&stop));
+                worker_params.best_score = Some(Arc::clone(&best_score));
+                if let Some(n) = params.num_starts {
+                    worker_params.num_starts = Some(ceil_div(n, num_threads));
+                }
+                let stop_for_worker = Arc::clone(&stop);
+
+                scope.spawn(move || {
+                    let result = run_loop(problem, lists, worker_params, sub_rng, verbose);
+                    let won = result.satisfiable
+                        && stop_for_worker
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok();
+                    (i, won, result)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (_, won, result) = handle.join().expect("hillclimb worker thread panicked");
+            total_starts += result.starts;
+            if won {
+                winner = Some(result);
+            }
+        }
+    });
+
+    let final_result = match winner {
+        Some(result) => SolveResult {
+            satisfiable: true,
+            assignment: result.assignment,
+            score: result.score,
+            starts: total_starts,
+        },
+        None => SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            score: 0,
+            starts: total_starts,
+        },
+    };
+
+    if verbose >= 1 {
+        println!("{}", verdict(final_result.satisfiable));
+    }
+    final_result
+}
+
+/// [`run`]'s search loop, without the "hillclimb: ..."/"SAT"/"UNKNOWN"
+/// announcements -- those are the caller's responsibility ([`run`]
+/// prints its own; [`run_parallel`] prints one combined
+/// announcement/verdict for the whole parallel search instead of one
+/// per worker), so that multithreaded runs don't produce
+/// `num_threads` duplicate announcement lines.
+fn run_loop<R: Rng>(
+    problem: &Problem,
+    lists: &Lists,
+    params: Params,
+    rng: &mut R,
+    verbose: i32,
+) -> SolveResult {
     let start_time = Instant::now();
-    let mut best_score: i64 = -1;
+    let mut local_best_score: i64 = -1;
     let num_clauses = problem.num_clauses();
 
     let mut record_if_best = |score: usize| {
-        if score as i64 > best_score {
-            best_score = score as i64;
+        if let Some(shared) = &params.best_score {
+            loop {
+                let old = shared.load(Ordering::SeqCst);
+                if score as i64 <= old {
+                    return;
+                }
+                if shared
+                    .compare_exchange(old, score as i64, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    if verbose >= 2 {
+                        println!("new best score: {score}/{num_clauses}");
+                    }
+                    return;
+                }
+                // Another worker updated it concurrently; retry against
+                // whatever the new value is.
+            }
+        }
+        if score as i64 > local_best_score {
+            local_best_score = score as i64;
             if verbose >= 2 {
                 println!("new best score: {score}/{num_clauses}");
             }
@@ -308,6 +519,11 @@ pub fn run<R: Rng>(
 
     let mut starts = 0usize;
     loop {
+        if let Some(stop) = &params.stop
+            && stop.load(Ordering::SeqCst)
+        {
+            break;
+        }
         if let Some(limit) = params.num_starts
             && starts >= limit
         {
@@ -332,9 +548,6 @@ pub fn run<R: Rng>(
         }
 
         if state.score == num_clauses {
-            if verbose >= 1 {
-                println!("SAT");
-            }
             return SolveResult {
                 satisfiable: true,
                 assignment: state.assignment,
@@ -351,15 +564,18 @@ pub fn run<R: Rng>(
         }
     }
 
-    if verbose >= 1 {
-        println!("UNKNOWN");
-    }
     SolveResult {
         satisfiable: false,
         assignment: assignment::new(problem.num_vars),
         score: 0,
         starts,
     }
+}
+
+/// Returns `ceil(a/b)` for positive `a` and `b`, without floating
+/// point.
+fn ceil_div(a: usize, b: usize) -> usize {
+    a.div_ceil(b)
 }
 
 #[cfg(test)]
@@ -546,6 +762,7 @@ mod tests {
         let params = Params {
             num_starts: Some(1),
             time_limit: None,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(1);
 
@@ -571,6 +788,7 @@ mod tests {
         let params = Params {
             num_starts: Some(5),
             time_limit: None,
+            ..Default::default()
         };
         let mut rng = StdRng::seed_from_u64(2);
 
@@ -590,5 +808,152 @@ mod tests {
             assert!(seen.insert(v), "duplicate value {v}");
         }
         assert_eq!(seen.len(), 10);
+    }
+
+    /// Verifies STAGE17.md's core compatibility guarantee:
+    /// `run_parallel` with `num_threads <= 1` must behave identically
+    /// to calling `run` directly, down to every random choice made,
+    /// since it delegates straight to `run` rather than going through
+    /// any thread/atomic machinery at all.
+    #[test]
+    fn test_run_parallel_with_one_thread_matches_run() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3], vec![4]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = Params {
+            num_starts: Some(3),
+            ..Default::default()
+        };
+
+        let want = run(
+            &problem,
+            &lists,
+            params.clone(),
+            &mut StdRng::seed_from_u64(11),
+            0,
+        );
+        let got = run_parallel(
+            &problem,
+            &lists,
+            params,
+            1,
+            &mut StdRng::seed_from_u64(11),
+            0,
+        );
+
+        assert_eq!(got.satisfiable, want.satisfiable);
+        assert_eq!(got.score, want.score);
+        assert_eq!(got.starts, want.starts);
+        if got.satisfiable {
+            assert_eq!(got.assignment, want.assignment);
+        }
+    }
+
+    /// Verifies that splitting a search across several concurrent
+    /// workers still finds a genuine satisfying assignment and
+    /// reports it correctly.
+    #[test]
+    fn test_run_parallel_finds_satisfiable_formula() {
+        let problem = Problem {
+            num_vars: 5,
+            clauses: vec![vec![1], vec![2], vec![3], vec![4], vec![5]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = Params {
+            num_starts: Some(8),
+            ..Default::default()
+        };
+        let mut rng = StdRng::seed_from_u64(12);
+
+        let result = run_parallel(&problem, &lists, params, 4, &mut rng, 0);
+
+        assert!(
+            result.satisfiable,
+            "score {}/{}",
+            result.score,
+            problem.num_clauses()
+        );
+        assert_eq!(result.score, problem.num_clauses());
+    }
+
+    /// Verifies that, for an unsatisfiable formula (so every worker
+    /// runs its full local quota with no early stop), the aggregate
+    /// `starts` is at least `num_starts` (each of 4 workers does
+    /// `ceil(num_starts/4)`, so the total may be rounded up, never
+    /// down).
+    #[test]
+    fn test_run_parallel_splits_num_starts_across_threads() {
+        let problem = Problem {
+            num_vars: 1,
+            clauses: vec![vec![1], vec![-1]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = Params {
+            num_starts: Some(20),
+            ..Default::default()
+        };
+        let mut rng = StdRng::seed_from_u64(13);
+
+        let result = run_parallel(&problem, &lists, params, 4, &mut rng, 0);
+
+        assert!(!result.satisfiable);
+        assert!(
+            result.starts >= 20,
+            "starts = {}, want >= 20",
+            result.starts
+        );
+        assert!(
+            result.starts < 20 + 4,
+            "starts = {}, want <= 23 (ceil rounding across 4 workers)",
+            result.starts
+        );
+    }
+
+    /// Verifies the stop signal directly: `run_loop` must perform zero
+    /// starts if `params.stop` is already true before it is ever
+    /// called, mirroring what happens to every other `run_parallel`
+    /// worker the instant one of them finds a solution.
+    #[test]
+    fn test_run_loop_stops_immediately_when_stop_is_already_set() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let lists = occurrence::build(&problem);
+        let params = Params {
+            stop: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+
+        let result = run_loop(&problem, &lists, params, &mut StdRng::seed_from_u64(14), 0);
+
+        assert_eq!(result.starts, 0);
+        assert!(!result.satisfiable);
+    }
+
+    /// Verifies the shared-`best_score` path directly: given a
+    /// `best_score` already at 5, `run_loop`'s `record_if_best` must
+    /// not report (or lower) it for a score of 5 or less, matching
+    /// the single-threaded local-best-score behavior it replaces for
+    /// `run_parallel`'s workers.
+    #[test]
+    fn test_run_loop_best_score_only_records_genuine_improvements() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1], vec![2], vec![3]],
+        };
+        let lists = occurrence::build(&problem);
+        let best_score = Arc::new(AtomicI64::new(5));
+        let params = Params {
+            num_starts: Some(1),
+            best_score: Some(Arc::clone(&best_score)),
+            ..Default::default()
+        };
+
+        run_loop(&problem, &lists, params, &mut StdRng::seed_from_u64(15), 0);
+
+        assert!(best_score.load(Ordering::SeqCst) >= 5);
     }
 }

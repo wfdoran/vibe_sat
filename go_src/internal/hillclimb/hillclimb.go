@@ -20,6 +20,8 @@ package hillclimb
 import (
 	"fmt"
 	"math/rand/v2"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"vibe_sat/internal/assign"
@@ -31,9 +33,34 @@ import (
 // attempt, how long to keep searching, or both (in which case the
 // search stops as soon as either limit is reached). A nil field means
 // that limit does not apply.
+//
+// Stop and BestScore (STAGE17.md) exist to let RunParallel coordinate
+// several concurrently running instances of the same search; every
+// single-threaded caller (including Run itself) leaves them nil, in
+// which case they have no effect whatsoever and behavior is identical
+// to before Stage 17.
 type Params struct {
 	NumStarts *int
 	TimeLimit *time.Duration
+
+	// Stop, if non-nil, is checked before every restart; if it is
+	// already true, the search stops immediately, exactly as if
+	// NumStarts/TimeLimit had been reached. RunParallel gives every
+	// worker the same *atomic.Bool, so that the moment any one of them
+	// finds a satisfying assignment, every other worker notices at its
+	// next restart and stops promptly instead of continuing to search
+	// for a solution that is no longer needed.
+	Stop *atomic.Bool
+
+	// BestScore, if non-nil, replaces Run's own local best-score
+	// tracking: instead of comparing against a private variable,
+	// recordIfBest compare-and-swaps against this shared value, so
+	// that several concurrently running instances (RunParallel's
+	// workers) track one global best score between them, and each
+	// only prints "new best score" (verbose >= 2) when it actually
+	// raised that global maximum -- not merely its own, possibly
+	// stale, local one.
+	BestScore *atomic.Int64
 }
 
 // Result describes the outcome of a hill-climbing run.
@@ -260,10 +287,122 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, params Params, rng *rand
 	if verbose >= 1 {
 		fmt.Println("hillclimb:", describeParams(params))
 	}
+	result := runLoop(problem, lists, params, rng, verbose)
+	if verbose >= 1 {
+		fmt.Println(verdict(result.Satisfiable))
+	}
+	return result
+}
 
+// RunParallel runs the same search as Run, split across numThreads
+// concurrent workers (STAGE17.md). numThreads <= 1 delegates straight
+// to Run, with rng used exactly as it always has been -- so behavior
+// (including every random choice made) is bit-for-bit identical to
+// calling Run directly whenever multithreading isn't actually in use.
+//
+// If params.NumStarts is given, it is split as evenly as possible
+// across the workers (each doing ceil(NumStarts/numThreads) starts,
+// so the total may run a few more starts than asked for, never
+// fewer); params.TimeLimit, if given, is handed to every worker
+// unchanged rather than divided, since the workers run concurrently
+// and dividing it would just shorten the wall-clock time spent
+// without letting any more work fit in it. rng is used, before any
+// worker starts, to derive one independent sub-generator per worker
+// (see newSubRand), so the overall result is fully reproducible given
+// (rng's state, numThreads) even though which worker's answer wins a
+// race to a solution is not.
+//
+// The moment any worker finds a satisfying assignment, it signals
+// every other worker to stop at its next restart (see Params.Stop),
+// and that worker's result -- and only that worker's -- is the one
+// RunParallel reports; every other worker's own result, even a
+// simultaneously-successful one, is discarded, so exactly one
+// solution is ever reported, per STAGE17.md. Result.Starts is the sum
+// of every worker's own start count, win or lose.
+func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, params Params, numThreads int, rng *rand.Rand, verbose int) Result {
+	if numThreads <= 1 {
+		return Run(problem, lists, params, rng, verbose)
+	}
+
+	if verbose >= 1 {
+		fmt.Println("hillclimb:", describeParallelParams(params, numThreads))
+	}
+
+	subRands := make([]*rand.Rand, numThreads)
+	for i := range subRands {
+		subRands[i] = newSubRand(rng)
+	}
+
+	var stop atomic.Bool
+	var bestScore atomic.Int64
+	bestScore.Store(-1)
+	var winner atomic.Int32
+	winner.Store(-1)
+
+	results := make([]Result, numThreads)
+	var wg sync.WaitGroup
+	for i := 0; i < numThreads; i++ {
+		workerParams := params
+		workerParams.Stop = &stop
+		workerParams.BestScore = &bestScore
+		if params.NumStarts != nil {
+			n := ceilDiv(*params.NumStarts, numThreads)
+			workerParams.NumStarts = &n
+		}
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = runLoop(problem, lists, workerParams, subRands[i], verbose)
+			if results[i].Satisfiable && stop.CompareAndSwap(false, true) {
+				winner.Store(int32(i))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	final := Result{}
+	for _, r := range results {
+		final.Starts += r.Starts
+	}
+	if idx := winner.Load(); idx >= 0 {
+		final.Satisfiable = true
+		final.Assignment = results[idx].Assignment
+		final.Score = results[idx].Score
+	}
+
+	if verbose >= 1 {
+		fmt.Println(verdict(final.Satisfiable))
+	}
+	return final
+}
+
+// runLoop is Run's search loop, without the "hillclimb: ..."/
+// "SAT"/"UNKNOWN" announcements -- those are the caller's
+// responsibility (Run prints its own; RunParallel prints one combined
+// announcement/verdict for the whole parallel search instead of one
+// per worker), so that multithreaded runs don't produce numThreads
+// duplicate announcement lines.
+func runLoop(problem *cnf.Problem, lists *occurrence.Lists, params Params, rng *rand.Rand, verbose int) Result {
 	startTime := time.Now()
 	bestScore := -1
 	recordIfBest := func(score int) {
+		if params.BestScore != nil {
+			for {
+				old := params.BestScore.Load()
+				if int64(score) <= old {
+					return
+				}
+				if params.BestScore.CompareAndSwap(old, int64(score)) {
+					if verbose >= 2 {
+						fmt.Printf("new best score: %d/%d\n", score, problem.NumClauses())
+					}
+					return
+				}
+				// Another worker updated it concurrently; retry against
+				// whatever the new value is.
+			}
+		}
 		if score > bestScore {
 			bestScore = score
 			if verbose >= 2 {
@@ -274,6 +413,9 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, params Params, rng *rand
 
 	starts := 0
 	for {
+		if params.Stop != nil && params.Stop.Load() {
+			break
+		}
 		if params.NumStarts != nil && starts >= *params.NumStarts {
 			break
 		}
@@ -294,9 +436,6 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, params Params, rng *rand
 		}
 
 		if state.score == problem.NumClauses() {
-			if verbose >= 1 {
-				fmt.Println("SAT")
-			}
 			return Result{Satisfiable: true, Assignment: state.assignment, Score: state.score, Starts: starts}
 		}
 
@@ -305,10 +444,33 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, params Params, rng *rand
 		}
 	}
 
-	if verbose >= 1 {
-		fmt.Println("UNKNOWN")
-	}
 	return Result{Satisfiable: false, Starts: starts}
+}
+
+// newSubRand draws two fresh uint64s from rng to seed a new,
+// independent *rand.Rand. Used by RunParallel to give every worker
+// its own generator (drained sequentially from the caller's rng,
+// before any worker goroutine starts, so the whole sequence of
+// derived seeds is itself deterministic given rng's own state) rather
+// than sharing one *rand.Rand across goroutines, which would be both
+// a data race and a source of scheduling-dependent nondeterminism.
+func newSubRand(rng *rand.Rand) *rand.Rand {
+	return rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64()))
+}
+
+// ceilDiv returns ceil(a/b) for positive a and b, without floating
+// point.
+func ceilDiv(a, b int) int {
+	return (a + b - 1) / b
+}
+
+// verdict returns "SAT" or "UNKNOWN", matching what Run/RunWalkSat
+// print at verbose level 1 once a search concludes.
+func verdict(satisfiable bool) string {
+	if satisfiable {
+		return "SAT"
+	}
+	return "UNKNOWN"
 }
 
 // describeParams formats the configured restart/time limits for the
@@ -325,4 +487,10 @@ func describeParams(params Params) string {
 		return "(no limit)"
 	}
 	return description[:len(description)-1]
+}
+
+// describeParallelParams is describeParams, extended with the worker
+// count, for RunParallel's "hillclimb: ..." announcement.
+func describeParallelParams(params Params, numThreads int) string {
+	return fmt.Sprintf("num_threads=%d %s", numThreads, describeParams(params))
 }

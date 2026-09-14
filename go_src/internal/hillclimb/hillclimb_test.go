@@ -2,6 +2,7 @@ package hillclimb
 
 import (
 	"math/rand/v2"
+	"sync/atomic"
 	"testing"
 
 	"vibe_sat/internal/assign"
@@ -471,5 +472,219 @@ func TestRandomPermutationIsAPermutation(t *testing.T) {
 	}
 	if len(seen) != 10 {
 		t.Fatalf("order contains %d distinct values, want 10", len(seen))
+	}
+}
+
+// TestRunParallelWithOneThreadMatchesRun verifies STAGE17.md's core
+// compatibility guarantee: RunParallel with numThreads <= 1 must
+// behave identically to calling Run directly, down to every random
+// choice made, since it delegates straight to Run rather than going
+// through any goroutine/atomic machinery at all.
+func TestRunParallelWithOneThreadMatchesRun(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 4,
+		Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}, {cnf.Literal(-1), cnf.Literal(3)}, {cnf.Literal(-2), cnf.Literal(-3)}, {cnf.Literal(4)}},
+	}
+	lists := occurrence.Build(problem)
+	numStarts := 3
+	params := Params{NumStarts: &numStarts}
+
+	want := Run(problem, lists, params, rand.New(rand.NewPCG(11, 11)), 0)
+	got := RunParallel(problem, lists, params, 1, rand.New(rand.NewPCG(11, 11)), 0)
+
+	if got.Satisfiable != want.Satisfiable || got.Score != want.Score || got.Starts != want.Starts {
+		t.Fatalf("RunParallel(numThreads=1) = %+v, want identical to Run() = %+v", got, want)
+	}
+	if got.Satisfiable && !assignmentsEqual(got.Assignment, want.Assignment) {
+		t.Errorf("RunParallel(numThreads=1) assignment differs from Run()'s")
+	}
+}
+
+// TestRunParallelFindsSatisfiableFormula verifies that splitting a
+// search across several concurrent workers still finds a genuine
+// satisfying assignment and reports it correctly.
+func TestRunParallelFindsSatisfiableFormula(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 5,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},
+			{cnf.Literal(2)},
+			{cnf.Literal(3)},
+			{cnf.Literal(4)},
+			{cnf.Literal(5)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	numStarts := 8
+	params := Params{NumStarts: &numStarts}
+	rng := rand.New(rand.NewPCG(12, 12))
+
+	result := RunParallel(problem, lists, params, 4, rng, 0)
+
+	if !result.Satisfiable {
+		t.Fatalf("expected Satisfiable = true (score %d/%d)", result.Score, problem.NumClauses())
+	}
+	if result.Score != problem.NumClauses() {
+		t.Errorf("Score = %d, want %d", result.Score, problem.NumClauses())
+	}
+}
+
+// TestRunParallelSplitsNumStartsAcrossThreads verifies that, for an
+// unsatisfiable formula (so every worker runs its full local quota
+// with no early stop), the aggregate Starts is at least NumStarts
+// (each of numThreads workers does ceil(NumStarts/numThreads), so the
+// total may be rounded up, never down) and workers actually ran in
+// parallel rather than one worker doing all the work.
+func TestRunParallelSplitsNumStartsAcrossThreads(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 1,
+		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
+	}
+	lists := occurrence.Build(problem)
+	numStarts := 20
+	params := Params{NumStarts: &numStarts}
+	rng := rand.New(rand.NewPCG(13, 13))
+
+	result := RunParallel(problem, lists, params, 4, rng, 0)
+
+	if result.Satisfiable {
+		t.Fatalf("expected Satisfiable = false for an unsatisfiable formula")
+	}
+	if result.Starts < numStarts {
+		t.Errorf("Starts = %d, want at least %d", result.Starts, numStarts)
+	}
+	if result.Starts > numStarts+4-1 {
+		t.Errorf("Starts = %d, want at most %d (ceil rounding across 4 workers)", result.Starts, numStarts+4-1)
+	}
+}
+
+// TestRunLoopStopsImmediatelyWhenStopIsAlreadySet verifies the stop
+// signal directly: runLoop must perform zero starts if params.Stop is
+// already true before it is ever called, mirroring what happens to
+// every other RunParallel worker the instant one of them finds a
+// solution.
+func TestRunLoopStopsImmediatelyWhenStopIsAlreadySet(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	lists := occurrence.Build(problem)
+	var stop atomic.Bool
+	stop.Store(true)
+	params := Params{Stop: &stop}
+
+	result := runLoop(problem, lists, params, rand.New(rand.NewPCG(14, 14)), 0)
+
+	if result.Starts != 0 {
+		t.Errorf("Starts = %d, want 0 (Stop was already set)", result.Starts)
+	}
+	if result.Satisfiable {
+		t.Error("expected Satisfiable = false when stopped before any start")
+	}
+}
+
+// TestRunLoopBestScoreOnlyRecordsGenuineImprovements verifies the
+// shared-BestScore path directly: given a BestScore already at 5,
+// runLoop's recordIfBest must not report (or lower) it for a score of
+// 5 or less, matching the single-threaded local-bestScore behavior it
+// replaces for RunParallel's workers.
+func TestRunLoopBestScoreOnlyRecordsGenuineImprovements(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(2)}, {cnf.Literal(3)}},
+	}
+	lists := occurrence.Build(problem)
+	var bestScore atomic.Int64
+	bestScore.Store(5)
+	numStarts := 1
+	params := Params{NumStarts: &numStarts, BestScore: &bestScore}
+
+	runLoop(problem, lists, params, rand.New(rand.NewPCG(15, 15)), 0)
+
+	if got := bestScore.Load(); got < 5 {
+		t.Errorf("BestScore = %d, want >= 5 (never lowered)", got)
+	}
+}
+
+// assignmentsEqual reports whether a and b assign every variable of a
+// (both are expected to have the same length) to the same value.
+func assignmentsEqual(a, b assign.Assignment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestRunWalkSatParallelWithOneThreadMatchesRunWalkSat is
+// TestRunParallelWithOneThreadMatchesRun's WalkSAT analog: verifies
+// the same STAGE17.md compatibility guarantee for
+// RunWalkSatParallel(numThreads=1).
+func TestRunWalkSatParallelWithOneThreadMatchesRunWalkSat(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 4,
+		Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}, {cnf.Literal(-1), cnf.Literal(3)}, {cnf.Literal(-2), cnf.Literal(-3)}, {cnf.Literal(4)}},
+	}
+	lists := occurrence.Build(problem)
+	numTries := 3
+	params := WalkSatParams{NumTries: &numTries, MaxFlipsPerTry: DefaultMaxFlipsPerTry, NoisePercent: DefaultNoisePercent}
+
+	want := RunWalkSat(problem, lists, params, rand.New(rand.NewPCG(21, 21)), 0)
+	got := RunWalkSatParallel(problem, lists, params, 1, rand.New(rand.NewPCG(21, 21)), 0)
+
+	if got.Satisfiable != want.Satisfiable || got.Score != want.Score || got.Starts != want.Starts {
+		t.Fatalf("RunWalkSatParallel(numThreads=1) = %+v, want identical to RunWalkSat() = %+v", got, want)
+	}
+	if got.Satisfiable && !assignmentsEqual(got.Assignment, want.Assignment) {
+		t.Errorf("RunWalkSatParallel(numThreads=1) assignment differs from RunWalkSat()'s")
+	}
+}
+
+// TestRunWalkSatParallelFindsSatisfiableFormula verifies that
+// splitting a WalkSAT search across several concurrent workers still
+// finds a genuine satisfying assignment.
+func TestRunWalkSatParallelFindsSatisfiableFormula(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 5,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},
+			{cnf.Literal(2)},
+			{cnf.Literal(3)},
+			{cnf.Literal(4)},
+			{cnf.Literal(5)},
+		},
+	}
+	lists := occurrence.Build(problem)
+	numTries := 8
+	params := WalkSatParams{NumTries: &numTries, MaxFlipsPerTry: DefaultMaxFlipsPerTry, NoisePercent: DefaultNoisePercent}
+	rng := rand.New(rand.NewPCG(22, 22))
+
+	result := RunWalkSatParallel(problem, lists, params, 4, rng, 0)
+
+	if !result.Satisfiable {
+		t.Fatalf("expected Satisfiable = true (score %d/%d)", result.Score, problem.NumClauses())
+	}
+	if result.Score != problem.NumClauses() {
+		t.Errorf("Score = %d, want %d", result.Score, problem.NumClauses())
+	}
+}
+
+// TestWalkSatLoopStopsImmediatelyWhenStopIsAlreadySet is
+// TestRunLoopStopsImmediatelyWhenStopIsAlreadySet's WalkSAT analog.
+func TestWalkSatLoopStopsImmediatelyWhenStopIsAlreadySet(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	lists := occurrence.Build(problem)
+	var stop atomic.Bool
+	stop.Store(true)
+	params := WalkSatParams{MaxFlipsPerTry: DefaultMaxFlipsPerTry, NoisePercent: DefaultNoisePercent, Stop: &stop}
+
+	result := walkSatLoop(problem, lists, params, rand.New(rand.NewPCG(23, 23)), 0)
+
+	if result.Starts != 0 {
+		t.Errorf("Starts = %d, want 0 (Stop was already set)", result.Starts)
+	}
+	if result.Satisfiable {
+		t.Error("expected Satisfiable = false when stopped before any start")
 	}
 }

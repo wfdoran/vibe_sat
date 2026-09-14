@@ -3,6 +3,8 @@ package hillclimb
 import (
 	"fmt"
 	"math/rand/v2"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"vibe_sat/internal/assign"
@@ -30,11 +32,17 @@ const (
 // of the chosen unsatisfied clause instead of the one that breaks the
 // fewest other clauses; it is never nil, defaulting to
 // DefaultNoisePercent.
+//
+// Stop and BestScore (STAGE17.md) play exactly the same role here as
+// they do in Params -- see its doc comment -- and are nil for every
+// single-threaded caller, including RunWalkSat itself.
 type WalkSatParams struct {
 	NumTries       *int
 	MaxFlipsPerTry int
 	NoisePercent   int
 	TimeLimit      *time.Duration
+	Stop           *atomic.Bool
+	BestScore      *atomic.Int64
 }
 
 // RunWalkSat performs a WalkSAT search (Selman, Kautz & Cohen, 1994):
@@ -56,13 +64,102 @@ type WalkSatParams struct {
 // otherwise identical to Run; see its documentation for details.
 func RunWalkSat(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatParams, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
-		fmt.Println("walksat:", describeWalkSatParams(params))
+		fmt.Println("walksat:", describeWalkSatParams(params, 0))
+	}
+	result := walkSatLoop(problem, lists, params, rng, verbose)
+	if verbose >= 1 {
+		fmt.Println(verdict(result.Satisfiable))
+	}
+	return result
+}
+
+// RunWalkSatParallel runs the same search as RunWalkSat, split across
+// numThreads concurrent workers (STAGE17.md), exactly as RunParallel
+// does for Run -- see its doc comment for the full behavior (start
+// splitting, unshared time limit, per-worker RNG derivation, and the
+// single-winner stop/report protocol); everything there applies here
+// unchanged, just for WalkSAT's NumTries instead of NumStarts.
+func RunWalkSatParallel(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatParams, numThreads int, rng *rand.Rand, verbose int) Result {
+	if numThreads <= 1 {
+		return RunWalkSat(problem, lists, params, rng, verbose)
 	}
 
+	if verbose >= 1 {
+		fmt.Println("walksat:", describeWalkSatParams(params, numThreads))
+	}
+
+	subRands := make([]*rand.Rand, numThreads)
+	for i := range subRands {
+		subRands[i] = newSubRand(rng)
+	}
+
+	var stop atomic.Bool
+	var bestScore atomic.Int64
+	bestScore.Store(-1)
+	var winner atomic.Int32
+	winner.Store(-1)
+
+	results := make([]Result, numThreads)
+	var wg sync.WaitGroup
+	for i := 0; i < numThreads; i++ {
+		workerParams := params
+		workerParams.Stop = &stop
+		workerParams.BestScore = &bestScore
+		if params.NumTries != nil {
+			n := ceilDiv(*params.NumTries, numThreads)
+			workerParams.NumTries = &n
+		}
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = walkSatLoop(problem, lists, workerParams, subRands[i], verbose)
+			if results[i].Satisfiable && stop.CompareAndSwap(false, true) {
+				winner.Store(int32(i))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	final := Result{}
+	for _, r := range results {
+		final.Starts += r.Starts
+	}
+	if idx := winner.Load(); idx >= 0 {
+		final.Satisfiable = true
+		final.Assignment = results[idx].Assignment
+		final.Score = results[idx].Score
+	}
+
+	if verbose >= 1 {
+		fmt.Println(verdict(final.Satisfiable))
+	}
+	return final
+}
+
+// walkSatLoop is RunWalkSat's search loop, without the "walksat:
+// ..."/"SAT"/"UNKNOWN" announcements -- see runLoop's doc comment for
+// why (RunWalkSatParallel prints one combined announcement/verdict
+// instead of one per worker).
+func walkSatLoop(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatParams, rng *rand.Rand, verbose int) Result {
 	startTime := time.Now()
 	numClauses := problem.NumClauses()
 	bestScore := -1
 	recordIfBest := func(score int) {
+		if params.BestScore != nil {
+			for {
+				old := params.BestScore.Load()
+				if int64(score) <= old {
+					return
+				}
+				if params.BestScore.CompareAndSwap(old, int64(score)) {
+					if verbose >= 2 {
+						fmt.Printf("new best score: %d/%d\n", score, numClauses)
+					}
+					return
+				}
+			}
+		}
 		if score > bestScore {
 			bestScore = score
 			if verbose >= 2 {
@@ -73,6 +170,9 @@ func RunWalkSat(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatPar
 
 	tries := 0
 	for {
+		if params.Stop != nil && params.Stop.Load() {
+			break
+		}
 		if params.NumTries != nil && tries >= *params.NumTries {
 			break
 		}
@@ -93,9 +193,6 @@ func RunWalkSat(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatPar
 		}
 
 		if state.score == numClauses {
-			if verbose >= 1 {
-				fmt.Println("SAT")
-			}
 			return Result{Satisfiable: true, Assignment: state.assignment, Score: state.score, Starts: tries}
 		}
 
@@ -104,9 +201,6 @@ func RunWalkSat(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatPar
 		}
 	}
 
-	if verbose >= 1 {
-		fmt.Println("UNKNOWN")
-	}
 	return Result{Satisfiable: false, Starts: tries}
 }
 
@@ -148,8 +242,16 @@ func chooseFlipVariable(state *climbState, clauseIndex int, noisePercent int, rn
 
 // describeWalkSatParams formats the configured limits/noise for the
 // "walksat:" announcement printed at verbose level 1.
-func describeWalkSatParams(params WalkSatParams) string {
+// describeWalkSatParams formats the configured limits/noise for the
+// "walksat:" announcement printed at verbose level 1. numThreads is
+// the worker count to report (RunWalkSatParallel's num_threads=N
+// prefix), or 0 for RunWalkSat's single-threaded case, which omits
+// the prefix entirely rather than printing "num_threads=0".
+func describeWalkSatParams(params WalkSatParams, numThreads int) string {
 	description := fmt.Sprintf("max_flips_per_try=%d noise_percent=%d", params.MaxFlipsPerTry, params.NoisePercent)
+	if numThreads > 0 {
+		description = fmt.Sprintf("num_threads=%d %s", numThreads, description)
+	}
 	if params.NumTries != nil {
 		description += fmt.Sprintf(" num_tries=%d", *params.NumTries)
 	}

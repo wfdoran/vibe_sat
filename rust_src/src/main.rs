@@ -21,7 +21,7 @@ use preprocess::PreprocessResult;
 use std::fs::File;
 use std::io;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cliargs::Args;
 use rand::SeedableRng;
@@ -33,6 +33,8 @@ use rand::rngs::StdRng;
 /// 0 on success (whether or not a solution was found) or non-zero if
 /// any error occurs.
 fn main() -> ExitCode {
+    let start_time = Instant::now();
+
     let argv: Vec<String> = std::env::args().collect();
     if cliargs::wants_help(&argv) {
         print!("{}", cliargs::help_text());
@@ -46,6 +48,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    warn_if_oversubscribed(&args);
 
     let problem = match cnf::read_dimacs(&args.input, args.verbose) {
         Ok(problem) => problem,
@@ -71,7 +75,7 @@ fn main() -> ExitCode {
             if args.verbose >= 1 {
                 println!("UNSAT");
             }
-            return ExitCode::from(0);
+            return exit(start_time, args.verbose);
         }
         problem = result
             .problem
@@ -92,7 +96,42 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    exit(start_time, args.verbose)
+}
+
+/// Prints the total wall-clock time used since `start_time` (per
+/// STAGE17.md, at `verbose >= 1`, so that this shows up alongside
+/// every other piece of progress output, only when it was actually
+/// asked for) and returns the success exit code. Every successful run
+/// of vibe_sat ends by calling this exactly once, so the timing line
+/// always reflects the whole run (argument parsing, reading the CNF
+/// file, preprocessing, and searching), not just the search itself.
+fn exit(start_time: Instant, verbose: i32) -> ExitCode {
+    if verbose >= 1 {
+        println!("wall clock time: {:?}", start_time.elapsed());
+    }
     ExitCode::from(0)
+}
+
+/// Prints a one-line warning at `verbose >= 1` (STAGE17.md) if
+/// `args.num_threads` is at least twice the number of logical cores
+/// this machine reports -- oversubscription is allowed (see
+/// `Args::num_threads`'s doc comment), but a request that large is
+/// more likely to be a mistake than a deliberate choice, so it's
+/// worth flagging rather than silently accepting.
+fn warn_if_oversubscribed(args: &Args) {
+    if args.verbose < 1 {
+        return;
+    }
+    let num_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if args.num_threads >= 2 * num_cores {
+        println!(
+            "warning: --num-threads={} is at least twice this machine's {num_cores} logical cores",
+            args.num_threads
+        );
+    }
 }
 
 /// Returns the assignment to write out for a found solution:
@@ -131,9 +170,17 @@ fn run_hill_climb(
         time_limit: args
             .time_limit_secs
             .map(|secs| Duration::from_secs(secs as u64)),
+        ..Default::default()
     };
 
-    let result = hillclimb::run(problem, &lists, params, &mut rng, args.verbose);
+    let result = hillclimb::run_parallel(
+        problem,
+        &lists,
+        params,
+        args.num_threads,
+        &mut rng,
+        args.verbose,
+    );
 
     if result.satisfiable {
         let assignment = reconstructed_assignment(&result.assignment, preresult);
@@ -147,9 +194,12 @@ fn run_hill_climb(
 /// tries/max-flips/noise/time-limit settings and verbosity level
 /// given in `args`, then reports and/or writes out the result. See
 /// `cliargs::help_text` for how `args.alg_params` maps onto WalkSAT's
-/// parameters. If `preresult` is `Some`, the found assignment is
-/// reconstructed back to `original_num_vars` variables before being
-/// written out.
+/// parameters. Per STAGE17.md, the search is split across
+/// `args.num_threads` concurrent workers (1 by default, identical to
+/// today's single-threaded behavior -- see
+/// `hillclimb::walksat::run_walksat_parallel`'s doc comment). If
+/// `preresult` is `Some`, the found assignment is reconstructed back
+/// to `original_num_vars` variables before being written out.
 fn run_walksat(
     problem: &cnf::Problem,
     preresult: &Option<PreprocessResult>,
@@ -175,7 +225,14 @@ fn run_walksat(
         .time_limit_secs
         .map(|secs| Duration::from_secs(secs as u64));
 
-    let result = hillclimb::walksat::run_walksat(problem, &lists, params, &mut rng, args.verbose);
+    let result = hillclimb::walksat::run_walksat_parallel(
+        problem,
+        &lists,
+        params,
+        args.num_threads,
+        &mut rng,
+        args.verbose,
+    );
 
     if result.satisfiable {
         let assignment = reconstructed_assignment(&result.assignment, preresult);
