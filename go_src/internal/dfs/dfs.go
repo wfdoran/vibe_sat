@@ -90,6 +90,54 @@ type searchNode struct {
 	watch      *watchState
 }
 
+// bootstrap builds the root searchNode for problem: a defensive round
+// of unit propagation (needed even though Stage 8's preprocessing
+// already does this by default, since --no-preprocessing skips that)
+// followed by initial watch state for whatever clauses survive it --
+// the same two-step bootstrap Run always performed inline, now shared
+// with RunParallel (see parallel.go), which needs the exact same root
+// before branching into its BFS seeding phase. ok is false if this
+// bootstrap alone already proves problem unsatisfiable.
+func bootstrap(problem *cnf.Problem) (clauses []cnf.Clause, root searchNode, ok bool) {
+	clauses = append([]cnf.Clause(nil), problem.Clauses...)
+	rootAssignment := assign.New(problem.NumVars)
+	if unsat, _ := preprocess.UnitPropagate(&clauses, rootAssignment); unsat {
+		return clauses, searchNode{}, false
+	}
+	rootWatch, foundWatch := newWatchState(clauses, rootAssignment)
+	if !foundWatch {
+		// Defensive: UnitPropagate above should already rule this out,
+		// since every surviving clause has at least one unassigned
+		// literal (otherwise it would have been a unit clause caught
+		// above, or a contradiction).
+		return clauses, searchNode{}, false
+	}
+	return clauses, searchNode{assignment: rootAssignment, watch: rootWatch}, true
+}
+
+// allAssigned reports whether every variable of x currently has a
+// value. Only ever meaningful for the root node bootstrap produces:
+// every other node in the search (in Run's stack, or bfsSeed/
+// dfsWorker's queues/deques in parallel.go) is only ever created by
+// BCP explicitly reporting OK (not Done), which by construction means
+// it still has at least one unassigned variable -- so it is only the
+// bootstrap-propagated root itself that might, in the rare case where
+// unit propagation alone already fully solves the formula (e.g. a
+// formula made entirely of unit clauses), turn out to already be
+// complete. Checking this once, right after bootstrap, avoids
+// SelectVar/SelectVarFastPick ever being asked to choose from an
+// assignment with nothing left unassigned, which they are not
+// prepared for (SelectVar returns -1, which would panic the very
+// next indexing operation).
+func allAssigned(x assign.Assignment) bool {
+	for _, value := range x[1:] {
+		if value == assign.Unassigned {
+			return false
+		}
+	}
+	return true
+}
+
 // Run performs the depth-first search described in STAGE5.md: starting
 // from the fully unassigned partial assignment, repeatedly pop a
 // partial assignment from an explicit stack, pick a variable to
@@ -130,32 +178,22 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	// The watched-literal scheme (see watch.go) requires every clause
-	// to have at least two literals: a unit clause has nothing to
-	// "shed" its second watch onto. Bootstrap by unit-propagating the
-	// root once, with the same routine internal/preprocess already
-	// uses for exactly this purpose, before ever building watch
-	// state. When --no-preprocessing is not given, Stage 8's
-	// preprocessing has already done this (so this is a no-op); this
-	// guarantees correctness either way.
-	clauses := append([]cnf.Clause(nil), problem.Clauses...)
-	rootAssignment := assign.New(problem.NumVars)
-	if unsat, _ := preprocess.UnitPropagate(&clauses, rootAssignment); unsat {
+	clauses, root, ok := bootstrap(problem)
+	if !ok {
 		if verbose >= 1 {
 			fmt.Println("UNSAT")
 		}
 		return Result{Satisfiable: false}
 	}
-	rootWatch, ok := newWatchState(clauses, rootAssignment)
-	if !ok {
-		// Defensive: UnitPropagate above should already rule this
-		// out, since every surviving clause has at least one
-		// unassigned literal (otherwise it would have been a unit
-		// clause caught above, or a contradiction).
+	if allAssigned(root.assignment) {
+		// Bootstrap's own unit propagation alone already fully solved
+		// the formula (e.g. one made entirely of unit clauses); see
+		// allAssigned's doc comment for why this is the only node
+		// that ever needs this check.
 		if verbose >= 1 {
-			fmt.Println("UNSAT")
+			fmt.Println("SAT")
 		}
-		return Result{Satisfiable: false}
+		return Result{Satisfiable: true, Assignment: root.assignment}
 	}
 
 	// workingProblem wraps the (possibly bootstrap-simplified) clause
@@ -164,7 +202,7 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
 	startTime := time.Now()
-	stack := []searchNode{{assignment: rootAssignment, watch: rootWatch}}
+	stack := []searchNode{root}
 	numNodes := 0
 
 	for len(stack) > 0 {

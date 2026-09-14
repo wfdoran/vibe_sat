@@ -250,9 +250,12 @@ fn run_walksat(
 /// verdict, not just "not found". Per STAGE6.md, `args.alg_params[0]`
 /// (if given) selects the `SelectVar` variant: 0 (the default) for the
 /// weighted heuristic from STAGE5.md, 1 for the cheaper static-order
-/// heuristic from STAGE6.md. If `preresult` is `Some`, the found
-/// assignment is reconstructed back to `original_num_vars` variables
-/// before being written out.
+/// heuristic from STAGE6.md. Per STAGE18.md, the search is split
+/// across `args.num_threads` concurrent workers (1 by default,
+/// identical to today's single-threaded behavior -- see
+/// `dfs::run_parallel`'s doc comment). If `preresult` is `Some`, the
+/// found assignment is reconstructed back to `original_num_vars`
+/// variables before being written out.
 fn run_dfs(
     problem: &cnf::Problem,
     preresult: &Option<PreprocessResult>,
@@ -271,7 +274,15 @@ fn run_dfs(
         _ => dfs::SelectVarVariant::Weighted,
     };
 
-    let result = dfs::run(problem, &lists, time_limit, variant, &mut rng, args.verbose);
+    let result = dfs::run_parallel(
+        problem,
+        &lists,
+        time_limit,
+        variant,
+        args.num_threads,
+        &mut rng,
+        args.verbose,
+    );
 
     if result.satisfiable {
         let assignment = reconstructed_assignment(&result.assignment, preresult);

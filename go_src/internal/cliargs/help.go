@@ -141,17 +141,24 @@ Options:
         takes no value.
 
   --num-threads=<integer>, -z <integer>
-        Number of concurrent worker threads to use (STAGE17.md).
-        Default is 1 (single-threaded). Currently honored only by
-        "hc"/"ws"; ignored by "dfs"/"cdcl" for now. If --alg-params
-        gives a restart/try count, it is split as evenly as possible
-        across the threads (each doing ceil(count/num-threads));
-        --time-limit-secs, if given, is handed to every thread in
-        full rather than divided, since the threads search
-        concurrently. A value larger than the machine's core count is
-        allowed (oversubscription); a warning is printed at
-        --verbose=1 or higher if --num-threads is at least twice the
-        core count, in case that's unintentional.
+        Number of concurrent worker threads to use (STAGE17.md,
+        STAGE18.md). Default is 1 (single-threaded). Currently
+        honored by "hc"/"ws"/"dfs"; ignored by "cdcl" for now.
+          hc/ws  If --alg-params gives a restart/try count, it is
+                 split as evenly as possible across the threads (each
+                 doing ceil(count/num-threads)); --time-limit-secs, if
+                 given, is handed to every thread in full rather than
+                 divided, since the threads search concurrently.
+          dfs    A genuine divide-and-conquer parallel search (not a
+                 portfolio solver): the search tree is seeded with up
+                 to num-threads disjoint starting branches, then
+                 explored via work-stealing between threads. May use
+                 fewer than num-threads threads if the tree has fewer
+                 branches than that to hand out.
+        For every algorithm that honors it, a value larger than the
+        machine's core count is allowed (oversubscription); a warning
+        is printed at --verbose=1 or higher if --num-threads is at
+        least twice the core count, in case that's unintentional.
 
   --help, -h
         Print this help message and exit.

@@ -6,6 +6,14 @@
 //! algorithms ([`crate::hillclimb`]), this search is complete: if it
 //! exhausts its search space without finding a satisfying assignment,
 //! the problem is proven UNSAT, not merely "not found yet".
+//!
+//! [`parallel::run_parallel`] (STAGE18.md, re-exported here as
+//! [`run_parallel`]) is a genuine divide-and-conquer parallel version
+//! of [`run`], not a portfolio solver; see its module doc comment for
+//! the full design.
+
+mod parallel;
+pub use parallel::run_parallel;
 
 use std::time::{Duration, Instant};
 
@@ -146,6 +154,50 @@ struct SearchNode {
     watch: WatchState,
 }
 
+/// Builds the root [`SearchNode`] for `problem`: a defensive round of
+/// unit propagation (needed even though Stage 8's preprocessing
+/// already does this by default, since `--no-preprocessing` skips
+/// that) followed by initial watch state for whatever clauses survive
+/// it -- the same two-step bootstrap [`run`] always performed inline,
+/// now shared with [`parallel::run_parallel`], which needs the exact
+/// same root before branching into its BFS seeding phase. Returns
+/// `None` if this bootstrap alone already proves `problem`
+/// unsatisfiable; otherwise, the (possibly simplified) clause set and
+/// the root node.
+fn bootstrap(problem: &Problem) -> Option<(Vec<Clause>, SearchNode)> {
+    let mut clauses = problem.clauses.clone();
+    let mut root_assignment = assignment::new(problem.num_vars);
+    if preprocess::unit_propagate(&mut clauses, &mut root_assignment).0 {
+        return None;
+    }
+    let root_watch = new_watch_state(&clauses, &root_assignment)?;
+    Some((
+        clauses,
+        SearchNode {
+            assignment: root_assignment,
+            watch: root_watch,
+        },
+    ))
+}
+
+/// Returns whether every variable of `x` currently has a value. Only
+/// ever meaningful for the root node [`bootstrap`] produces: every
+/// other node in the search ([`run`]'s stack, or
+/// [`parallel::bfs_seed`]/parallel workers' queues/deques) is only
+/// ever created by [`bcp`] explicitly reporting [`Status::Ok`] (not
+/// [`Status::Done`]), which by construction means it still has at
+/// least one unassigned variable -- so it is only the
+/// bootstrap-propagated root itself that might, in the rare case
+/// where unit propagation alone already fully solves the formula
+/// (e.g. a formula made entirely of unit clauses), turn out to
+/// already be complete. Checking this once, right after bootstrap,
+/// avoids select_var/select_var_fast_pick ever being asked to choose
+/// from an assignment with nothing left unassigned, which they are
+/// not prepared for (both `.expect(...)`-panic in that case).
+fn all_assigned(x: &Assignment) -> bool {
+    !x[1..].contains(&Value::Unassigned)
+}
+
 /// Describes the outcome of a depth-first search.
 pub struct SolveResult {
     /// Whether a satisfying assignment was found.
@@ -214,17 +266,7 @@ pub fn run<R: Rng>(
         };
     }
 
-    // The watched-literal scheme (see WatchState) requires every
-    // clause to have at least two literals: a unit clause has nothing
-    // to "shed" its second watch onto. Bootstrap by unit-propagating
-    // the root once, with the same routine crate::preprocess already
-    // uses for exactly this purpose, before ever building watch
-    // state. When --no-preprocessing is not given, Stage 8's
-    // preprocessing has already done this (so this is a no-op); this
-    // guarantees correctness either way.
-    let mut clauses = problem.clauses.clone();
-    let mut root_assignment = assignment::new(problem.num_vars);
-    if preprocess::unit_propagate(&mut clauses, &mut root_assignment).0 {
+    let Some((clauses, root)) = bootstrap(problem) else {
         if verbose >= 1 {
             println!("UNSAT");
         }
@@ -234,25 +276,22 @@ pub fn run<R: Rng>(
             num_nodes: 0,
             timed_out: false,
         };
-    }
-    let root_watch = match new_watch_state(&clauses, &root_assignment) {
-        Some(ws) => ws,
-        // Defensive: unit_propagate above should already rule this
-        // out, since every surviving clause has at least one
-        // unassigned literal (otherwise it would have been a unit
-        // clause caught above, or a contradiction).
-        None => {
-            if verbose >= 1 {
-                println!("UNSAT");
-            }
-            return SolveResult {
-                satisfiable: false,
-                assignment: assignment::new(problem.num_vars),
-                num_nodes: 0,
-                timed_out: false,
-            };
-        }
     };
+    if all_assigned(&root.assignment) {
+        // Bootstrap's own unit propagation alone already fully solved
+        // the formula (e.g. one made entirely of unit clauses); see
+        // all_assigned's doc comment for why this is the only node
+        // that ever needs this check.
+        if verbose >= 1 {
+            println!("SAT");
+        }
+        return SolveResult {
+            satisfiable: true,
+            assignment: root.assignment,
+            num_nodes: 0,
+            timed_out: false,
+        };
+    }
 
     // working_problem wraps the (possibly bootstrap-simplified) clause
     // set for select_var/select_var_fast_pick, which only ever need
@@ -265,10 +304,7 @@ pub fn run<R: Rng>(
     };
 
     let start_time = Instant::now();
-    let mut stack: Vec<SearchNode> = vec![SearchNode {
-        assignment: root_assignment,
-        watch: root_watch,
-    }];
+    let mut stack: Vec<SearchNode> = vec![root];
     let mut num_nodes: usize = 0;
 
     while let Some(node) = stack.pop() {
