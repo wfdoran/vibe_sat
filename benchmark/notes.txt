@@ -12,3 +12,16 @@ Uniform Random-3-SAT, phase transition region, unforced filtered - description (
     uf175-753 / uuf175-753: 175 variables, 753 clauses - 100 instances, all sat/unsat 
 
     uf250-1065 / uuf250-1065: 250 variables, 1065 clauses - 100 instances, all sat/unsat 
+
+"Flat" Graph Colouring, 3 colourable - description (html)
+
+    flat125-301: 125 vertices, 301 edges - 100 instances, all satisfiable 
+	flat200-479: 200 vertices, 479 edges - 100 instances, all satisfiable 
+	
+Planning (contributed by Henry Kautz and Bart Selman) 
+
+    blocksworld: 7 instances, all satisfiable - description (html)
+
+DIMACS Benchmark Instances (original source: DIMACS Benchmark set for SAT) - overview (ps-file, 72k)
+
+    SSA: Circuit fault analysis: single-stuck-at fault - 4 instances satisfiable, 4 instances unsatisfiable description (html) 	 
