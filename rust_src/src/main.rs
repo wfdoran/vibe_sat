@@ -347,22 +347,32 @@ fn run_cdcl(
     };
 
     // STAGE15.md leaves the default restart strategy up to this
-    // implementation too; see cdcl::run's doc comment for why it's
-    // RestartStrategy::Polynomial.
+    // implementation too; see cdcl::run_loop's doc comment for why
+    // it's RestartStrategy::Polynomial with a single thread.
+    // STAGE21.md changes the default, but only the default -- an
+    // explicit --alg-params restart value, even 0, always wins
+    // regardless of --num-threads -- once --num-threads > 1:
+    // RestartStrategy::RoundRobin, which spreads quadratic/geometric/
+    // Luby evenly across the workers rather than racing every worker
+    // with the identical restart cadence (see cdcl::run_parallel's
+    // doc comment).
     let restart_strategy = match args.alg_params.as_deref() {
         Some([_, 0, ..]) => cdcl::RestartStrategy::None,
         Some([_, 1, ..]) => cdcl::RestartStrategy::Luby,
         Some([_, 2, ..]) => cdcl::RestartStrategy::Polynomial,
         Some([_, 3, ..]) => cdcl::RestartStrategy::Geometric,
+        Some([_, 4, ..]) => cdcl::RestartStrategy::RoundRobin,
+        _ if args.num_threads > 1 => cdcl::RestartStrategy::RoundRobin,
         _ => cdcl::RestartStrategy::Polynomial,
     };
 
-    let result = cdcl::run(
+    let result = cdcl::run_parallel(
         problem,
         time_limit,
         variant,
         restart_strategy,
         args.memory_limit_bytes,
+        args.num_threads,
         &mut rng,
         args.verbose,
     );

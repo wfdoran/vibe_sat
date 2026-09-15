@@ -233,12 +233,22 @@ Options:
                      means in the SAT literature (val2=2's sequence
                      was originally, incorrectly, called "geometric";
                      see reports/REPORT15.md).
-               Optional; defaults to 2 (polynomial) if not given: this
-               project's own benchmark comparison (reports/REPORT15.md)
-               found the polynomial schedule clearly ahead of no
-               restarts and of Luby on this project's actual benchmark
-               set, especially for proving UNSAT. Note: val1 must be
-               given to set val2, even if val1 is just the default
+                 4 = round-robin (STAGE21.md, --num-threads > 1 only):
+                     worker 0 uses quadratic, worker 1 geometric,
+                     worker 2 Luby, worker 3 quadratic again, and so
+                     on, so each strategy runs on close to an equal
+                     share of the workers instead of every worker
+                     racing with the same restart cadence.
+               Optional; defaults to 2 (polynomial) with --num-threads=1
+               (this project's own benchmark comparison,
+               reports/REPORT15.md, found the polynomial schedule
+               clearly ahead of no restarts and of Luby on this
+               project's actual benchmark set, especially for proving
+               UNSAT), or to 4 (round-robin) with --num-threads > 1
+               (reports/REPORT20.md/REPORT21.md). An explicit val2,
+               including 0, is always honored by every worker exactly
+               as given, regardless of --num-threads. Note: val1 must
+               be given to set val2, even if val1 is just the default
                (2).
                val3 = an optional learned-clause database memory
                      limit (STAGE12.md; this was val2 before
@@ -264,8 +274,8 @@ Options:
 
   --num-threads=<integer>, -z <integer>
         Number of concurrent worker threads to use (STAGE17.md,
-        STAGE18.md). Default is 1 (single-threaded). Currently
-        honored by "hc"/"ws"/"dfs"; ignored by "cdcl" for now.
+        STAGE18.md, STAGE20.md/STAGE21.md). Default is 1
+        (single-threaded). Honored by "hc"/"ws"/"dfs"/"cdcl".
           hc/ws  If --alg-params gives a restart/try count, it is
                  split as evenly as possible across the threads (each
                  doing ceil(count/num-threads)); --time-limit-secs, if
@@ -277,6 +287,16 @@ Options:
                  explored via work-stealing between threads. May use
                  fewer than num-threads threads if the tree has fewer
                  branches than that to hand out.
+          cdcl   A portfolio, not divide-and-conquer, design (Option B
+                 of reports/REPORT20.md): every thread independently
+                 searches the *entire* original problem, so the first
+                 thread to reach any verdict (SAT or UNSAT) is already
+                 the answer for the whole run, and every other thread
+                 stops. The only thing threads share is learned
+                 clauses, continuously, through a lock-free per-thread
+                 export buffer every other thread drains -- see
+                 --alg-params val2=4 above for how each thread's
+                 restart schedule is chosen.
         For every algorithm that honors it, a value larger than the
         machine's core count is allowed (oversubscription); a warning
         is printed at --verbose=1 or higher if --num-threads is at
@@ -324,7 +344,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         if raw.algorithm == "cdcl" {
             if values.len() > 3 {
                 return Err(
-                    "for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-3 selecting the restart strategy, and an optional learned-clause database memory limit)"
+                    "for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-4 selecting the restart strategy, and an optional learned-clause database memory limit)"
                         .to_string(),
                 );
             }
@@ -512,12 +532,16 @@ fn validate(args: &Args) -> Result<(), String> {
             // k/kb/m/mb/g/gb suffix) were already enforced in
             // build_args, since that's where the raw tokens are
             // available; only the remaining business rules (variant
-            // is 0-3; restart strategy is 0-3; the limit, if given,
+            // is 0-3; restart strategy is 0-4; the limit, if given,
             // is positive) are checked here. STAGE13.md extends the
             // first value's range from dfs's 0/1 (Weighted/Fast) to
             // also allow 2 (VSIDS) and 3 (LRB), both cdcl-only.
             // STAGE15.md adds the second value (restart strategy: 0 =
             // none, 1 = Luby, 2 = polynomial, 3 = geometric).
+            // STAGE21.md adds a fourth restart-strategy value (4 =
+            // round-robin across quadratic/geometric/Luby by worker
+            // index, meaningful with --num-threads > 1; see
+            // cdcl::RestartStrategy::RoundRobin).
             if let Some(params) = &args.alg_params
                 && !(0..=3).contains(&params[0])
             {
@@ -528,10 +552,10 @@ fn validate(args: &Args) -> Result<(), String> {
             }
             if let Some(params) = &args.alg_params
                 && let Some(&restart) = params.get(1)
-                && !(0..=3).contains(&restart)
+                && !(0..=4).contains(&restart)
             {
                 return Err(
-                    "for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, or 3 (selecting the restart strategy)"
+                    "for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, 3, or 4 (selecting the restart strategy)"
                         .to_string(),
                 );
             }
@@ -897,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_rejects_out_of_range_restart_strategy() {
-        for restart in ["4", "-1"] {
+        for restart in ["5", "-1"] {
             let result = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",
@@ -911,6 +935,20 @@ mod tests {
                 "expected error for --alg-params 2 {restart} with --algorithm=cdcl"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_cdcl_accepts_round_robin_restart_strategy() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "2",
+            "4",
+        ])
+        .expect("Parse with --alg-params 2 4 should succeed");
+        assert_eq!(args.alg_params.as_deref(), Some(&[2, 4][..]));
     }
 
     #[test]

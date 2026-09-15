@@ -111,12 +111,22 @@ Options:
                      means in the SAT literature (val2=2's sequence
                      was originally, incorrectly, called "geometric";
                      see reports/REPORT15.md).
-               Optional; defaults to 2 (polynomial) if not given: this
-               project's own benchmark comparison (reports/REPORT15.md)
-               found the polynomial schedule clearly ahead of no
-               restarts and of Luby on this project's actual benchmark
-               set, especially for proving UNSAT. Note: val1 must be
-               given to set val2, even if val1 is just the default
+                 4 = round-robin (STAGE21.md, --num-threads > 1 only):
+                     worker 0 uses quadratic, worker 1 geometric,
+                     worker 2 Luby, worker 3 quadratic again, and so
+                     on, so each strategy runs on close to an equal
+                     share of the workers instead of every worker
+                     racing with the same restart cadence.
+               Optional; defaults to 2 (polynomial) with --num-threads=1
+               (this project's own benchmark comparison,
+               reports/REPORT15.md, found the polynomial schedule
+               clearly ahead of no restarts and of Luby on this
+               project's actual benchmark set, especially for proving
+               UNSAT), or to 4 (round-robin) with --num-threads > 1
+               (reports/REPORT20.md/REPORT21.md). An explicit val2,
+               including 0, is always honored by every worker exactly
+               as given, regardless of --num-threads. Note: val1 must
+               be given to set val2, even if val1 is just the default
                (2).
                val3 = an optional learned-clause database memory
                      limit (STAGE12.md; this was val2 before
@@ -142,8 +152,8 @@ Options:
 
   --num-threads=<integer>, -z <integer>
         Number of concurrent worker threads to use (STAGE17.md,
-        STAGE18.md). Default is 1 (single-threaded). Currently
-        honored by "hc"/"ws"/"dfs"; ignored by "cdcl" for now.
+        STAGE18.md, STAGE20.md/STAGE21.md). Default is 1
+        (single-threaded). Honored by "hc"/"ws"/"dfs"/"cdcl".
           hc/ws  If --alg-params gives a restart/try count, it is
                  split as evenly as possible across the threads (each
                  doing ceil(count/num-threads)); --time-limit-secs, if
@@ -155,6 +165,16 @@ Options:
                  explored via work-stealing between threads. May use
                  fewer than num-threads threads if the tree has fewer
                  branches than that to hand out.
+          cdcl   A portfolio, not divide-and-conquer, design (Option B
+                 of reports/REPORT20.md): every thread independently
+                 searches the *entire* original problem, so the first
+                 thread to reach any verdict (SAT or UNSAT) is already
+                 the answer for the whole run, and every other thread
+                 stops. The only thing threads share is learned
+                 clauses, continuously, through a lock-free per-thread
+                 export buffer every other thread drains -- see
+                 --alg-params val2=4 above for how each thread's
+                 restart schedule is chosen.
         For every algorithm that honors it, a value larger than the
         machine's core count is allowed (oversubscription); a warning
         is printed at --verbose=1 or higher if --num-threads is at

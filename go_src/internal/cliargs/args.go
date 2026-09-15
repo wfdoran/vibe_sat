@@ -295,7 +295,7 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		// AlgParams just like the first.
 		if args.Algorithm == "cdcl" {
 			if len(values) > 3 {
-				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-3 selecting the restart strategy, and an optional learned-clause database memory limit)")
+				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-4 selecting the restart strategy, and an optional learned-clause database memory limit)")
 			}
 			if len(values) >= 1 {
 				p, err := strconv.ParseInt(values[0], 10, 64)
@@ -405,17 +405,20 @@ func validate(args *Args, rawValues map[string][]string) error {
 		// syntax (plain integer, optionally with a k/kb/m/mb/g/gb
 		// suffix) were already enforced in buildArgs, since that's
 		// where the raw tokens are available; only the remaining
-		// business rules (variant is 0-3; restart strategy is 0-3;
+		// business rules (variant is 0-3; restart strategy is 0-4;
 		// the limit, if given, is positive) are checked here.
 		// STAGE13.md extends the first value's range from dfs's 0/1
 		// (Weighted/Fast) to also allow 2 (VSIDS) and 3 (LRB), both
 		// cdcl-only. STAGE15.md adds the second value (restart
 		// strategy: 0 = none, 1 = Luby, 2 = polynomial, 3 = geometric).
+		// STAGE21.md adds a fourth restart-strategy value (4 = round-
+		// robin across quadratic/geometric/Luby by worker index,
+		// meaningful with --num-threads > 1; see cdcl.RestartRoundRobin).
 		if len(args.AlgParams) >= 1 && (args.AlgParams[0] < 0 || args.AlgParams[0] > 3) {
 			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)")
 		}
-		if len(args.AlgParams) >= 2 && (args.AlgParams[1] < 0 || args.AlgParams[1] > 3) {
-			return fmt.Errorf("for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, or 3 (selecting the restart strategy)")
+		if len(args.AlgParams) >= 2 && (args.AlgParams[1] < 0 || args.AlgParams[1] > 4) {
+			return fmt.Errorf("for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, 3, or 4 (selecting the restart strategy)")
 		}
 		if args.MemoryLimitBytes != nil && *args.MemoryLimitBytes < 1 {
 			return fmt.Errorf("for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes")

@@ -7,3 +7,4 @@ edition = "2024"
 clap = { version = "4.6.6", features = ["derive"] }
 rand = "0.10.2"
 crossbeam-deque = "0.8"
+arc-swap = "1.7"

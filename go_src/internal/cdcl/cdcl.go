@@ -100,6 +100,13 @@
 //     literature (e.g. MiniSat 1.13/1.14's restart scheme, before
 //     Luby restarts became the default in later MiniSat versions).
 //
+// STAGE21.md adds a fourth choice, RestartRoundRobin, once
+// multithreaded cdcl (STAGE20.md/STAGE21.md's Option B: a
+// continuously shared clause pool, each thread otherwise running the
+// ordinary single-threaded search independently) made "which restart
+// strategy should each thread use" a real question -- see
+// RestartRoundRobin's own doc comment and resolveRestartStrategy.
+//
 // All three schedules are driven by conflict count, not decision
 // count: STAGE15.md assumes "node count" as the restart statistic,
 // and conflict count is this implementation's reading of that,
@@ -117,6 +124,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"vibe_sat/internal/assign"
@@ -277,7 +286,46 @@ const (
 	// ratio geometricGrowthFactor between consecutive restart
 	// intervals, scaled by geometricBaseConflicts.
 	RestartGeometric RestartStrategy = 3
+	// RestartRoundRobin is STAGE21.md's addition, meaningful only as a
+	// value RunParallel/Run resolve away before ever constructing a
+	// *solver -- no solver's own restartStrategy field is ever
+	// RestartRoundRobin, and restartThreshold never needs to handle
+	// it. It means: thread i uses roundRobinStrategies[i%3] (quadratic,
+	// geometric, Luby, quadratic, ... -- see resolveRestartStrategy),
+	// so each of the three strategies runs on as close to an equal
+	// share of threads as num_threads allows, rather than every thread
+	// racing with the identical restart cadence.
+	RestartRoundRobin RestartStrategy = 4
 )
+
+// roundRobinStrategies is RestartRoundRobin's resolution order (see
+// resolveRestartStrategy): thread 0 uses quadratic (RestartPolynomial),
+// thread 1 uses geometric (RestartGeometric), thread 2 uses Luby
+// (RestartLuby), thread 3 cycles back to quadratic, and so on. Assigning
+// by spawn-order index -- a plain int RunParallel already hands every
+// worker goroutine/thread, the same way Stage 17/18's winner index and
+// per-worker sub-RNG already are -- gives an exactly even split with no
+// extra bookkeeping, which is why this doesn't fall back to
+// randomizing among the three (something STAGE21.md allowed for in
+// case a deterministic per-thread index turned out to be awkward to
+// get at in Go; it isn't).
+var roundRobinStrategies = [3]RestartStrategy{RestartPolynomial, RestartGeometric, RestartLuby}
+
+// resolveRestartStrategy returns the concrete restart strategy thread
+// threadIndex should actually use: restartStrategy unchanged, unless
+// it is RestartRoundRobin, in which case it resolves to
+// roundRobinStrategies[threadIndex%3]. Called with threadIndex 0 for
+// Run (so an explicit --alg-params restart=4 with --num-threads=1
+// still behaves sensibly -- it resolves to the same RestartPolynomial
+// thread 0 of a round-robin RunParallel run would get, rather than
+// being silently mishandled) and with the worker's own spawn index for
+// each of RunParallel's workers.
+func resolveRestartStrategy(restartStrategy RestartStrategy, threadIndex int) RestartStrategy {
+	if restartStrategy == RestartRoundRobin {
+		return roundRobinStrategies[threadIndex%3]
+	}
+	return restartStrategy
+}
 
 // Result describes the outcome of a CDCL search.
 type Result struct {
@@ -285,7 +333,14 @@ type Result struct {
 	Assignment   assign.Assignment // the satisfying assignment; only meaningful if Satisfiable
 	NumDecisions int               // number of branching decisions made
 	NumConflicts int               // number of conflicts encountered (= number of clauses learned)
-	TimedOut     bool              // true if the search was abandoned due to the time limit, rather than exhausting the search space
+	// TimedOut is true if the search was abandoned before reaching a
+	// verdict, rather than exhausting the search space: either the
+	// time limit was reached, or (RunParallel only, STAGE20.md/
+	// STAGE21.md's Option B) another worker already reached a genuine
+	// verdict first and this one gave up early rather than duplicate
+	// work nobody needs anymore. Satisfiable/Assignment are meaningless
+	// whenever this is true.
+	TimedOut bool
 }
 
 // solver holds all of the mutable state of one CDCL run.
@@ -379,6 +434,30 @@ type solver struct {
 	restartStrategy       RestartStrategy
 	restartCount          int
 	conflictsSinceRestart int
+
+	// stop, export, peers, and peerCursors (STAGE20.md/STAGE21.md's
+	// Option B) are nil for every single-threaded caller (Run itself),
+	// matching the nil-safe optional-field pattern Stage 17 established
+	// for hc/ws's Params.Stop/BestScore: newSolver never sets any of
+	// these, and runLoop only wires them in for RunParallel's workers.
+	//
+	// stop is checked once per loop iteration (see runLoop); the
+	// moment any worker reaches a genuine verdict, it CASes stop from
+	// false to true, and every other worker notices at its very next
+	// iteration and abandons its own (now-redundant) search.
+	//
+	// export is this thread's own outbox: every learned clause short
+	// enough to qualify (see exportMaxClauseLen) is published to it
+	// continuously, in addLearnedClause, as soon as it's learned --
+	// not batched to restart boundaries, which is the whole point of
+	// Option B over the batched alternatives REPORT20.md considered
+	// and rejected. peers is every OTHER thread's own outbox (this
+	// thread's own is deliberately excluded); peerCursors[i] is this
+	// thread's own next-read index into peers[i] (see maybeImport).
+	stop        *atomic.Bool
+	export      *exportBuffer
+	peers       []*exportBuffer
+	peerCursors []uint64
 
 	x            assign.Assignment // current (partial) assignment
 	level        []int             // level[v] = decision level at which v was assigned (meaningless if x[v] is Unassigned)
@@ -520,21 +599,134 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 	if verbose >= 1 {
 		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy)+describeMemoryLimit(memoryLimitBytes))
 	}
+	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil)
+	if verbose >= 1 {
+		fmt.Println(verdict(result))
+	}
+	return result
+}
 
+// RunParallel runs the same search as Run, split across numThreads
+// concurrent workers implementing STAGE20.md/STAGE21.md's Option B:
+// every worker independently runs the ordinary single-threaded search
+// over the *complete* original problem -- no divide-and-conquer, no
+// work redistribution, nothing shared between workers except learned
+// clauses (see exportBuffer/maybeImport) -- so unlike dfs's parallel
+// search (STAGE18.md), any single worker's own verdict, SAT or UNSAT,
+// is already the authoritative answer for the whole problem the
+// moment it's reached; there is no termination-detection protocol to
+// build here at all, only the same CAS-based single-winner shutdown
+// Stage 17/18 already established.
+//
+// numThreads <= 1 delegates straight to Run, with rng used exactly as
+// it always has been, so behavior is bit-for-bit identical to calling
+// Run directly whenever multithreading isn't in use, matching the
+// same guarantee Stage 17/18 established for the parallel hillclimb/
+// walksat/dfs entry points.
+//
+// restartStrategy is resolved per worker via resolveRestartStrategy:
+// RestartRoundRobin (STAGE21.md) assigns worker i
+// roundRobinStrategies[i%3] (an even split of quadratic/geometric/
+// Luby across the workers); any other explicit strategy, including
+// RestartNone, is used unchanged by every worker. Per STAGE21.md,
+// callers (see main.go's runCDCL) are expected to pass
+// RestartRoundRobin as the default restart strategy whenever
+// numThreads > 1 and the caller didn't explicitly ask for something
+// else, and whatever was explicitly asked for otherwise -- that
+// policy lives in main.go, not here, since RunParallel has no way to
+// tell "the caller's default" from "the caller's explicit choice"
+// apart once it's just a RestartStrategy value.
+//
+// rng is used, before any worker starts, to derive one independent
+// sub-generator per worker (see newSubRand), so the overall result is
+// fully reproducible given (rng's state, numThreads) even though
+// which worker's answer wins a race to a verdict is not.
+// Result.NumDecisions/NumConflicts are summed across every worker,
+// win or lose, matching Stage 18's Result.NumNodes convention.
+func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, numThreads int, rng *rand.Rand, verbose int) Result {
+	if numThreads <= 1 {
+		return Run(problem, timeLimit, variant, restartStrategy, memoryLimitBytes, rng, verbose)
+	}
+
+	if verbose >= 1 {
+		fmt.Println("cdcl:", describeParallelParams(timeLimit, variant, restartStrategy, numThreads)+describeMemoryLimit(memoryLimitBytes))
+	}
+
+	exportBuffers := make([]*exportBuffer, numThreads)
+	for i := range exportBuffers {
+		exportBuffers[i] = newExportBuffer(exportBufferCapacity)
+	}
+	subRands := make([]*rand.Rand, numThreads)
+	for i := range subRands {
+		subRands[i] = newSubRand(rng)
+	}
+
+	var stop atomic.Bool
+	var winner atomic.Int32
+	winner.Store(-1)
+
+	results := make([]Result, numThreads)
+	var wg sync.WaitGroup
+	for i := 0; i < numThreads; i++ {
+		peers := make([]*exportBuffer, 0, numThreads-1)
+		for j, buf := range exportBuffers {
+			if j != i {
+				peers = append(peers, buf)
+			}
+		}
+		wg.Add(1)
+		go func(i int, peers []*exportBuffer) {
+			defer wg.Done()
+			threadStrategy := resolveRestartStrategy(restartStrategy, i)
+			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers)
+			if !results[i].TimedOut && stop.CompareAndSwap(false, true) {
+				winner.Store(int32(i))
+			}
+		}(i, peers)
+	}
+	wg.Wait()
+
+	var final Result
+	for _, r := range results {
+		final.NumDecisions += r.NumDecisions
+		final.NumConflicts += r.NumConflicts
+	}
+	if idx := winner.Load(); idx >= 0 {
+		w := results[idx]
+		final.Satisfiable = w.Satisfiable
+		final.Assignment = w.Assignment
+	} else {
+		final.TimedOut = true
+	}
+
+	if verbose >= 1 {
+		fmt.Println(verdict(final))
+	}
+	return final
+}
+
+// runLoop is Run's search loop, without the "cdcl: ..."/"SAT"/
+// "UNSAT"/"UNKNOWN" announcements -- those are the caller's
+// responsibility (Run prints its own; RunParallel prints one combined
+// announcement/verdict for the whole parallel search instead of one
+// per worker), matching Stage 17/18's identical runLoop/dfsWorker
+// pattern. stop/export/peers are nil for Run's own single-threaded
+// call; see the solver struct's doc comment for what each does.
+func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, stop *atomic.Bool, export *exportBuffer, peers []*exportBuffer) Result {
 	if problem.NumVars == 0 {
 		satisfiable := len(problem.Clauses) == 0
-		if verbose >= 1 {
-			fmt.Println(map[bool]string{true: "SAT", false: "UNSAT"}[satisfiable])
-		}
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
 	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy)
 	if !ok {
-		if verbose >= 1 {
-			fmt.Println("UNSAT")
-		}
 		return Result{Satisfiable: false}
+	}
+	s.stop = stop
+	s.export = export
+	s.peers = peers
+	if peers != nil {
+		s.peerCursors = make([]uint64, len(peers))
 	}
 
 	startTime := time.Now()
@@ -542,19 +734,16 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 
 	for {
 		step++
+		if s.stop != nil && s.stop.Load() {
+			return Result{NumDecisions: s.numDecisions, NumConflicts: s.numConflicts, TimedOut: true}
+		}
 		if timeLimit != nil && step&timeCheckInterval == 0 && time.Since(startTime) >= *timeLimit {
-			if verbose >= 1 {
-				fmt.Println("UNKNOWN")
-			}
-			return Result{Satisfiable: false, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts, TimedOut: true}
+			return Result{NumDecisions: s.numDecisions, NumConflicts: s.numConflicts, TimedOut: true}
 		}
 
 		if confl := s.propagate(); confl != noReason {
 			s.numConflicts++
 			if s.currentLevel == 0 {
-				if verbose >= 1 {
-					fmt.Println("UNSAT")
-				}
 				return Result{Satisfiable: false, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts}
 			}
 			s.learnAndBackjump(confl)
@@ -564,14 +753,33 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 		}
 
 		if s.allAssigned() {
-			if verbose >= 1 {
-				fmt.Println("SAT")
-			}
 			return Result{Satisfiable: true, Assignment: s.x, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts}
 		}
 
 		s.decide(rng)
 	}
+}
+
+// verdict formats a Result's outcome for the "SAT"/"UNSAT"/"UNKNOWN"
+// line Run/RunParallel print at verbose >= 1.
+func verdict(r Result) string {
+	if r.TimedOut {
+		return "UNKNOWN"
+	}
+	if r.Satisfiable {
+		return "SAT"
+	}
+	return "UNSAT"
+}
+
+// newSubRand draws two fresh uint64s from rng to seed a new,
+// independent *rand.Rand, matching Stage 17/18's identical helper in
+// internal/hillclimb/internal/dfs (see either's doc comment for why:
+// giving every worker its own generator, derived deterministically
+// and sequentially before any worker starts, rather than sharing one
+// *rand.Rand across goroutines).
+func newSubRand(rng *rand.Rand) *rand.Rand {
+	return rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64()))
 }
 
 // allAssigned reports whether every variable of the solver currently
@@ -738,6 +946,12 @@ func (s *solver) propagate() int {
 // equivalent of decaying every clause's activity individually. If a
 // memory limit was given (STAGE12.md) and the database's estimated
 // size has grown past it, reduceClauseDatabase is triggered.
+//
+// Finally (STAGE20.md/STAGE21.md's Option B), if this solver is part
+// of a parallel run (s.peers != nil), maybeImport gives it a chance to
+// pull in clauses other threads have learned -- once per conflict is
+// the natural point to check, since it's already the point where this
+// thread's own local database just changed shape.
 func (s *solver) learnAndBackjump(confl int) {
 	learned, backtrackLevel := s.analyze(confl)
 	s.backtrackTo(backtrackLevel)
@@ -765,6 +979,8 @@ func (s *solver) learnAndBackjump(confl int) {
 	if s.memoryLimitBytes != nil && s.estimatedBytes > *s.memoryLimitBytes {
 		s.reduceClauseDatabase()
 	}
+
+	s.maybeImport()
 }
 
 // maybeRestart implements STAGE15.md's restart schedules (see the
@@ -1020,9 +1236,23 @@ func (s *solver) backtrackTo(level int) {
 // fact, exactly like a variable fixed by the bootstrap unit
 // propagation in newSolver. Returns the new clause's index, or
 // noReason if none was stored.
+//
+// STAGE20.md/STAGE21.md's Option B: if this solver is part of a
+// parallel run (s.export != nil) and learned is short enough to
+// qualify (see exportMaxClauseLen -- ManySAT's own convention is
+// length <= 8), it is published to this thread's export buffer here,
+// continuously, the moment it's learned -- not batched to some later
+// point -- which is the whole reason RunParallel doesn't need any
+// restart synchronization across workers at all. Unit clauses
+// (returned above, before ever reaching here) are not shared; see
+// exportMaxClauseLen's doc comment for why that's a deliberate,
+// documented simplification rather than an oversight.
 func (s *solver) addLearnedClause(learned cnf.Clause) int {
 	if len(learned) == 1 {
 		return noReason
+	}
+	if s.export != nil && len(learned) <= exportMaxClauseLen {
+		s.export.publish(learned)
 	}
 
 	idx := len(s.clauses)
@@ -1173,6 +1403,13 @@ func describeParams(timeLimit *time.Duration, variant SelectVarVariant, restartS
 		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
 	}
 	return description
+}
+
+// describeParallelParams is describeParams, extended with the worker
+// count, for RunParallel's "cdcl: ..." announcement (STAGE20.md/
+// STAGE21.md), matching dfs.describeParallelParams's identical role.
+func describeParallelParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, numThreads int) string {
+	return fmt.Sprintf("num_threads=%d %s", numThreads, describeParams(timeLimit, variant, restartStrategy))
 }
 
 // describeMemoryLimit formats an optional STAGE12.md memory limit for

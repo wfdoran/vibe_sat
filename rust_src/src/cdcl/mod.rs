@@ -122,15 +122,33 @@
 //! `POLYNOMIAL_BASE_CONFLICTS`/`GEOMETRIC_BASE_CONFLICTS` and
 //! `GEOMETRIC_GROWTH_FACTOR` for how each schedule's scale constant(s)
 //! were chosen.
+//!
+//! STAGE20.md/STAGE21.md add multithreading: [`run_parallel`]
+//! implements Option B of `reports/REPORT20.md` (a continuously
+//! shared clause pool; every worker otherwise runs the ordinary
+//! single-threaded search, independently, over the *complete*
+//! original problem -- no divide-and-conquer, no work
+//! redistribution). See [`run_parallel`]'s own doc comment, and
+//! [`clause_share`] for the lock-free clause-sharing mechanism.
+//! STAGE21.md also adds a fourth [`RestartStrategy`],
+//! `RestartStrategy::RoundRobin`, so that a multithreaded run's
+//! workers don't all race with the identical restart cadence; see
+//! its own doc comment and [`resolve_restart_strategy`].
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, RngExt, SeedableRng};
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
 use crate::dfs::{select_var, select_var_fast_pick};
 use crate::occurrence::{self, Lists};
 use crate::preprocess;
+
+mod clause_share;
+use clause_share::ExportBuffer;
 
 /// Identifies which heuristic [`run`] should use to pick the next
 /// branching variable. `Weighted`/`Fast` match
@@ -178,6 +196,55 @@ pub enum RestartStrategy {
     /// `GEOMETRIC_GROWTH_FACTOR` between consecutive restart
     /// intervals, scaled by `GEOMETRIC_BASE_CONFLICTS`.
     Geometric,
+    /// STAGE21.md's addition, meaningful only as a value
+    /// [`run_parallel`]/[`run`] resolve away before ever calling
+    /// [`run_loop`] -- `run_loop`'s own `restart_strategy` parameter
+    /// is never `RoundRobin`, and `restart_threshold` never needs to
+    /// handle it. It means: worker i uses
+    /// `ROUND_ROBIN_STRATEGIES[i % 3]` (quadratic, geometric, Luby,
+    /// quadratic, ... -- see [`resolve_restart_strategy`]), so each of
+    /// the three strategies runs on as close to an equal share of
+    /// workers as `num_threads` allows, rather than every worker
+    /// racing with the identical restart cadence.
+    RoundRobin,
+}
+
+/// [`RestartStrategy::RoundRobin`]'s resolution order (see
+/// [`resolve_restart_strategy`]): worker 0 uses quadratic
+/// (`Polynomial`), worker 1 geometric, worker 2 Luby, worker 3 cycles
+/// back to quadratic, and so on. Assigning by spawn-order index -- a
+/// plain `usize` [`run_parallel`] already hands every worker thread,
+/// the same way Stage 17/18's winner index and per-worker sub-RNG
+/// already are -- gives an exactly even split with no extra
+/// bookkeeping, which is why this doesn't fall back to randomizing
+/// among the three (something STAGE21.md allowed for in case a
+/// deterministic per-thread index turned out to be awkward to get at;
+/// it isn't, in either language).
+const ROUND_ROBIN_STRATEGIES: [RestartStrategy; 3] = [
+    RestartStrategy::Polynomial,
+    RestartStrategy::Geometric,
+    RestartStrategy::Luby,
+];
+
+/// Returns the concrete restart strategy worker `thread_index` should
+/// actually use: `restart_strategy` unchanged, unless it is
+/// `RestartStrategy::RoundRobin`, in which case it resolves to
+/// `ROUND_ROBIN_STRATEGIES[thread_index % 3]`. Called with
+/// `thread_index` 0 for [`run`] (so an explicit `--alg-params`
+/// restart=4 with `--num-threads=1` still behaves sensibly -- it
+/// resolves to the same `Polynomial` worker 0 of a round-robin
+/// `run_parallel` run would get, rather than being silently
+/// mishandled) and with each of `run_parallel`'s workers' own spawn
+/// index.
+fn resolve_restart_strategy(
+    restart_strategy: RestartStrategy,
+    thread_index: usize,
+) -> RestartStrategy {
+    if restart_strategy == RestartStrategy::RoundRobin {
+        ROUND_ROBIN_STRATEGIES[thread_index % 3]
+    } else {
+        restart_strategy
+    }
 }
 
 /// `LUBY_BASE_CONFLICTS` and `POLYNOMIAL_BASE_CONFLICTS` are
@@ -284,6 +351,10 @@ fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) ->
                 as usize
         }
         RestartStrategy::None => 0, // never actually consulted (see maybe_restart)
+        // Never actually reaches a real solver: run/run_parallel
+        // resolve RoundRobin away via resolve_restart_strategy before
+        // any restart_threshold call is possible with it.
+        RestartStrategy::RoundRobin => 0,
     }
 }
 
@@ -470,8 +541,13 @@ pub struct SolveResult {
     /// Number of conflicts encountered (= number of clauses learned).
     #[allow(dead_code)]
     pub num_conflicts: usize,
-    /// True if the search was abandoned due to the time limit, rather
-    /// than exhausting the search space.
+    /// True if the search was abandoned before reaching a verdict,
+    /// rather than exhausting the search space: either the time limit
+    /// was reached, or (`run_parallel` only, STAGE20.md/STAGE21.md's
+    /// Option B) another worker already reached a genuine verdict
+    /// first and this one gave up early rather than duplicate work
+    /// nobody needs anymore. `satisfiable`/`assignment` are
+    /// meaningless whenever this is true.
     #[allow(dead_code)]
     pub timed_out: bool,
 }
@@ -479,10 +555,221 @@ pub struct SolveResult {
 /// Performs a CDCL search: repeatedly propagate, and on a conflict,
 /// learn a clause and backjump; on reaching a fixpoint with no
 /// conflict, either the assignment is complete (satisfiable) or a new
-/// variable is chosen to branch on (a decision, always tried `False`
-/// first -- see the decision step below). If propagation ever
-/// conflicts while at decision level 0 (nothing left to backjump to),
-/// the problem is proven unsatisfiable.
+/// variable is chosen to branch on. If propagation ever conflicts
+/// while at decision level 0 (nothing left to backjump to), the
+/// problem is proven unsatisfiable. See [`run_loop`]'s doc comment
+/// for what every parameter here means -- `run` is a thin wrapper
+/// (prints the "cdcl: ..." announcement and final verdict) around it,
+/// matching Stage 17/18's identical `run`/`run_loop` split; the only
+/// difference from calling `run_loop` directly is that `verbose`
+/// controls progress output here.
+#[allow(clippy::too_many_arguments)]
+pub fn run<R: Rng>(
+    problem: &Problem,
+    time_limit: Option<Duration>,
+    variant: SelectVarVariant,
+    restart_strategy: RestartStrategy,
+    memory_limit_bytes: Option<i64>,
+    rng: &mut R,
+    verbose: i32,
+) -> SolveResult {
+    if verbose >= 1 {
+        println!(
+            "cdcl: {}{}",
+            describe_params(time_limit, variant, restart_strategy),
+            describe_memory_limit(memory_limit_bytes)
+        );
+    }
+    let result = run_loop(
+        problem,
+        time_limit,
+        variant,
+        resolve_restart_strategy(restart_strategy, 0),
+        memory_limit_bytes,
+        rng,
+        None,
+        None,
+        &[],
+    );
+    if verbose >= 1 {
+        println!("{}", verdict(&result));
+    }
+    result
+}
+
+/// Runs the same search as [`run`], split across `num_threads`
+/// concurrent workers implementing STAGE20.md/STAGE21.md's Option B:
+/// every worker independently runs the ordinary single-threaded
+/// search over the *complete* original problem -- no divide-and-
+/// conquer, no work redistribution, nothing shared between workers
+/// except learned clauses (see [`clause_share`]) -- so unlike `dfs`'s
+/// parallel search (STAGE18.md), any single worker's own verdict, SAT
+/// or UNSAT, is already the authoritative answer for the whole
+/// problem the moment it's reached; there is no termination-detection
+/// protocol to build here at all, only the same CAS-based
+/// single-winner shutdown Stage 17/18 already established.
+///
+/// `num_threads <= 1` delegates straight to [`run`], with `rng` used
+/// exactly as it always has been, so behavior is bit-for-bit
+/// identical to calling `run` directly whenever multithreading isn't
+/// in use, matching the same guarantee Stage 17/18 established for
+/// the parallel hillclimb/walksat/dfs entry points.
+///
+/// `restart_strategy` is resolved per worker via
+/// [`resolve_restart_strategy`]: `RestartStrategy::RoundRobin`
+/// (STAGE21.md) assigns worker i `ROUND_ROBIN_STRATEGIES[i % 3]` (an
+/// even split of quadratic/geometric/Luby across the workers); any
+/// other explicit strategy, including `RestartStrategy::None`, is
+/// used unchanged by every worker. Per STAGE21.md, callers (see
+/// `main.rs`'s `run_cdcl`) are expected to pass `RoundRobin` as the
+/// default restart strategy whenever `num_threads > 1` and the caller
+/// didn't explicitly ask for something else, and whatever was
+/// explicitly asked for otherwise -- that policy lives in `main.rs`,
+/// not here.
+///
+/// `rng` is used, before any worker starts, to derive one independent
+/// sub-generator per worker (matching Stage 17/18's identical
+/// pattern), so the overall result is fully reproducible given
+/// (`rng`'s state, `num_threads`) even though which worker's answer
+/// wins a race to a verdict is not. `num_decisions`/`num_conflicts`
+/// are summed across every worker, win or lose, matching Stage 18's
+/// `num_nodes` convention.
+#[allow(clippy::too_many_arguments)]
+pub fn run_parallel<R: Rng>(
+    problem: &Problem,
+    time_limit: Option<Duration>,
+    variant: SelectVarVariant,
+    restart_strategy: RestartStrategy,
+    memory_limit_bytes: Option<i64>,
+    num_threads: usize,
+    rng: &mut R,
+    verbose: i32,
+) -> SolveResult {
+    if num_threads <= 1 {
+        return run(
+            problem,
+            time_limit,
+            variant,
+            restart_strategy,
+            memory_limit_bytes,
+            rng,
+            verbose,
+        );
+    }
+
+    if verbose >= 1 {
+        println!(
+            "cdcl: {}{}",
+            describe_parallel_params(time_limit, variant, restart_strategy, num_threads),
+            describe_memory_limit(memory_limit_bytes)
+        );
+    }
+
+    let export_buffers: Vec<ExportBuffer> = (0..num_threads)
+        .map(|_| ExportBuffer::new(clause_share::EXPORT_BUFFER_CAPACITY))
+        .collect();
+    // peers_for_worker[i] is every OTHER worker's export buffer --
+    // this worker's own is deliberately excluded, matching dfs's
+    // shuffled_peers convention of never stealing from/importing
+    // one's own outbox.
+    let peers_for_worker: Vec<Vec<&ExportBuffer>> = (0..num_threads)
+        .map(|i| {
+            export_buffers
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, b)| b)
+                .collect()
+        })
+        .collect();
+    let mut sub_rngs: Vec<StdRng> = (0..num_threads)
+        .map(|_| StdRng::seed_from_u64(rng.random::<u64>()))
+        .collect();
+
+    let stop = AtomicBool::new(false);
+    let winner = AtomicI32::new(-1);
+
+    let mut results: Vec<SolveResult> = Vec::new();
+    thread::scope(|scope| {
+        let handles: Vec<_> = sub_rngs
+            .iter_mut()
+            .enumerate()
+            .map(|(i, sub_rng)| {
+                let export = &export_buffers[i];
+                let peers = &peers_for_worker[i];
+                let stop = &stop;
+                let winner = &winner;
+                let thread_strategy = resolve_restart_strategy(restart_strategy, i);
+
+                scope.spawn(move || {
+                    // The winner CAS must happen here, inside this
+                    // worker's own thread, immediately after run_loop
+                    // returns -- not deferred to after every thread
+                    // has already been joined -- exactly matching
+                    // dfs::run_parallel's identical structure and the
+                    // reasoning documented there (Stage 18).
+                    let result = run_loop(
+                        problem,
+                        time_limit,
+                        variant,
+                        thread_strategy,
+                        memory_limit_bytes,
+                        sub_rng,
+                        Some(stop),
+                        Some(export),
+                        peers,
+                    );
+                    if !result.timed_out
+                        && stop
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        winner.store(i as i32, Ordering::SeqCst);
+                    }
+                    result
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            results.push(handle.join().expect("cdcl worker thread panicked"));
+        }
+    });
+
+    let mut final_result = SolveResult {
+        satisfiable: false,
+        assignment: assignment::new(0),
+        num_decisions: 0,
+        num_conflicts: 0,
+        timed_out: false,
+    };
+    for r in &results {
+        final_result.num_decisions += r.num_decisions;
+        final_result.num_conflicts += r.num_conflicts;
+    }
+    match winner.load(Ordering::SeqCst) {
+        idx if idx >= 0 => {
+            let w = &results[idx as usize];
+            final_result.satisfiable = w.satisfiable;
+            final_result.assignment = w.assignment.clone();
+        }
+        _ => final_result.timed_out = true,
+    }
+
+    if verbose >= 1 {
+        println!("{}", verdict(&final_result));
+    }
+    final_result
+}
+
+/// [`run`]'s (and each of [`run_parallel`]'s workers') search loop,
+/// without the "cdcl: ..."/"SAT"/"UNSAT"/"UNKNOWN" announcements --
+/// those are the caller's responsibility (`run` prints its own;
+/// `run_parallel` prints one combined announcement/verdict for the
+/// whole parallel search instead of one per worker), matching Stage
+/// 17/18's identical `run_loop`/`dfs_worker` pattern. `stop`/`export`
+/// are `None` and `peers` is empty for `run`'s own single-threaded
+/// call; see [`clause_share`] for what each does.
 ///
 /// `variant` selects which heuristic is used to pick the branching
 /// variable at every decision (see [`SelectVarVariant`]); per
@@ -531,35 +818,25 @@ pub struct SolveResult {
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
 /// once it is exceeded, checked only periodically (see
 /// [`TIME_CHECK_INTERVAL`]). `rng` supplies the randomness
-/// `SelectVarVariant::Weighted` uses to break ties, and `verbose`
-/// controls progress output, matching [`crate::dfs::run`].
+/// `SelectVarVariant::Weighted` uses to break ties.
 #[allow(clippy::too_many_arguments)]
-pub fn run<R: Rng>(
+fn run_loop<R: Rng>(
     problem: &Problem,
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
     restart_strategy: RestartStrategy,
     memory_limit_bytes: Option<i64>,
     rng: &mut R,
-    verbose: i32,
+    stop: Option<&AtomicBool>,
+    export: Option<&ExportBuffer>,
+    peers: &[&ExportBuffer],
 ) -> SolveResult {
-    if verbose >= 1 {
-        println!(
-            "cdcl: {}{}",
-            describe_params(time_limit, variant, restart_strategy),
-            describe_memory_limit(memory_limit_bytes)
-        );
-    }
-
     // A problem with no variables can only contain empty clauses (no
     // literal can reference a variable beyond num_vars), each of
     // which is unsatisfiable by construction; guard this degenerate
     // case explicitly, matching dfs::run.
     if problem.num_vars == 0 {
         let satisfiable = problem.clauses.is_empty();
-        if verbose >= 1 {
-            println!("{}", if satisfiable { "SAT" } else { "UNSAT" });
-        }
         return SolveResult {
             satisfiable,
             assignment: assignment::new(0),
@@ -570,9 +847,6 @@ pub fn run<R: Rng>(
     }
 
     let Some((mut working_problem, mut watch, mut x)) = bootstrap(problem) else {
-        if verbose >= 1 {
-            println!("UNSAT");
-        }
         return SolveResult {
             satisfiable: false,
             assignment: assignment::new(problem.num_vars),
@@ -582,6 +856,7 @@ pub fn run<R: Rng>(
         };
     };
 
+    let mut peer_cursors = vec![0u64; peers.len()];
     let mut lists = occurrence::build(&working_problem);
     let mut level = vec![0usize; problem.num_vars + 1];
     let mut reason: Vec<Option<usize>> = vec![None; problem.num_vars + 1];
@@ -627,13 +902,21 @@ pub fn run<R: Rng>(
 
     loop {
         step += 1;
+        if let Some(s) = stop
+            && s.load(Ordering::SeqCst)
+        {
+            return SolveResult {
+                satisfiable: false,
+                assignment: assignment::new(problem.num_vars),
+                num_decisions,
+                num_conflicts,
+                timed_out: true,
+            };
+        }
         if let Some(limit) = time_limit
             && step & TIME_CHECK_INTERVAL == 0
             && start_time.elapsed() >= limit
         {
-            if verbose >= 1 {
-                println!("UNKNOWN");
-            }
             return SolveResult {
                 satisfiable: false,
                 assignment: assignment::new(problem.num_vars),
@@ -661,9 +944,6 @@ pub fn run<R: Rng>(
         if let Some(c) = confl {
             num_conflicts += 1;
             if current_level == 0 {
-                if verbose >= 1 {
-                    println!("UNSAT");
-                }
                 return SolveResult {
                     satisfiable: false,
                     assignment: assignment::new(problem.num_vars),
@@ -710,6 +990,20 @@ pub fn run<R: Rng>(
                 &mut clause_activity,
                 &mut estimated_bytes,
             );
+            // STAGE20.md/STAGE21.md's Option B: publish learned to
+            // this thread's export buffer, continuously, the moment
+            // it's learned -- not batched to some later point -- if
+            // it qualifies (see clause_share::EXPORT_MAX_CLAUSE_LEN)
+            // and this run is actually part of a parallel run
+            // (export is Some). new_clause is None for a unit
+            // learned clause (length 1), which is never shared; see
+            // EXPORT_MAX_CLAUSE_LEN's doc comment for why.
+            if let Some(export) = export
+                && new_clause.is_some()
+                && learned.len() <= clause_share::EXPORT_MAX_CLAUSE_LEN
+            {
+                export.publish(&learned);
+            }
             assign_literal(
                 learned[0],
                 backtrack_level,
@@ -759,6 +1053,24 @@ pub fn run<R: Rng>(
                 );
             }
 
+            // STAGE20.md/STAGE21.md's Option B: give this thread a
+            // chance to pull in clauses other threads have learned --
+            // a no-op whenever peers is empty (every single-threaded
+            // call). Once per conflict is the natural point to check,
+            // since it's already the point where this thread's own
+            // local database just changed shape.
+            clause_share::maybe_import(
+                peers,
+                &mut peer_cursors,
+                num_conflicts,
+                &mut working_problem.clauses,
+                &mut lists,
+                &mut watch,
+                &x,
+                &mut clause_activity,
+                &mut estimated_bytes,
+            );
+
             conflicts_since_restart += 1;
             maybe_restart(
                 restart_strategy,
@@ -778,9 +1090,6 @@ pub fn run<R: Rng>(
         }
 
         if !x[1..].contains(&Value::Unassigned) {
-            if verbose >= 1 {
-                println!("SAT");
-            }
             return SolveResult {
                 satisfiable: true,
                 assignment: x,
@@ -1389,6 +1698,7 @@ fn describe_params(
         RestartStrategy::Luby => 1,
         RestartStrategy::Polynomial => 2,
         RestartStrategy::Geometric => 3,
+        RestartStrategy::RoundRobin => 4,
     };
     match time_limit {
         Some(limit) => format!(
@@ -1399,12 +1709,40 @@ fn describe_params(
     }
 }
 
+/// [`describe_params`], extended with the worker count, for
+/// [`run_parallel`]'s "cdcl: ..." announcement (STAGE20.md/
+/// STAGE21.md), matching `dfs`'s identical
+/// `describe_parallel_params`.
+fn describe_parallel_params(
+    time_limit: Option<Duration>,
+    variant: SelectVarVariant,
+    restart_strategy: RestartStrategy,
+    num_threads: usize,
+) -> String {
+    format!(
+        "num_threads={num_threads} {}",
+        describe_params(time_limit, variant, restart_strategy)
+    )
+}
+
 /// Formats an optional STAGE12.md memory limit for the "cdcl:"
 /// announcement printed at verbose level 1, in bytes.
 fn describe_memory_limit(memory_limit_bytes: Option<i64>) -> String {
     match memory_limit_bytes {
         Some(limit) => format!(" memory_limit_bytes={limit}"),
         None => String::new(),
+    }
+}
+
+/// Formats a [`SolveResult`]'s outcome for the "SAT"/"UNSAT"/
+/// "UNKNOWN" line [`run`]/[`run_parallel`] print at verbose >= 1.
+fn verdict(result: &SolveResult) -> &'static str {
+    if result.timed_out {
+        "UNKNOWN"
+    } else if result.satisfiable {
+        "SAT"
+    } else {
+        "UNSAT"
     }
 }
 
@@ -2593,5 +2931,284 @@ mod tests {
             "expected timed_out = true with a 1ns time limit"
         );
         assert!(!result.satisfiable);
+    }
+
+    /// Verifies STAGE20.md/STAGE21.md's compatibility guarantee:
+    /// `run_parallel(..., 1, ...)` is bit-for-bit identical to calling
+    /// `run` directly, matching Stage 17/18's identical guarantee for
+    /// hillclimb/walksat/dfs.
+    #[test]
+    fn test_run_parallel_with_one_thread_matches_run() {
+        let problem = pigeonhole_problem(4, 3);
+
+        let mut rng1 = StdRng::seed_from_u64(7);
+        let want = run(
+            &problem,
+            None,
+            SelectVarVariant::Vsids,
+            RestartStrategy::Polynomial,
+            None,
+            &mut rng1,
+            0,
+        );
+
+        let mut rng2 = StdRng::seed_from_u64(7);
+        let got = run_parallel(
+            &problem,
+            None,
+            SelectVarVariant::Vsids,
+            RestartStrategy::Polynomial,
+            None,
+            1,
+            &mut rng2,
+            0,
+        );
+
+        assert_eq!(got.satisfiable, want.satisfiable);
+        assert_eq!(got.num_decisions, want.num_decisions);
+        assert_eq!(got.num_conflicts, want.num_conflicts);
+    }
+
+    /// Verifies a satisfiable formula is solved correctly across
+    /// several thread counts, and that the returned assignment
+    /// genuinely satisfies every clause.
+    #[test]
+    fn test_run_parallel_finds_satisfiable_formula() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
+        };
+
+        for num_threads in [2, 4, 8, 32] {
+            let mut rng = StdRng::seed_from_u64(num_threads as u64);
+            let result = run_parallel(
+                &problem,
+                None,
+                SelectVarVariant::Vsids,
+                RestartStrategy::RoundRobin,
+                None,
+                num_threads,
+                &mut rng,
+                0,
+            );
+            assert!(
+                result.satisfiable,
+                "num_threads={num_threads}: expected satisfiable"
+            );
+            assert!(!result.timed_out, "num_threads={num_threads}");
+            for (ci, clause) in problem.clauses.iter().enumerate() {
+                let satisfied = clause.iter().any(|&lit| {
+                    let v = cnf::literal_var(lit);
+                    let value = result.assignment[v];
+                    if cnf::literal_is_negative(lit) {
+                        value == Value::False
+                    } else {
+                        value == Value::True
+                    }
+                });
+                assert!(
+                    satisfied,
+                    "num_threads={num_threads}: clause {ci} ({clause:?}) not satisfied by {:?}",
+                    result.assignment
+                );
+            }
+        }
+    }
+
+    /// Verifies an unsatisfiable formula is correctly proven UNSAT
+    /// across several thread counts -- unlike dfs's parallel search,
+    /// every worker here covers the *whole* problem, so any single
+    /// worker reaching UNSAT is already authoritative.
+    #[test]
+    fn test_run_parallel_proves_unsatisfiable_pigeonhole() {
+        let problem = pigeonhole_problem(4, 3);
+
+        for num_threads in [2, 4, 8, 16] {
+            let mut rng = StdRng::seed_from_u64(9 + num_threads as u64);
+            let result = run_parallel(
+                &problem,
+                None,
+                SelectVarVariant::Vsids,
+                RestartStrategy::RoundRobin,
+                None,
+                num_threads,
+                &mut rng,
+                0,
+            );
+            assert!(
+                !result.satisfiable,
+                "num_threads={num_threads}: expected unsatisfiable"
+            );
+            assert!(!result.timed_out, "num_threads={num_threads}");
+        }
+    }
+
+    /// Exercises a harder instance (6 pigeons, 5 holes) at a large
+    /// thread count, matching Stage 18's equivalent "does this
+    /// actually scale" check.
+    #[test]
+    fn test_run_parallel_proves_unsatisfiable_larger_pigeonhole() {
+        let problem = pigeonhole_problem(6, 5);
+        let mut rng = StdRng::seed_from_u64(11);
+
+        let result = run_parallel(
+            &problem,
+            None,
+            SelectVarVariant::Vsids,
+            RestartStrategy::RoundRobin,
+            None,
+            64,
+            &mut rng,
+            0,
+        );
+
+        assert!(!result.satisfiable);
+        assert!(!result.timed_out);
+    }
+
+    /// Verifies that a hard instance with a very short time limit
+    /// reports `timed_out` rather than hanging or silently reporting
+    /// an incorrect verdict.
+    #[test]
+    fn test_run_parallel_respects_time_limit() {
+        let problem = pigeonhole_problem(9, 8);
+        let mut rng = StdRng::seed_from_u64(3);
+        let tiny = Duration::from_nanos(1);
+
+        let result = run_parallel(
+            &problem,
+            Some(tiny),
+            SelectVarVariant::Vsids,
+            RestartStrategy::RoundRobin,
+            None,
+            8,
+            &mut rng,
+            0,
+        );
+
+        assert!(result.timed_out);
+        assert!(!result.satisfiable);
+    }
+
+    /// Runs many trials of a satisfiable formula at a high thread
+    /// count and checks every result is a genuine, independently
+    /// verified satisfying assignment -- i.e. the single-winner CAS
+    /// protocol never lets a stale/aborted worker's result leak
+    /// through as the final answer.
+    #[test]
+    fn test_run_parallel_reports_exactly_one_winner() {
+        let problem = Problem {
+            num_vars: 5,
+            clauses: vec![
+                vec![1, 2],
+                vec![-1, 3],
+                vec![-2, 4],
+                vec![-3, 5],
+                vec![-4, -5],
+            ],
+        };
+
+        for trial in 0..20u64 {
+            let mut rng = StdRng::seed_from_u64(trial);
+            let result = run_parallel(
+                &problem,
+                None,
+                SelectVarVariant::Vsids,
+                RestartStrategy::RoundRobin,
+                None,
+                16,
+                &mut rng,
+                0,
+            );
+            assert!(result.satisfiable, "trial {trial}: expected satisfiable");
+            for (ci, clause) in problem.clauses.iter().enumerate() {
+                let satisfied = clause.iter().any(|&lit| {
+                    let v = cnf::literal_var(lit);
+                    let value = result.assignment[v];
+                    if cnf::literal_is_negative(lit) {
+                        value == Value::False
+                    } else {
+                        value == Value::True
+                    }
+                });
+                assert!(
+                    satisfied,
+                    "trial {trial}: clause {ci} ({clause:?}) not satisfied"
+                );
+            }
+        }
+    }
+
+    /// Verifies the round-robin resolution order STAGE21.md
+    /// specifies: worker 0 quadratic, worker 1 geometric, worker 2
+    /// Luby, then repeating.
+    #[test]
+    fn test_resolve_restart_strategy_round_robin() {
+        let want = [
+            RestartStrategy::Polynomial,
+            RestartStrategy::Geometric,
+            RestartStrategy::Luby,
+            RestartStrategy::Polynomial,
+            RestartStrategy::Geometric,
+            RestartStrategy::Luby,
+            RestartStrategy::Polynomial,
+        ];
+        for (i, &w) in want.iter().enumerate() {
+            assert_eq!(resolve_restart_strategy(RestartStrategy::RoundRobin, i), w);
+        }
+    }
+
+    /// Verifies that any explicit (non-round-robin) restart strategy,
+    /// including `RestartStrategy::None`, is returned unchanged
+    /// regardless of thread index -- STAGE21.md: "If the user
+    /// explicitly sets a different restart strategy, even 0, all
+    /// threads will use that."
+    #[test]
+    fn test_resolve_restart_strategy_passes_explicit_value_through() {
+        for strategy in [
+            RestartStrategy::None,
+            RestartStrategy::Luby,
+            RestartStrategy::Polynomial,
+            RestartStrategy::Geometric,
+        ] {
+            for thread_index in [0, 1, 2, 5, 127] {
+                assert_eq!(resolve_restart_strategy(strategy, thread_index), strategy);
+            }
+        }
+    }
+
+    /// Verifies the basic single-slot round-trip: a clause published
+    /// at some index can be read back with its literals intact.
+    #[test]
+    fn test_export_buffer_publish_and_try_read() {
+        let buf = clause_share::ExportBuffer::new(4);
+        buf.publish(&vec![1, -2, 3]);
+
+        let got = buf
+            .try_read(0)
+            .expect("expected Some immediately after publish");
+        assert_eq!(got, vec![1, -2, 3]);
+    }
+
+    /// Verifies that reading a never-written slot reports `None`
+    /// rather than a zero-value clause.
+    #[test]
+    fn test_export_buffer_try_read_fails_before_any_publish() {
+        let buf = clause_share::ExportBuffer::new(4);
+        assert_eq!(buf.try_read(0), None);
+    }
+
+    /// Verifies that `publish` copies the literal slice rather than
+    /// aliasing the caller's, so a caller mutating its own slice
+    /// afterward can't corrupt an already-published clause.
+    #[test]
+    fn test_export_buffer_publish_owns_its_data() {
+        let buf = clause_share::ExportBuffer::new(4);
+        let mut lits = vec![1, 2, 3];
+        buf.publish(&lits);
+        lits[0] = 99;
+
+        let got = buf.try_read(0).expect("expected Some");
+        assert_eq!(got[0], 1, "publish must not alias the caller's slice");
     }
 }

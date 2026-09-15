@@ -281,13 +281,21 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 
 	// STAGE15.md leaves the default restart strategy up to this
 	// implementation too; see cdcl.Run's doc comment for why it's
-	// RestartPolynomial.
+	// RestartPolynomial with a single thread. STAGE21.md changes the
+	// default, but only the default -- an explicit --alg-params
+	// restart value, even 0, always wins regardless of --num-threads --
+	// once --num-threads > 1: cdcl.RestartRoundRobin, which spreads
+	// quadratic/geometric/Luby evenly across the workers rather than
+	// racing every worker with the identical restart cadence (see
+	// cdcl.RunParallel's doc comment).
 	restartStrategy := cdcl.RestartPolynomial
 	if len(args.AlgParams) >= 2 {
 		restartStrategy = cdcl.RestartStrategy(args.AlgParams[1])
+	} else if args.NumThreads > 1 {
+		restartStrategy = cdcl.RestartRoundRobin
 	}
 
-	result := cdcl.Run(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, rng, args.Verbose)
+	result := cdcl.RunParallel(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, args.NumThreads, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)
