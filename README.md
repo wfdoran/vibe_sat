@@ -79,3 +79,15 @@ attempt at a completely vibe code project.
 
 The sample benchmark problems were taken from the
 [SATLIB Benchmark Problems](https://www.cs.ubc.ca/~hoos/SATLIB/benchm.html) page.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the
+full license text.
+
+## Warranty
+
+This software is provided "as is", without warranty of any kind, express or
+implied. See the LICENSE file for the complete warranty disclaimer.
+
+
