@@ -26,6 +26,23 @@ files for the same feature). `reports/REPORTx.md` documents what was
 done, any issues encountered, and any judgment calls made, for each
 corresponding stage.
 
+## Documentation
+
+- [**Usage**](docs/usage.md) — the full command line reference, a
+  nicely formatted version of `vibe_sat --help`.
+- [**Sample runs**](docs/sample-runs.md) — worked examples using files
+  from `benchmark/`, from the simplest possible invocation up through
+  multi-threading and preprocessing.
+- [**Background**](docs/background.md) — how each algorithm actually
+  works (DFS/DPLL, CDCL, WalkSAT, preprocessing, restarts,
+  non-chronological backtracking, the two very different
+  multi-threading designs `dfs` and `cdcl` use), this project's
+  testing methodology, and what the Go-vs-Rust comparison actually
+  found.
+- [**References**](docs/references.md) — the papers that shaped
+  specific design decisions, and which report each one is discussed
+  in.
+
 ## Building both `vibe_sat`s
 
 ### Go
@@ -70,6 +87,7 @@ cargo test
 /rust_src    Rust source code
 /reports     REPORTx.md write-ups, one per stage
 /benchmark   sample DIMACS CNF problems used for testing
+/docs        usage reference, sample runs, background, and references (see below)
 ```
 
 ## Credit
