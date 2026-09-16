@@ -881,6 +881,28 @@ func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 // the trail is exhausted (no conflict: returns noReason) or some
 // clause becomes fully falsified, in which case that clause's index
 // is returned as the conflict.
+//
+// STAGE23.md: profiling (see reports/REPORT23.md) found this loop
+// responsible for ~98% of total CPU time on a hard benchmark
+// instance, with chooseWatch's linear scan for a replacement watch
+// alone accounting for roughly 45% of it -- unsurprising, since this
+// is the innermost loop of the whole algorithm. One candidate fix was
+// tried and rejected: MiniSat-lineage solvers check whether the
+// *other* watched literal is already true before ever scanning the
+// clause for a new watch, skipping the scan entirely when it is,
+// since a clause satisfied via a true literal needs no attention
+// until some future backtrack. Measured here, this made things
+// worse, not better (27.0s -> ~29.6s on the same hard instance
+// profiled above), reproducibly. The likely reason: this project's
+// benchmark clauses are mostly length 3 (uniform random 3-SAT), so
+// chooseWatch's "expensive" scan is already down to checking a
+// single remaining literal -- there is very little for the added
+// check to skip, and it costs a real branch and an extra
+// Literal.Var() call on every single candidate, on every single call,
+// whether or not it ever pays off. See reports/REPORT23.md for the
+// full profile comparison and why this is left as a "bigger possible
+// change" (worth revisiting conditionally, e.g. only for longer
+// learned/imported clauses) rather than applied outright.
 func (s *solver) propagate() int {
 	for s.qHead < len(s.trail) {
 		v := s.trail[s.qHead]
@@ -899,21 +921,18 @@ func (s *solver) propagate() int {
 		for _, c := range candidates {
 			watch := &s.watch[c]
 			var otherWatch cnf.Literal
+			var falsifiedSlot int
 			switch {
 			case watch[0] == falsifiedLiteral:
-				otherWatch = watch[1]
+				otherWatch, falsifiedSlot = watch[1], 0
 			case watch[1] == falsifiedLiteral:
-				otherWatch = watch[0]
+				otherWatch, falsifiedSlot = watch[0], 1
 			default:
 				continue // this clause isn't watching the falsified literal
 			}
 
 			if replacement, found := chooseWatch(s.clauses[c], s.x, otherWatch); found {
-				if watch[0] == falsifiedLiteral {
-					watch[0] = replacement
-				} else {
-					watch[1] = replacement
-				}
+				watch[falsifiedSlot] = replacement
 				continue
 			}
 

@@ -1220,6 +1220,23 @@ fn assign_literal(
 /// `candidates`) and `watch`/`x`/`trail` (borrowed mutably) never
 /// alias, which it cannot do across a method boundary the way it can
 /// across a plain function's independent parameters.
+///
+/// STAGE23.md: profiling (see `reports/REPORT23.md`) found this loop
+/// responsible for essentially all (~98.6%) of total wall-clock time
+/// on a hard benchmark instance -- the same finding as the Go port's
+/// identical `propagate`, since both implement the same two-watched-
+/// literal algorithm. `falsified_slot` (which of `watch[c]`'s two
+/// entries currently holds `falsified_literal`) is remembered from
+/// the lookup above rather than re-derived with a second `w[0] ==
+/// falsified_literal` comparison when writing a replacement back --
+/// a pure, behavior-preserving simplification, matching the
+/// equivalent fix applied to the Go port. A second, more aggressive
+/// idea (skip `choose_watch`'s scan entirely whenever `other_watch`
+/// is already true) was tried and rejected: measured on this
+/// project's own benchmark instances (mostly length-3 clauses), it
+/// made things reproducibly *worse*, not better -- see
+/// `reports/REPORT23.md` for why, and for why it's listed there as a
+/// possible future change rather than applied here.
 #[allow(clippy::too_many_arguments)]
 fn propagate(
     clauses: &[Clause],
@@ -1247,20 +1264,16 @@ fn propagate(
 
         for &c in candidates {
             let w = watch[c];
-            let other_watch = if w[0] == falsified_literal {
-                w[1]
+            let (other_watch, falsified_slot) = if w[0] == falsified_literal {
+                (w[1], 0)
             } else if w[1] == falsified_literal {
-                w[0]
+                (w[0], 1)
             } else {
                 continue; // this clause isn't watching the falsified literal
             };
 
             if let Some(replacement) = choose_watch(&clauses[c], x, Some(other_watch)) {
-                if w[0] == falsified_literal {
-                    watch[c][0] = replacement;
-                } else {
-                    watch[c][1] = replacement;
-                }
+                watch[c][falsified_slot] = replacement;
                 continue;
             }
 
