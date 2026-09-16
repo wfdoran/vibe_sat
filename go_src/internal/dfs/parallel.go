@@ -217,7 +217,7 @@ func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.
 	deques := make([]*deque, numWorkers)
 	subRands := make([]*rand.Rand, numWorkers)
 	for i, seed := range seeds {
-		deques[i] = &deque{}
+		deques[i] = newDeque()
 		deques[i].pushBottom(seed)
 		subRands[i] = newSubRand(rng)
 	}

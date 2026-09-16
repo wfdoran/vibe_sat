@@ -2,6 +2,7 @@ package dfs
 
 import (
 	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 
@@ -209,7 +210,7 @@ func TestBFSSeedProducesFewerSeedsThanThreadsForASmallTree(t *testing.T) {
 // take from the opposite end (the earliest-pushed item still
 // present), never the same end popBottom would.
 func TestDequePushPopStealAreConsistent(t *testing.T) {
-	d := &deque{}
+	d := newDeque()
 	nodes := make([]searchNode, 3)
 	for i := range nodes {
 		nodes[i] = searchNode{assignment: assign.New(i + 1)}
@@ -234,6 +235,224 @@ func TestDequePushPopStealAreConsistent(t *testing.T) {
 	}
 	if !d.isEmpty() {
 		t.Error("deque should now be empty")
+	}
+}
+
+// TestDequeGrowPreservesOrderAndContents pushes far more nodes than
+// dequeInitialCapacity (forcing several growTo calls) purely
+// sequentially, then confirms every one comes back out via popBottom
+// in exact LIFO order with the right identity (encoded, as in
+// TestDequePushPopStealAreConsistent, by each node's assignment
+// length) -- the simplest possible check that growTo's copy is
+// correct before any concurrency is layered on top. This and the
+// three tests below mirror util/lockfreedeque/go/deque_test.go's own
+// suite, which validated this design (generically) before this
+// STAGE26.md port; see deque.go's package doc comment.
+func TestDequeGrowPreservesOrderAndContents(t *testing.T) {
+	const n = 500 // far more than dequeInitialCapacity (32); forces multiple doublings
+	d := newDeque()
+	for i := 0; i < n; i++ {
+		d.pushBottom(searchNode{assignment: assign.New(i)})
+	}
+	for i := n - 1; i >= 0; i-- {
+		got, ok := d.popBottom()
+		if !ok {
+			t.Fatalf("popBottom() reported empty with %d nodes still expected", i+1)
+		}
+		if len(got.assignment) != i+1 {
+			t.Fatalf("popBottom() returned node %d, want %d", len(got.assignment)-1, i)
+		}
+	}
+	if !d.isEmpty() {
+		t.Error("deque should be empty after popping every pushed node")
+	}
+}
+
+// TestDequeGrowPreservesContentsForStealing is
+// TestDequeGrowPreservesOrderAndContents's counterpart for the other
+// end: push far more than dequeInitialCapacity, then drain entirely
+// via stealTop, confirming FIFO order (oldest first) and that growth
+// didn't corrupt or lose anything reachable from the top.
+func TestDequeGrowPreservesContentsForStealing(t *testing.T) {
+	const n = 500
+	d := newDeque()
+	for i := 0; i < n; i++ {
+		d.pushBottom(searchNode{assignment: assign.New(i)})
+	}
+	for i := 0; i < n; i++ {
+		got, ok := d.stealTop()
+		if !ok {
+			t.Fatalf("stealTop() reported empty with %d nodes still expected", n-i)
+		}
+		if len(got.assignment) != i+1 {
+			t.Fatalf("stealTop() returned node %d, want %d", len(got.assignment)-1, i)
+		}
+	}
+	if !d.isEmpty() {
+		t.Error("deque should be empty after stealing every pushed node")
+	}
+}
+
+// dequeExactlyOnceCollector is a test-only (deliberately not lock-free
+// itself -- it exists purely to observe the deque under test, not to
+// be part of what's under test) recorder used by both concurrent
+// stress tests below: every goroutine reports the identity (assignment
+// length) of each node it successfully removed, and the final check
+// confirms the whole expected set was seen with no duplicates and
+// nothing missing.
+type dequeExactlyOnceCollector struct {
+	mu   sync.Mutex
+	seen map[int]int // node identity -> how many times it was observed
+}
+
+func newDequeExactlyOnceCollector() *dequeExactlyOnceCollector {
+	return &dequeExactlyOnceCollector{seen: make(map[int]int)}
+}
+
+func (c *dequeExactlyOnceCollector) record(node searchNode) {
+	c.mu.Lock()
+	c.seen[len(node.assignment)]++
+	c.mu.Unlock()
+}
+
+// checkExactlyOnce fails t unless every identity in [1, n] was
+// recorded exactly once.
+func (c *dequeExactlyOnceCollector) checkExactlyOnce(t *testing.T, n int) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.seen) != n {
+		t.Errorf("saw %d distinct nodes, want %d", len(c.seen), n)
+	}
+	for i := 1; i <= n; i++ {
+		if got := c.seen[i]; got != 1 {
+			t.Errorf("node %d observed %d times, want exactly 1", i, got)
+		}
+	}
+}
+
+// TestDequeConcurrentOwnerAndThievesExactlyOnce is this file's main
+// deque stress test: one owner goroutine pushes n nodes (interleaved
+// with occasionally popping its own, to exercise popBottom
+// concurrently with stealing too, not just pushBottom), while several
+// thief goroutines hammer stealTop concurrently until the deque
+// drains. Every node removed by anyone (owner's pops, any thief's
+// steals) is recorded; the test then confirms the full set was
+// delivered exactly once each -- no node lost, none duplicated --
+// which is the core correctness property a work-stealing deque must
+// have regardless of how push/pop/steal happen to interleave.
+func TestDequeConcurrentOwnerAndThievesExactlyOnce(t *testing.T) {
+	const n = 20000
+	const numThieves = 8
+
+	d := newDeque()
+	collector := newDequeExactlyOnceCollector()
+	done := make(chan struct{})
+
+	var thieves sync.WaitGroup
+	for th := 0; th < numThieves; th++ {
+		thieves.Add(1)
+		go func(seed uint64) {
+			defer thieves.Done()
+			rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+			for {
+				if node, ok := d.stealTop(); ok {
+					collector.record(node)
+					continue
+				}
+				select {
+				case <-done:
+					if node, ok := d.stealTop(); ok {
+						collector.record(node)
+						continue
+					}
+					return
+				default:
+					if rng.IntN(4) == 0 {
+						time.Sleep(time.Microsecond)
+					}
+				}
+			}
+		}(uint64(th) + 1)
+	}
+
+	rng := rand.New(rand.NewPCG(99, 99))
+	for i := 0; i < n; i++ {
+		d.pushBottom(searchNode{assignment: assign.New(i)})
+		if rng.IntN(3) == 0 {
+			if node, ok := d.popBottom(); ok {
+				collector.record(node)
+			}
+		}
+	}
+	for {
+		node, ok := d.popBottom()
+		if !ok {
+			break
+		}
+		collector.record(node)
+	}
+	close(done)
+	thieves.Wait()
+
+	collector.checkExactlyOnce(t, n)
+}
+
+// TestDequeConcurrentGrowDuringSteals specifically targets the
+// trickiest part of this design (see deque.go's and circularBuffer's
+// doc comments): an owner growing the backing buffer (via pushBottom)
+// while multiple thieves are concurrently stealing, so that some
+// thieves are guaranteed to observe a buffer pointer swap mid-flight.
+// Uses a deliberately tiny fixed workload run many times (rather than
+// one huge run) to maximize how often a steal's buf load and its
+// subsequent CAS straddle a concurrent growTo.
+func TestDequeConcurrentGrowDuringSteals(t *testing.T) {
+	const nodesPerRound = 128 // several multiples of dequeInitialCapacity (32): guarantees growTo runs repeatedly
+	const numThieves = 16
+	const rounds = 50
+
+	for round := 0; round < rounds; round++ {
+		d := newDeque()
+		collector := newDequeExactlyOnceCollector()
+		done := make(chan struct{})
+
+		var thieves sync.WaitGroup
+		for th := 0; th < numThieves; th++ {
+			thieves.Add(1)
+			go func() {
+				defer thieves.Done()
+				for {
+					if node, ok := d.stealTop(); ok {
+						collector.record(node)
+						continue
+					}
+					select {
+					case <-done:
+						if node, ok := d.stealTop(); ok {
+							collector.record(node)
+							continue
+						}
+						return
+					default:
+					}
+				}
+			}()
+		}
+
+		for i := 0; i < nodesPerRound; i++ {
+			d.pushBottom(searchNode{assignment: assign.New(i)})
+		}
+		for {
+			node, ok := d.popBottom()
+			if !ok {
+				break
+			}
+			collector.record(node)
+		}
+		close(done)
+		thieves.Wait()
+
+		collector.checkExactlyOnce(t, nodesPerRound)
 	}
 }
 
