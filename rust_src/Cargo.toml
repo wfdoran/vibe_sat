@@ -8,3 +8,37 @@ clap = { version = "4.6.6", features = ["derive"] }
 rand = "0.10.2"
 crossbeam-deque = "0.8"
 arc-swap = "1.7"
+
+
+# STAGE24.md: permanent profiling-benchmark infrastructure, mirroring
+# go_src's *_test.go "-bench" functions. These are plain binaries
+# (harness = false, no criterion or other statistics-focused
+# benchmarking crate): stable Rust has no built-in #[bench] the way Go
+# always has testing.B, but REPORT23.md already found that a proper
+# statistical benchmarking harness is the wrong tool for this project's
+# actual need here anyway -- criterion's minimum of 10 timed samples
+# per benchmark is a poor fit for a ~20-second cdcl search on a hard
+# instance (that alone would mean 200+ seconds just to benchmark once),
+# and REPORT23.md's own methodology needed single-shot timing (Go's
+# "-benchtime=1x") specifically because repeated-sampling timing was
+# either too slow or too noisy to trust. Each bench binary below is
+# exactly that: a manually-timed, single-shot (or small fixed count)
+# run against a real benchmark/ instance, invoked with
+# "cargo bench --bench <name>" and profiled externally (e.g. with
+# `perf record`, now that the target machine has
+# kernel.perf_event_paranoid=1 set per STAGE24.md).
+[[bench]]
+name = "dfs_bench"
+harness = false
+
+[[bench]]
+name = "cdcl_bench"
+harness = false
+
+[[bench]]
+name = "hillclimb_bench"
+harness = false
+
+[[bench]]
+name = "preprocess_bench"
+harness = false

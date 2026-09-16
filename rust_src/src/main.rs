@@ -5,15 +5,12 @@
 //! learning, "cdcl"), optionally printing progress and writing out a
 //! satisfying assignment if one is found.
 
-mod assignment;
-mod cdcl;
-mod cliargs;
-mod cnf;
-mod dfs;
-mod hillclimb;
-mod occurrence;
-mod preprocess;
-mod solution;
+// STAGE24.md: these modules now live in src/lib.rs (a library target
+// this binary depends on, alongside cargo bench's benches/ -- see
+// lib.rs's own doc comment for why) rather than being declared
+// directly here with "mod X;". This changes nothing about the
+// compiled binary's behavior, only where the module tree is rooted.
+use vibe_sat::{assignment, cdcl, cliargs, cnf, dfs, hillclimb, occurrence, preprocess, solution};
 
 use assignment::Assignment;
 use preprocess::PreprocessResult;
