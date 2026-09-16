@@ -1,6 +1,8 @@
 package preprocess
 
 import (
+	"path/filepath"
+	"slices"
 	"testing"
 
 	"vibe_sat/internal/assign"
@@ -113,6 +115,118 @@ func TestEliminateSubsumedClausesRemovesDuplicates(t *testing.T) {
 	}
 }
 
+// cloneClauses makes an independent copy of clauses (and each clause
+// within it), so two calls under test can each mutate their own copy
+// without one affecting the other.
+func cloneClauses(clauses []cnf.Clause) []cnf.Clause {
+	out := make([]cnf.Clause, len(clauses))
+	for i, c := range clauses {
+		out[i] = append(cnf.Clause(nil), c...)
+	}
+	return out
+}
+
+// TestEliminateSubsumedClausesParallelMatchesSequentialChained
+// exercises exactly the transitivity chain
+// eliminateSubsumedClausesParallel's doc comment argues makes omitting
+// the "if !keep[i] { continue }" skip safe: clause 0 ({1}) subsumes
+// clause 1 ({1,2}), which is itself long enough that -- were it not
+// itself about to be marked non-keep -- it would be the one to catch
+// clause 2 ({1,2,4}). Since {1} is also a subset of {1,2,4} directly,
+// this asserts the parallel version (at several thread counts,
+// including more threads than clauses) removes exactly the same two
+// clauses the sequential version does.
+func TestEliminateSubsumedClausesParallelMatchesSequentialChained(t *testing.T) {
+	original := []cnf.Clause{
+		{cnf.Literal(1)},
+		{cnf.Literal(1), cnf.Literal(2)},
+		{cnf.Literal(1), cnf.Literal(2), cnf.Literal(4)},
+	}
+
+	want := cloneClauses(original)
+	wantRemoved := eliminateSubsumedClauses(&want)
+
+	for _, numThreads := range []int{1, 2, 3, 4, 8} {
+		got := cloneClauses(original)
+		gotRemoved := eliminateSubsumedClausesParallel(&got, numThreads)
+		if gotRemoved != wantRemoved {
+			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("numThreads=%d: clauses = %v, want %v", numThreads, got, want)
+		}
+		for i := range want {
+			if !slices.Equal(got[i], want[i]) {
+				t.Errorf("numThreads=%d: clauses[%d] = %v, want %v", numThreads, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestEliminateSubsumedClausesParallelMatchesSequentialOnRealFile runs
+// both the sequential and parallel (several thread counts)
+// implementations against a real benchmark file and asserts they
+// remove exactly the same clauses.
+func TestEliminateSubsumedClausesParallelMatchesSequentialOnRealFile(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "benchmark", "blocksworld", "anomaly.cnf")
+	problem, err := cnf.ReadDIMACS(path, 0)
+	if err != nil {
+		t.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
+	}
+
+	want := cloneClauses(problem.Clauses)
+	wantRemoved := eliminateSubsumedClauses(&want)
+	if wantRemoved == 0 {
+		t.Fatal("test file has nothing to subsume; pick a different file")
+	}
+
+	for _, numThreads := range []int{1, 2, 3, 4, 8, 16} {
+		got := cloneClauses(problem.Clauses)
+		gotRemoved := eliminateSubsumedClausesParallel(&got, numThreads)
+		if gotRemoved != wantRemoved {
+			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("numThreads=%d: got %d surviving clauses, want %d", numThreads, len(got), len(want))
+		}
+		for i := range want {
+			if !slices.Equal(got[i], want[i]) {
+				t.Errorf("numThreads=%d: clauses[%d] = %v, want %v", numThreads, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestRunProducesIdenticalResultsRegardlessOfNumThreads confirms
+// preprocessing is still fully deterministic (it always has been --
+// nothing in this package uses randomness) even with Stage 25's
+// multithreaded subsumption elimination active: the same input
+// produces byte-for-byte identical Stats and simplified-problem output
+// regardless of numThreads.
+func TestRunProducesIdenticalResultsRegardlessOfNumThreads(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "benchmark", "blocksworld", "anomaly.cnf")
+	problem, err := cnf.ReadDIMACS(path, 0)
+	if err != nil {
+		t.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
+	}
+
+	want := Run(problem, 0, 1)
+	for _, numThreads := range []int{1, 2, 4, 8, 16} {
+		got := Run(problem, 0, numThreads)
+		if got.Stats != want.Stats {
+			t.Errorf("numThreads=%d: Stats = %+v, want %+v", numThreads, got.Stats, want.Stats)
+		}
+		if len(got.Problem.Clauses) != len(want.Problem.Clauses) {
+			t.Fatalf("numThreads=%d: got %d clauses, want %d", numThreads, len(got.Problem.Clauses), len(want.Problem.Clauses))
+		}
+		for i := range want.Problem.Clauses {
+			if !slices.Equal(got.Problem.Clauses[i], want.Problem.Clauses[i]) {
+				t.Errorf("numThreads=%d: Problem.Clauses[%d] = %v, want %v", numThreads, i, got.Problem.Clauses[i], want.Problem.Clauses[i])
+			}
+		}
+	}
+}
+
 // TestResolveOmitsTautology verifies that resolve reports ok = false
 // when the resolvent would contain a literal and its negation.
 func TestResolveOmitsTautology(t *testing.T) {
@@ -197,7 +311,7 @@ func TestRunSimplifiesAndPreservesSatisfiability(t *testing.T) {
 		},
 	}
 
-	result := Run(problem, 0)
+	result := Run(problem, 0, 1)
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}
@@ -226,7 +340,7 @@ func TestRunDetectsUnsat(t *testing.T) {
 			{cnf.Literal(-1)},
 		},
 	}
-	result := Run(problem, 0)
+	result := Run(problem, 0, 1)
 	if !result.Unsat {
 		t.Fatalf("expected Unsat = true")
 	}
@@ -256,7 +370,7 @@ func TestRunWithVariableEliminationReconstructsCorrectly(t *testing.T) {
 		},
 	}
 
-	result := Run(problem, 0)
+	result := Run(problem, 0, 1)
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}
@@ -308,7 +422,7 @@ func TestRunLeavesUnconstrainedVariablesArbitrarilyFalse(t *testing.T) {
 			{cnf.Literal(1)},
 		},
 	}
-	result := Run(problem, 0)
+	result := Run(problem, 0, 1)
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}

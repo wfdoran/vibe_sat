@@ -60,7 +60,7 @@ func main() {
 	originalNumVars := problem.NumVars
 	var preResult *preprocess.Result
 	if !args.NoPreprocessing {
-		preResult = preprocess.Run(problem, args.Verbose)
+		preResult = preprocess.Run(problem, args.Verbose, args.NumThreads)
 		if preResult.Unsat {
 			// Preprocessing alone already proves the original problem
 			// has no solution, regardless of which algorithm was

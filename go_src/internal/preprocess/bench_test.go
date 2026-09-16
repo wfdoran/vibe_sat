@@ -33,6 +33,19 @@ func BenchmarkRunHard(b *testing.B) {
 		b.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
 	}
 	for i := 0; i < b.N; i++ {
-		Run(problem, 0)
+		Run(problem, 0, 1)
+	}
+}
+
+// BenchmarkRunHardParallel8 profiles the same instance with Stage 25's
+// multithreaded subsumption elimination active.
+func BenchmarkRunHardParallel8(b *testing.B) {
+	path := filepath.Join("..", "..", "..", "benchmark", "blocksworld", "bw_large.c.cnf")
+	problem, err := cnf.ReadDIMACS(path, 0)
+	if err != nil {
+		b.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
+	}
+	for i := 0; i < b.N; i++ {
+		Run(problem, 0, 8)
 	}
 }

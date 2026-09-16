@@ -13,7 +13,8 @@
 //! for Preprocessing SAT Instances," SAT 2004 (the specific, simpler
 //! elimination bound used here).
 
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
@@ -107,7 +108,21 @@ pub struct PreprocessResult {
 /// `PreprocessResult::unsat` is true and `PreprocessResult::problem`
 /// is `None`; the caller should report the original problem as
 /// unsatisfiable without running any solving algorithm at all.
-pub fn run(problem: &Problem, verbose: i32) -> PreprocessResult {
+///
+/// STAGE25.md: `num_threads` uses this many OS threads to speed up
+/// subsumption elimination, the technique profiling found dominates
+/// preprocessing cost on real, clause-count-heavy instances (see
+/// [`eliminate_subsumed_clauses_parallel`]'s doc comment; REPORT25.md
+/// has the full measurement). `num_threads <= 1` runs the exact same
+/// single-threaded code path as before Stage 25 (bit-for-bit
+/// identical output, matching the `num_threads <= 1` delegates-to-the-
+/// original-function convention this project has used for every other
+/// algorithm's own `--num-threads` support since Stage 17). Every
+/// other technique here (unit propagation, pure literal elimination,
+/// and bounded variable elimination) remains single-threaded
+/// regardless of `num_threads`; see REPORT25.md for why BVE in
+/// particular was not also threaded this stage.
+pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessResult {
     let mut clauses = problem.clauses.clone();
     let mut assignment = assignment::new(problem.num_vars);
     let mut eliminated = Vec::new();
@@ -139,7 +154,7 @@ pub fn run(problem: &Problem, verbose: i32) -> PreprocessResult {
         stats.pure_literals_fixed += pure_fixed;
         changed |= pure_fixed > 0;
 
-        let subsumed = eliminate_subsumed_clauses(&mut clauses);
+        let subsumed = eliminate_subsumed_clauses_parallel(&mut clauses, num_threads);
         stats.clauses_subsumed += subsumed;
         changed |= subsumed > 0;
 
@@ -438,11 +453,22 @@ fn eliminate_pure_literals(clauses: &mut Vec<Clause>, assignment: &mut Assignmen
 /// equal-length) clause in `clauses`: if clause A is a subset of
 /// clause B, then A already enforces at least as much as B does,
 /// making B redundant. Returns how many clauses were removed.
+///
+/// STAGE25.md: this used to check subset membership against a
+/// `HashSet<Literal>` built once per clause (the `sets` vector
+/// below, now removed). Profiling this exact function with `perf`
+/// found that hashing dominated: `RandomState::hash_one` alone
+/// accounted for ~44% of total preprocessing time on
+/// `benchmark/blocksworld/bw_large.c.cnf` (see REPORT25.md), not the
+/// `eliminate_variables` (BVE) pass REPORT22.md guessed was the
+/// bottleneck. This project's clauses are almost always short (a
+/// handful of literals, occasionally a few dozen for structured
+/// instances), and Rust's default hasher (`SipHash`, chosen for
+/// DoS-resistance against adversarial input, not speed) costs more
+/// per lookup than just scanning that many literals directly with
+/// `[Literal]::contains` -- no hash computation, no allocation, and
+/// better cache locality for a slice this small.
 fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>) -> usize {
-    let sets: Vec<HashSet<Literal>> = clauses
-        .iter()
-        .map(|clause| clause.iter().copied().collect())
-        .collect();
     let mut keep = vec![true; clauses.len()];
 
     for i in 0..clauses.len() {
@@ -460,7 +486,7 @@ fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>) -> usize {
                 // Equal-length duplicates: keep only the first one seen.
                 continue;
             }
-            if clauses[i].iter().all(|lit| sets[j].contains(lit)) {
+            if clauses[i].iter().all(|lit| clauses[j].contains(lit)) {
                 keep[j] = false;
             }
         }
@@ -480,14 +506,124 @@ fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>) -> usize {
     num_removed
 }
 
+/// Computes exactly the same result as [`eliminate_subsumed_clauses`]
+/// (the set of clauses removed, and the surviving clauses in their
+/// original relative order), but splits the outer `i` loop across
+/// `num_threads` OS threads. `num_threads <= 1` just calls
+/// `eliminate_subsumed_clauses` directly.
+///
+/// STAGE25.md/REPORT25.md: profiling found subsumption elimination is
+/// the single largest cost in preprocessing on real, clause-count-heavy
+/// benchmark instances (87-94% of total preprocessing time on
+/// `benchmark/blocksworld/bw_large.c.cnf`/`.d.cnf`) -- its
+/// `O(clauses^2)` pairwise comparison is the natural target for
+/// `--num-threads`, far more than `eliminate_variables` (BVE), which
+/// REPORT22.md had guessed was the bottleneck (see `run`'s doc comment
+/// for why BVE itself is not also threaded this stage).
+///
+/// The key fact that makes this a safe, provably-equivalent
+/// parallelization, not just an approximation:
+/// `eliminate_subsumed_clauses`'s own `if !keep[i] { continue }` skip
+/// is a pure optimization, never required for correctness. If some
+/// clause `i` is itself later found to be subsumed by another clause
+/// `i2` (`i2` is a subset of `i`), then `i2` is also, by transitivity
+/// of the subset relation, a subset of anything `i` itself is a subset
+/// of -- so whatever `j`'s `i` would go on to mark non-keep, `i2` marks
+/// too, independently, when `i2`'s own turn as an outer index comes
+/// around (whether that happens before or after `i`'s own turn does
+/// not matter: either `i2` runs first and already caught every such
+/// `j` directly, in which case `i`'s own attempt would have been
+/// entirely redundant anyway, or `i2` runs later, in which case `i`
+/// had already done its own full pass -- including marking every `j`
+/// it subsumes -- before anyone marked `i` itself non-keep). So
+/// evaluating every ordered pair `(i, j)` against the fixed input
+/// snapshot, regardless of any other pair's outcome, yields the exact
+/// same final "keep" set as the sequential, short-circuiting version.
+/// That is exactly what this function does: it never reads `keep[i]`
+/// as an outer-loop skip (only `keep[j]`, purely to avoid redundant
+/// writes to an already-false entry -- itself just as harmless to skip
+/// or not), so every thread's chunk of `i` values can run against a
+/// read-only `clauses` slice with no coordination beyond `keep`'s
+/// atomic writes. `test_eliminate_subsumed_clauses_parallel_matches_sequential_chained`
+/// and `test_eliminate_subsumed_clauses_parallel_matches_sequential_on_real_file`
+/// verify this holds in practice, including the exact "i2 subsumes i,
+/// i subsumes j" chain this argument depends on, not just in theory.
+///
+/// `keep` is monotonic (`true` -> `false`, never back) and every write
+/// stores the same value (`false`) every time, so concurrent
+/// unsynchronized writes from different threads are semantically
+/// harmless -- but Rust's aliasing rules still require a real atomic
+/// type for two threads to safely touch the same memory location at
+/// all (a plain `Vec<bool>` would not even compile here without
+/// `unsafe`), hence `AtomicBool` rather than a plain `Vec<bool>`.
+fn eliminate_subsumed_clauses_parallel(clauses: &mut Vec<Clause>, num_threads: usize) -> usize {
+    if num_threads <= 1 {
+        return eliminate_subsumed_clauses(clauses);
+    }
+
+    let n = clauses.len();
+    let keep: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(true)).collect();
+    let cs: &Vec<Clause> = clauses;
+    let chunk = n.div_ceil(num_threads).max(1);
+
+    thread::scope(|scope| {
+        let mut start = 0;
+        while start < n {
+            let end = (start + chunk).min(n);
+            let keep = &keep;
+            scope.spawn(move || {
+                for i in start..end {
+                    for j in 0..n {
+                        if i == j || !keep[j].load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        if cs[i].len() > cs[j].len() {
+                            continue;
+                        }
+                        if cs[i].len() == cs[j].len() && i > j {
+                            // Equal-length duplicates: keep only the first one seen.
+                            continue;
+                        }
+                        if cs[i].iter().all(|lit| cs[j].contains(lit)) {
+                            keep[j].store(false, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+            start = end;
+        }
+    });
+
+    let mut num_removed = 0;
+    let old = std::mem::take(clauses);
+    let mut kept = Vec::with_capacity(old.len());
+    for (i, clause) in old.into_iter().enumerate() {
+        if keep[i].load(Ordering::SeqCst) {
+            kept.push(clause);
+        } else {
+            num_removed += 1;
+        }
+    }
+    *clauses = kept;
+    num_removed
+}
+
 /// Computes the resolvent of clauses `pos` and `neg` on variable `v`
 /// (which `pos` contains positively and `neg` contains negatively),
 /// omitting the literal on `v` itself. Returns `None` if the
 /// resolvent would be a tautology (containing both some literal and
 /// its negation), in which case it is always true and carries no
 /// information, so it is discarded rather than returned.
+///
+/// STAGE25.md: `seen` used to be a `HashSet<Literal>`; per
+/// `eliminate_subsumed_clauses`'s doc comment above, a resolvent is
+/// typically just as short as any other clause in this project, so a
+/// plain `Vec` scan beats a `HashSet` here too -- and this also drops
+/// a per-call heap allocation that `resolve` paid on *every* one of
+/// its (often numerous: `pos`-occurrences x `neg`-occurrences per
+/// candidate variable) calls.
 fn resolve(pos: &Clause, neg: &Clause, v: usize) -> Option<Clause> {
-    let mut seen: HashSet<Literal> = HashSet::new();
+    let mut seen: Clause = Vec::with_capacity(pos.len() + neg.len());
     let mut resolvent = Clause::new();
     for &lit in pos.iter().chain(neg.iter()) {
         if cnf::literal_var(lit) == v {
@@ -496,7 +632,8 @@ fn resolve(pos: &Clause, neg: &Clause, v: usize) -> Option<Clause> {
         if seen.contains(&-lit) {
             return None;
         }
-        if seen.insert(lit) {
+        if !seen.contains(&lit) {
+            seen.push(lit);
             resolvent.push(lit);
         }
     }
@@ -572,12 +709,18 @@ fn eliminate_variables(
                 negative: negative_clauses,
             });
 
-            let remove_set: HashSet<usize> =
-                pos_idx.iter().chain(neg_idx.iter()).copied().collect();
+            // STAGE25.md: remove_set used to be a HashSet<usize>;
+            // clause indices are already a dense range, so a plain
+            // Vec<bool> (direct O(1) indexing, no hashing) is both
+            // simpler and faster.
+            let mut remove_set = vec![false; clauses.len()];
+            for &idx in pos_idx.iter().chain(neg_idx.iter()) {
+                remove_set[idx] = true;
+            }
             let mut survivors: Vec<Clause> = clauses
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| !remove_set.contains(i))
+                .filter(|(i, _)| !remove_set[*i])
                 .map(|(_, clause)| clause.clone())
                 .collect();
             survivors.extend(resolvents);
@@ -596,6 +739,7 @@ fn eliminate_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn all_satisfied(clauses: &[Clause], assignment: &Assignment) -> bool {
         clauses.iter().all(|c| clause_satisfied(c, assignment))
@@ -660,6 +804,113 @@ mod tests {
         assert_eq!(clauses.len(), 1);
     }
 
+    /// Exercises exactly the transitivity chain
+    /// `eliminate_subsumed_clauses_parallel`'s doc comment argues makes
+    /// omitting the `if !keep[i] { continue }` skip safe: clause 0
+    /// (`{1}`) subsumes clause 1 (`{1,2}`), which is itself long enough
+    /// that -- were it not itself about to be marked non-keep -- it
+    /// would be the one to catch clause 2 (`{1,2,4}`). Since `{1}` is
+    /// also a subset of `{1,2,4}` directly, this asserts the parallel
+    /// version (at several thread counts, including more threads than
+    /// clauses) removes exactly the same two clauses the sequential
+    /// version does.
+    #[test]
+    fn test_eliminate_subsumed_clauses_parallel_matches_sequential_chained() {
+        let original: Vec<Clause> = vec![vec![1], vec![1, 2], vec![1, 2, 4]];
+
+        let mut want = original.clone();
+        let want_removed = eliminate_subsumed_clauses(&mut want);
+
+        for num_threads in [1, 2, 3, 4, 8] {
+            let mut got = original.clone();
+            let got_removed = eliminate_subsumed_clauses_parallel(&mut got, num_threads);
+            assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
+            assert_eq!(got, want, "num_threads={num_threads}");
+        }
+    }
+
+    /// Runs both the sequential and parallel (several thread counts)
+    /// implementations against a real benchmark file and asserts they
+    /// remove exactly the same clauses.
+    #[test]
+    fn test_eliminate_subsumed_clauses_parallel_matches_sequential_on_real_file() {
+        let path = "../benchmark/blocksworld/anomaly.cnf";
+        let problem =
+            cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+
+        let mut want = problem.clauses.clone();
+        let want_removed = eliminate_subsumed_clauses(&mut want);
+        assert!(
+            want_removed > 0,
+            "test file has nothing to subsume; pick a different file"
+        );
+
+        for num_threads in [1, 2, 3, 4, 8, 16] {
+            let mut got = problem.clauses.clone();
+            let got_removed = eliminate_subsumed_clauses_parallel(&mut got, num_threads);
+            assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
+            assert_eq!(got, want, "num_threads={num_threads}");
+        }
+    }
+
+    /// Confirms preprocessing is still fully deterministic (it always
+    /// has been -- nothing in this module uses randomness) even with
+    /// Stage 25's multithreaded subsumption elimination active: the
+    /// same input produces byte-for-byte identical stats and
+    /// simplified-problem output regardless of `num_threads`.
+    #[test]
+    fn test_run_produces_identical_results_regardless_of_num_threads() {
+        let path = "../benchmark/blocksworld/anomaly.cnf";
+        let problem =
+            cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+
+        let want = run(&problem, 0, 1);
+        let want_problem = want
+            .problem
+            .as_ref()
+            .expect("expected a simplified problem");
+        for num_threads in [1, 2, 4, 8, 16] {
+            let got = run(&problem, 0, num_threads);
+            let got_problem = got.problem.as_ref().expect("expected a simplified problem");
+            assert_eq!(
+                got.stats.clauses_before, want.stats.clauses_before,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.clauses_after, want.stats.clauses_after,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.vars_before, want.stats.vars_before,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.vars_after, want.stats.vars_after,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.units_propagated, want.stats.units_propagated,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.pure_literals_fixed, want.stats.pure_literals_fixed,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.clauses_subsumed, want.stats.clauses_subsumed,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got.stats.variables_eliminated, want.stats.variables_eliminated,
+                "num_threads={num_threads}"
+            );
+            assert_eq!(
+                got_problem.clauses, want_problem.clauses,
+                "num_threads={num_threads}"
+            );
+        }
+    }
+
     #[test]
     fn test_resolve_omits_tautology() {
         let pos = vec![1, 2];
@@ -716,7 +967,7 @@ mod tests {
             ],
         };
 
-        let result = run(&problem, 0);
+        let result = run(&problem, 0, 1);
         assert!(!result.unsat);
         let reduced = result.problem.as_ref().expect("expected a reduced problem");
         assert!(reduced.num_vars <= 2);
@@ -736,7 +987,7 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        let result = run(&problem, 0);
+        let result = run(&problem, 0, 1);
         assert!(result.unsat);
         assert!(result.problem.is_none());
     }
@@ -762,7 +1013,7 @@ mod tests {
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
 
-        let result = run(&problem, 0);
+        let result = run(&problem, 0, 1);
         assert!(!result.unsat);
         assert!(
             !result.eliminated.is_empty(),
@@ -800,7 +1051,7 @@ mod tests {
             num_vars: 2, // variable 2 never appears in any clause
             clauses: vec![vec![1]],
         };
-        let result = run(&problem, 0);
+        let result = run(&problem, 0, 1);
         assert!(!result.unsat);
         let reduced = result.problem.as_ref().expect("expected a reduced problem");
 

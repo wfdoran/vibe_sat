@@ -152,8 +152,19 @@ Options:
 
   --num-threads=<integer>, -z <integer>
         Number of concurrent worker threads to use (STAGE17.md,
-        STAGE18.md, STAGE20.md/STAGE21.md). Default is 1
-        (single-threaded). Honored by "hc"/"ws"/"dfs"/"cdcl".
+        STAGE18.md, STAGE20.md/STAGE21.md, STAGE25.md). Default is 1
+        (single-threaded). Honored by preprocessing and by
+        "hc"/"ws"/"dfs"/"cdcl".
+          preprocessing (STAGE25.md)
+                 Speeds up subsumption elimination only (profiling
+                 found it, not bounded variable elimination, dominates
+                 preprocessing cost on real, clause-count-heavy
+                 instances -- see reports/REPORT25.md); unit
+                 propagation, pure literal elimination, and bounded
+                 variable elimination remain single-threaded. Fully
+                 deterministic regardless of thread count: the result
+                 is always identical to the single-threaded one, just
+                 (usually) faster.
           hc/ws  If --alg-params gives a restart/try count, it is
                  split as evenly as possible across the threads (each
                  doing ceil(count/num-threads)); --time-limit-secs, if

@@ -102,7 +102,21 @@ type Stats struct {
 // true and Result.Problem is nil; the caller should report the
 // original problem as unsatisfiable without running any solving
 // algorithm at all.
-func Run(problem *cnf.Problem, verbose int) *Result {
+//
+// STAGE25.md: numThreads uses this many goroutines to speed up
+// subsumption elimination, the technique profiling found dominates
+// preprocessing cost on real, clause-count-heavy instances (see
+// eliminateSubsumedClausesParallel's doc comment; REPORT25.md has the
+// full measurement). numThreads <= 1 runs the exact same single-
+// threaded code path as before Stage 25 (bit-for-bit identical
+// output, per the numThreads<=1-delegates-to-the-original-function
+// convention this project has used for every other algorithm's own
+// --num-threads support since Stage 17). Every other technique here
+// (unit propagation, pure literal elimination, and bounded variable
+// elimination) remains single-threaded regardless of numThreads; see
+// REPORT25.md for why BVE in particular was not also threaded this
+// stage.
+func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	assignment := assign.New(problem.NumVars)
 	var eliminated []EliminationStep
@@ -125,7 +139,7 @@ func Run(problem *cnf.Problem, verbose int) *Result {
 			changed = true
 		}
 
-		if subsumed := eliminateSubsumedClauses(&clauses); subsumed > 0 {
+		if subsumed := eliminateSubsumedClausesParallel(&clauses, numThreads); subsumed > 0 {
 			stats.ClausesSubsumed += subsumed
 			changed = true
 		}

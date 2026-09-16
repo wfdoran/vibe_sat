@@ -64,7 +64,7 @@ fn main() -> ExitCode {
     let mut preresult: Option<PreprocessResult> = None;
     let mut problem = problem;
     if !args.no_preprocessing {
-        let mut result = preprocess::run(&problem, args.verbose);
+        let mut result = preprocess::run(&problem, args.verbose, args.num_threads);
         if result.unsat {
             // Preprocessing alone already proves the original problem
             // has no solution, regardless of which algorithm was
