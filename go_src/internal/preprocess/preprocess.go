@@ -122,6 +122,12 @@ func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
 	var eliminated []EliminationStep
 	stats := Stats{ClausesBefore: len(problem.Clauses), VarsBefore: problem.NumVars}
 
+	// STAGE31.md: shared across every round below, not reset per
+	// round -- see eliminateVariables's doc comment on its own budget
+	// parameter for why a fresh-every-call budget would fail to bound
+	// this loop's total work.
+	bveBudget := bveWorkBudgetFactor * len(problem.Clauses)
+
 	for round := 0; round < maxRounds; round++ {
 		changed := false
 
@@ -144,7 +150,7 @@ func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
 			changed = true
 		}
 
-		newSteps := eliminateVariables(&clauses, assignment, problem.NumVars)
+		newSteps := eliminateVariables(&clauses, assignment, problem.NumVars, &bveBudget)
 		if len(newSteps) > 0 {
 			eliminated = append(eliminated, newSteps...)
 			stats.VariablesEliminated += len(newSteps)

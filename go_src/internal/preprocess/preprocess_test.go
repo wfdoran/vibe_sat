@@ -388,6 +388,16 @@ func TestResolveProducesExpectedClause(t *testing.T) {
 	}
 }
 
+// hugeBudget returns a bveWorkBudgetFactor-style budget large enough
+// that no test using it is exercising STAGE31.md's work-budget cap --
+// that cap has its own dedicated tests below; every other
+// eliminateVariables test wants the pre-STAGE31.md, uncapped
+// behavior.
+func hugeBudget() *int {
+	budget := 1 << 30
+	return &budget
+}
+
 // TestEliminateVariablesNonIncreasing verifies that a variable with
 // one positive and one negative occurrence is eliminated (a single
 // resolvent replacing two clauses is non-increasing).
@@ -398,7 +408,7 @@ func TestEliminateVariablesNonIncreasing(t *testing.T) {
 	}
 	assignment := assign.New(3)
 
-	steps := eliminateVariables(&clauses, assignment, 3)
+	steps := eliminateVariables(&clauses, assignment, 3, hugeBudget())
 	if len(steps) != 1 || steps[0].Var != 1 {
 		t.Fatalf("steps = %v, want one step eliminating variable 1", steps)
 	}
@@ -421,9 +431,222 @@ func TestEliminateVariablesSkipsWhenIncreasing(t *testing.T) {
 	}
 	assignment := assign.New(6)
 
-	steps := eliminateVariables(&clauses, assignment, 6)
+	steps := eliminateVariables(&clauses, assignment, 6, hugeBudget())
 	if len(steps) != 0 {
 		t.Fatalf("steps = %v, want none (elimination would increase clause count 5 -> 6)", steps)
+	}
+}
+
+// TestResolveWithMarksMatchesResolveAcrossReusedBuffers checks
+// resolveWithMarks against resolve directly (tautology detection,
+// intra-clause duplicate-literal handling, and the resolvent
+// contents), across several calls that deliberately reuse the same
+// mark/touched buffers and revisit overlapping variables --
+// STAGE31.md/REPORT31.md: mark is reset only for the entries a call
+// actually touched, not with a full clear, so a bug in that cleanup
+// would only show up as a leftover mark corrupting a *later* call
+// that happens to touch the same variable, which is exactly what this
+// sequence of cases is designed to exercise. The final loop over mark
+// itself confirms nothing was left set after the last call.
+func TestResolveWithMarksMatchesResolveAcrossReusedBuffers(t *testing.T) {
+	mark := make([]int8, 6)
+	var touched []int
+
+	cases := []struct {
+		pos, neg cnf.Clause
+		v        int
+	}{
+		{cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, cnf.Clause{cnf.Literal(-1), cnf.Literal(3)}, 1},
+		{cnf.Clause{cnf.Literal(2), cnf.Literal(3)}, cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}, 2},
+		{cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, cnf.Clause{cnf.Literal(-1), cnf.Literal(-2)}, 1},
+		{cnf.Clause{cnf.Literal(3), cnf.Literal(4)}, cnf.Clause{cnf.Literal(-3), cnf.Literal(4)}, 3},
+		{cnf.Clause{cnf.Literal(5)}, cnf.Clause{cnf.Literal(-5)}, 5},
+	}
+
+	for i, c := range cases {
+		wantResolvent, wantOK := resolve(c.pos, c.neg, c.v)
+		gotResolvent, gotOK := resolveWithMarks(c.pos, c.neg, c.v, mark, &touched)
+		if gotOK != wantOK {
+			t.Fatalf("case %d: ok = %v, want %v", i, gotOK, wantOK)
+		}
+		if wantOK && !sameLiteralSet(gotResolvent, wantResolvent) {
+			t.Errorf("case %d: resolvent = %v, want %v (as sets)", i, gotResolvent, wantResolvent)
+		}
+	}
+
+	for v, m := range mark {
+		if m != 0 {
+			t.Errorf("mark[%d] = %d after all calls, want 0 (leaked mark)", v, m)
+		}
+	}
+}
+
+// sameLiteralSet reports whether a and b contain the same literals,
+// ignoring order (resolve/resolveWithMarks both build their resolvent
+// by appending in first-seen order across pos then neg, which the
+// two implementations can, in principle, do compatibly but which this
+// test does not want to over-assume).
+func sameLiteralSet(a, b cnf.Clause) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[cnf.Literal]bool{}
+	for _, lit := range a {
+		seen[lit] = true
+	}
+	for _, lit := range b {
+		if !seen[lit] {
+			return false
+		}
+	}
+	return true
+}
+
+// bruteForceEliminateVariables is a deliberately naive, obviously-
+// correct reference implementation of bounded variable elimination --
+// exactly what eliminateVariables itself was before STAGE31.md's
+// incremental-occurrence-list rewrite (see reports/REPORT31.md), kept
+// here purely as a test oracle rather than shipped in the real
+// preprocessing path. Used by
+// TestEliminateVariablesMatchesBruteForceOnRandomFormulas to build
+// confidence in the fast version's correctness across many random
+// cases, not just the small number of hand-picked examples above.
+func bruteForceEliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, numVars int) []EliminationStep {
+	var steps []EliminationStep
+
+	for {
+		positive := make([][]int, numVars+1)
+		negative := make([][]int, numVars+1)
+		for i, clause := range *clauses {
+			for _, lit := range clause {
+				if lit.IsNegative() {
+					negative[lit.Var()] = append(negative[lit.Var()], i)
+				} else {
+					positive[lit.Var()] = append(positive[lit.Var()], i)
+				}
+			}
+		}
+
+		eliminatedThisPass := false
+		for v := 1; v <= numVars; v++ {
+			if assignment[v] != assign.Unassigned {
+				continue
+			}
+			posIdx, negIdx := positive[v], negative[v]
+			if len(posIdx) == 0 || len(negIdx) == 0 {
+				continue
+			}
+
+			var resolvents []cnf.Clause
+			for _, pi := range posIdx {
+				for _, ni := range negIdx {
+					if resolvent, ok := resolve((*clauses)[pi], (*clauses)[ni], v); ok {
+						resolvents = append(resolvents, resolvent)
+					}
+				}
+			}
+
+			removedCount := len(posIdx) + len(negIdx)
+			if len(resolvents) > removedCount {
+				continue
+			}
+
+			step := EliminationStep{Var: v}
+			for _, pi := range posIdx {
+				step.Positive = append(step.Positive, (*clauses)[pi])
+			}
+			for _, ni := range negIdx {
+				step.Negative = append(step.Negative, (*clauses)[ni])
+			}
+			steps = append(steps, step)
+
+			removeSet := make([]bool, len(*clauses))
+			for _, idx := range posIdx {
+				removeSet[idx] = true
+			}
+			for _, idx := range negIdx {
+				removeSet[idx] = true
+			}
+			var survivors []cnf.Clause
+			for i, clause := range *clauses {
+				if !removeSet[i] {
+					survivors = append(survivors, clause)
+				}
+			}
+			*clauses = append(survivors, resolvents...)
+
+			eliminatedThisPass = true
+			break
+		}
+
+		if !eliminatedThisPass {
+			return steps
+		}
+	}
+}
+
+// sameEliminationStep reports whether a and b record the same
+// eliminated variable from the same positive/negative clauses, in the
+// same order.
+func sameEliminationStep(a, b EliminationStep) bool {
+	if a.Var != b.Var {
+		return false
+	}
+	if len(a.Positive) != len(b.Positive) || len(a.Negative) != len(b.Negative) {
+		return false
+	}
+	for i := range a.Positive {
+		if !slices.Equal(a.Positive[i], b.Positive[i]) {
+			return false
+		}
+	}
+	for i := range a.Negative {
+		if !slices.Equal(a.Negative[i], b.Negative[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestEliminateVariablesMatchesBruteForceOnRandomFormulas fuzz-tests
+// the incremental-occurrence-list rewrite (STAGE31.md/REPORT31.md)
+// against bruteForceEliminateVariables across many random small
+// clause sets, reusing Stage 30's randomClauseSet generator. Both
+// algorithms restart their elimination scan from v=1 after every
+// single elimination and call resolve/resolveWithMarks in the same
+// order, so REPORT31.md's claim that this stage changed only internal
+// bookkeeping -- never which variables get eliminated, in what order,
+// or what the final clauses are -- is checked here as exact equality
+// (steps and surviving clauses, both in order), not merely a weaker
+// "still satisfiable" property.
+func TestEliminateVariablesMatchesBruteForceOnRandomFormulas(t *testing.T) {
+	rng := rand.New(rand.NewPCG(24680, 13579))
+	const trials = 500
+	for trial := 0; trial < trials; trial++ {
+		numVars := 1 + rng.IntN(8)
+		numClauses := rng.IntN(20)
+		original := randomClauseSet(rng, numVars, numClauses)
+
+		want := cloneClauses(original)
+		wantSteps := bruteForceEliminateVariables(&want, assign.New(numVars), numVars)
+
+		got := cloneClauses(original)
+		gotSteps := eliminateVariables(&got, assign.New(numVars), numVars, hugeBudget())
+
+		if !slices.EqualFunc(gotSteps, wantSteps, sameEliminationStep) {
+			t.Fatalf("trial %d (numVars=%d, clauses=%v): steps = %v, want %v",
+				trial, numVars, original, gotSteps, wantSteps)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("trial %d (numVars=%d, clauses=%v): got %d surviving clauses %v, want %d %v",
+				trial, numVars, original, len(got), got, len(want), want)
+		}
+		for i := range want {
+			if !slices.Equal(got[i], want[i]) {
+				t.Fatalf("trial %d (numVars=%d, clauses=%v): clauses[%d] = %v, want %v",
+					trial, numVars, original, i, got[i], want[i])
+			}
+		}
 	}
 }
 

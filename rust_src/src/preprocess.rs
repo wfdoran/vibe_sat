@@ -133,6 +133,12 @@ pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessRes
         ..Stats::default()
     };
 
+    // STAGE31.md: shared across every round below, not reset per
+    // round -- see eliminate_variables's doc comment on its own
+    // budget parameter for why a fresh-every-call budget would fail
+    // to bound this loop's total work.
+    let mut bve_budget = BVE_WORK_BUDGET_FACTOR * problem.clauses.len();
+
     for _ in 0..MAX_ROUNDS {
         let mut changed = false;
 
@@ -160,7 +166,8 @@ pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessRes
         stats.clauses_subsumed += subsumed;
         changed |= subsumed > 0;
 
-        let new_steps = eliminate_variables(&mut clauses, &assignment, problem.num_vars);
+        let new_steps =
+            eliminate_variables(&mut clauses, &assignment, problem.num_vars, &mut bve_budget);
         if !new_steps.is_empty() {
             stats.variables_eliminated += new_steps.len();
             eliminated.extend(new_steps);
@@ -762,30 +769,91 @@ fn eliminate_subsumed_clauses_parallel(
 /// its negation), in which case it is always true and carries no
 /// information, so it is discarded rather than returned.
 ///
-/// STAGE25.md: `seen` used to be a `HashSet<Literal>`; per
-/// `eliminate_subsumed_clauses`'s doc comment above, a resolvent is
-/// typically just as short as any other clause in this project, so a
-/// plain `Vec` scan beats a `HashSet` here too -- and this also drops
-/// a per-call heap allocation that `resolve` paid on *every* one of
-/// its (often numerous: `pos`-occurrences x `neg`-occurrences per
-/// candidate variable) calls.
-fn resolve(pos: &Clause, neg: &Clause, v: usize) -> Option<Clause> {
-    let mut seen: Clause = Vec::with_capacity(pos.len() + neg.len());
+/// STAGE31.md/REPORT31.md: computes exactly the same result as
+/// `resolve` (a naive `O((len(pos)+len(neg))^2)` version kept in `mod
+/// tests` below purely as `eliminate_variables`'s test oracle -- see
+/// its doc comment there), but in `O(len(pos)+len(neg))`: `mark[w]`
+/// records whether variable `w` has been seen in this call's
+/// resolvent so far, and with which sign, replacing repeated linear
+/// scans with a single O(1) array lookup per literal.
+///
+/// `mark` must be sized `num_vars+1` and start (and end, which this
+/// function guarantees by cleaning up after itself via `touched`)
+/// entirely zeroed, so the same `mark`/`touched` pair can be reused
+/// across every call in a single `eliminate_variables` run without
+/// reallocating or re-zeroing an O(num_vars) array each time -- only
+/// the entries this call actually touches are reset, in `touched`'s
+/// O(resolvent length) cleanup pass at the end.
+fn resolve_with_marks(
+    pos: &Clause,
+    neg: &Clause,
+    v: usize,
+    mark: &mut [i8],
+    touched: &mut Vec<usize>,
+) -> Option<Clause> {
+    touched.clear();
     let mut resolvent = Clause::new();
+    let mut tautology = false;
+
     for &lit in pos.iter().chain(neg.iter()) {
-        if cnf::literal_var(lit) == v {
+        let w = cnf::literal_var(lit);
+        if w == v {
             continue;
         }
-        if seen.contains(&-lit) {
-            return None;
+        let sign: i8 = if cnf::literal_is_negative(lit) { -1 } else { 1 };
+        if mark[w] == sign {
+            continue; // duplicate literal, already in resolvent
         }
-        if !seen.contains(&lit) {
-            seen.push(lit);
-            resolvent.push(lit);
+        if mark[w] == -sign {
+            tautology = true;
+            break;
         }
+        mark[w] = sign;
+        touched.push(w);
+        resolvent.push(lit);
     }
-    Some(resolvent)
+
+    for &w in touched.iter() {
+        mark[w] = 0;
+    }
+    if tautology { None } else { Some(resolvent) }
 }
+
+/// Filters `list` in place, dropping any index no longer live
+/// (STAGE31.md: `eliminate_variables`'s occurrence lists are
+/// maintained incrementally -- entries are tombstoned via `live`, not
+/// physically removed from the list, when the clause they refer to is
+/// replaced -- so a variable's occurrence list must be compacted like
+/// this immediately before it is used, to skip stale indices left
+/// over from an earlier elimination).
+fn compact_live_occurrences(list: &mut Vec<usize>, live: &[bool]) {
+    list.retain(|&idx| live[idx]);
+}
+
+/// Bounds the total number of `resolve_with_marks` calls `run` allows
+/// bounded variable elimination across a *whole* preprocessing run
+/// (every round, not just one call to `eliminate_variables` -- see
+/// `budget`'s doc comment on the parameter below for why that
+/// distinction matters), as a multiple of the original clause count.
+/// The same kind of safety net STAGE30.md/REPORT30.md added for
+/// subsumption elimination, once that technique's own occurrence-list
+/// rewrite stopped being the dominant cost and exposed BVE as the
+/// next one (REPORT31.md). Even with the algorithmic fixes above, a
+/// single variable that genuinely occurs in thousands of clauses on
+/// both polarities still costs `O(occurrences^2)` `resolve_with_marks`
+/// calls if its elimination is ultimately accepted (the early-exit
+/// above only helps the *rejected* case) -- REPORT31.md's profiling
+/// measured real, legitimate files needing up to ~994x their clause
+/// count in resolve calls to complete BVE fully, and a genuinely
+/// pathological one exceeding 2845x (and still climbing) without this
+/// cap. 2000 sits comfortably above every legitimate value measured
+/// while cutting off runaway growth well before it becomes a
+/// multi-second, let alone unbounded, cost. Running out of budget is
+/// always safe, for the same reason it was for subsumption:
+/// abandoning an in-progress or not-yet-attempted elimination never
+/// changes whether the formula is satisfiable, only how compact it
+/// ends up.
+const BVE_WORK_BUDGET_FACTOR: usize = 2000;
 
 /// Applies bounded variable elimination (the NiVER rule: Subbarayan &
 /// Pradhan, SAT 2004): a variable `v` is eliminated by resolving every
@@ -800,87 +868,179 @@ fn resolve(pos: &Clause, neg: &Clause, v: usize) -> Option<Clause> {
 /// polarities (pure literals) or do not appear at all are left alone
 /// here; [`eliminate_pure_literals`] and `run`'s outer fixpoint loop
 /// handle those cases.
+///
+/// STAGE31.md: before this stage, every single elimination rebuilt
+/// both occurrence-list arrays and rescanned the entire clause set
+/// from scratch (both `O(clauses)`) before looking for the next one --
+/// REPORT31.md's profiling found this was the dominant cost on some
+/// real SAT Competition files, to the point of not finishing at all
+/// within any reasonable time. This version builds the occurrence
+/// lists once and maintains them incrementally: a clause is never
+/// physically removed (that would require renumbering every later
+/// index, right back to an `O(clauses)` cost), only tombstoned in
+/// `live`; a variable's occurrence list is compacted -- lazily, only
+/// when that variable is next considered, via `compact_live_occurrences`
+/// -- so this never costs more in total than the number of tombstones
+/// ever created. Newly created resolvents are appended to the end of
+/// `cs` (never inserted or reordered), and their literals' occurrence
+/// lists get exactly the new entry each needs, in `O(resolvent
+/// length)`.
+///
+/// The elimination order, and therefore the exact sequence of `steps`
+/// and the exact final surviving clauses, is unchanged from before
+/// this stage (up to `budget` running out, which is new this stage
+/// and can only change the outcome towards "less eliminated," never
+/// towards incorrectness): this still restarts its scan from `v=1`
+/// after every single elimination, mirroring the pre-STAGE31.md
+/// control flow exactly, which is what lets
+/// `test_eliminate_variables_matches_brute_force_on_random_formulas`
+/// assert byte-for-byte equality against `brute_force_eliminate_variables`
+/// (a kept-for-testing copy of the pre-STAGE31.md algorithm) rather
+/// than only a weaker "still satisfiability-preserving" property.
+///
+/// `budget` is a `&mut usize`, not a value, because `run` calls this
+/// once per preprocessing round: a budget freshly reset to
+/// `BVE_WORK_BUDGET_FACTOR * clauses.len()` on every call would let a
+/// single variable whose exploration alone exceeds the whole budget
+/// get retried from scratch, with a brand new budget, every single
+/// round -- up to `MAX_ROUNDS` times -- since exhausting the budget
+/// partway through examining `v` neither eliminates `v` (so it stays
+/// a candidate) nor marks it rejected (so nothing remembers to leave
+/// it alone next round either). A caller-owned budget shared across
+/// every round closes that hole: once it reaches zero, every later
+/// call in the same `run` bails out on its very first candidate pair,
+/// for the cost of a handful of array accesses, rather than
+/// re-attempting the same expensive variable from zero each time.
 fn eliminate_variables(
     clauses: &mut Vec<Clause>,
     assignment: &Assignment,
     num_vars: usize,
+    budget: &mut usize,
 ) -> Vec<EliminationStep> {
     let mut steps = Vec::new();
 
-    loop {
-        let mut positive: Vec<Vec<usize>> = vec![Vec::new(); num_vars + 1];
-        let mut negative: Vec<Vec<usize>> = vec![Vec::new(); num_vars + 1];
-        for (i, clause) in clauses.iter().enumerate() {
-            for &lit in clause {
-                let v = cnf::literal_var(lit);
-                if cnf::literal_is_negative(lit) {
-                    negative[v].push(i);
-                } else {
-                    positive[v].push(i);
-                }
+    let mut cs: Vec<Clause> = std::mem::take(clauses);
+    let mut live: Vec<bool> = vec![true; cs.len()];
+
+    let mut positive: Vec<Vec<usize>> = vec![Vec::new(); num_vars + 1];
+    let mut negative: Vec<Vec<usize>> = vec![Vec::new(); num_vars + 1];
+    for (i, clause) in cs.iter().enumerate() {
+        for &lit in clause {
+            let v = cnf::literal_var(lit);
+            if cnf::literal_is_negative(lit) {
+                negative[v].push(i);
+            } else {
+                positive[v].push(i);
             }
         }
+    }
 
+    // Reused across every resolve_with_marks call in this run; see
+    // that function's doc comment for why this avoids an O(num_vars)
+    // allocate-and-zero on every single resolution.
+    let mut mark: Vec<i8> = vec![0; num_vars + 1];
+    let mut touched: Vec<usize> = Vec::new();
+
+    loop {
         let mut eliminated_this_pass = false;
+        let mut budget_exhausted = false;
         for v in 1..=num_vars {
             if assignment[v] != Value::Unassigned {
                 continue;
             }
-            let pos_idx = &positive[v];
-            let neg_idx = &negative[v];
-            if pos_idx.is_empty() || neg_idx.is_empty() {
+            compact_live_occurrences(&mut positive[v], &live);
+            compact_live_occurrences(&mut negative[v], &live);
+            if positive[v].is_empty() || negative[v].is_empty() {
                 continue; // not eliminable here: pure or absent
             }
+            let pos_idx = positive[v].clone();
+            let neg_idx = negative[v].clone();
 
-            let mut resolvents = Vec::new();
-            for &pi in pos_idx {
-                for &ni in neg_idx {
-                    if let Some(resolvent) = resolve(&clauses[pi], &clauses[ni], v) {
+            let removed_count = pos_idx.len() + neg_idx.len();
+            let mut resolvents: Vec<Clause> = Vec::new();
+            let mut exceeded = false;
+            'resolve_loop: for &pi in &pos_idx {
+                for &ni in &neg_idx {
+                    if *budget == 0 {
+                        budget_exhausted = true;
+                        break 'resolve_loop;
+                    }
+                    *budget -= 1;
+                    if let Some(resolvent) =
+                        resolve_with_marks(&cs[pi], &cs[ni], v, &mut mark, &mut touched)
+                    {
                         resolvents.push(resolvent);
+                        if resolvents.len() > removed_count {
+                            // STAGE31.md: bail out as soon as the
+                            // non-increasing check below is guaranteed
+                            // to reject v, instead of computing every
+                            // remaining resolvent (REPORT31.md's
+                            // profiling found resolve calls for
+                            // ultimately-rejected high-degree
+                            // variables were a large share of total
+                            // preprocessing time). Once this count is
+                            // exceeded it can only grow, never shrink,
+                            // so the eventual decision below is
+                            // already determined.
+                            exceeded = true;
+                            break 'resolve_loop;
+                        }
                     }
                 }
             }
-
-            let removed_count = pos_idx.len() + neg_idx.len();
-            if resolvents.len() > removed_count {
+            if budget_exhausted {
+                // Not enough budget left to even fully evaluate this
+                // variable, let alone any variable after it -- stop
+                // attempting further eliminations entirely rather
+                // than accept v based on an incomplete resolvent set.
+                break;
+            }
+            if exceeded {
                 continue; // would increase the clause count; not worth it
             }
 
-            let positive_clauses: Vec<Clause> =
-                pos_idx.iter().map(|&i| clauses[i].clone()).collect();
-            let negative_clauses: Vec<Clause> =
-                neg_idx.iter().map(|&i| clauses[i].clone()).collect();
+            let positive_clauses: Vec<Clause> = pos_idx.iter().map(|&i| cs[i].clone()).collect();
+            let negative_clauses: Vec<Clause> = neg_idx.iter().map(|&i| cs[i].clone()).collect();
             steps.push(EliminationStep {
                 var: v,
                 positive: positive_clauses,
                 negative: negative_clauses,
             });
 
-            // STAGE25.md: remove_set used to be a HashSet<usize>;
-            // clause indices are already a dense range, so a plain
-            // Vec<bool> (direct O(1) indexing, no hashing) is both
-            // simpler and faster.
-            let mut remove_set = vec![false; clauses.len()];
             for &idx in pos_idx.iter().chain(neg_idx.iter()) {
-                remove_set[idx] = true;
+                live[idx] = false;
             }
-            let mut survivors: Vec<Clause> = clauses
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !remove_set[*i])
-                .map(|(_, clause)| clause.clone())
-                .collect();
-            survivors.extend(resolvents);
-            *clauses = survivors;
+            for resolvent in resolvents {
+                let new_idx = cs.len();
+                for &lit in &resolvent {
+                    let w = cnf::literal_var(lit);
+                    if cnf::literal_is_negative(lit) {
+                        negative[w].push(new_idx);
+                    } else {
+                        positive[w].push(new_idx);
+                    }
+                }
+                cs.push(resolvent);
+                live.push(true);
+            }
 
             eliminated_this_pass = true;
-            break; // occurrence lists above are now stale; rebuild and retry
+            break; // restart from v=1, exactly as before STAGE31.md
         }
 
-        if !eliminated_this_pass {
-            return steps;
+        if budget_exhausted || !eliminated_this_pass {
+            break;
         }
     }
+
+    let final_clauses: Vec<Clause> = cs
+        .into_iter()
+        .zip(live)
+        .filter(|(_, live)| *live)
+        .map(|(clause, _)| clause)
+        .collect();
+    *clauses = final_clauses;
+    steps
 }
 
 #[cfg(test)]
@@ -890,6 +1050,32 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use std::collections::HashSet;
+
+    /// Computes the resolvent of clauses `pos` and `neg` on variable
+    /// `v`, omitting the literal on `v` itself, or `None` if it would
+    /// be a tautology. This is exactly what `eliminate_variables`
+    /// itself used before STAGE31.md's `resolve_with_marks` rewrite
+    /// (see reports/REPORT31.md) -- kept here, deliberately naive and
+    /// `O((len(pos)+len(neg))^2)`, purely as a test oracle for
+    /// `resolve_with_marks` and `brute_force_eliminate_variables`
+    /// below, not shipped in the real preprocessing path.
+    fn resolve(pos: &Clause, neg: &Clause, v: usize) -> Option<Clause> {
+        let mut seen: Clause = Vec::with_capacity(pos.len() + neg.len());
+        let mut resolvent = Clause::new();
+        for &lit in pos.iter().chain(neg.iter()) {
+            if cnf::literal_var(lit) == v {
+                continue;
+            }
+            if seen.contains(&-lit) {
+                return None;
+            }
+            if !seen.contains(&lit) {
+                seen.push(lit);
+                resolvent.push(lit);
+            }
+        }
+        Some(resolvent)
+    }
 
     fn all_satisfied(clauses: &[Clause], assignment: &Assignment) -> bool {
         clauses.iter().all(|c| clause_satisfied(c, assignment))
@@ -1204,12 +1390,64 @@ mod tests {
         assert_eq!(got, HashSet::from([2, 3]));
     }
 
+    /// Checks `resolve_with_marks` against `resolve` directly
+    /// (tautology detection, intra-clause duplicate-literal handling,
+    /// and the resolvent contents), across several calls that
+    /// deliberately reuse the same mark/touched buffers and revisit
+    /// overlapping variables -- STAGE31.md/REPORT31.md: `mark` is
+    /// reset only for the entries a call actually touched, not with a
+    /// full clear, so a bug in that cleanup would only show up as a
+    /// leftover mark corrupting a *later* call that happens to touch
+    /// the same variable, which is exactly what this sequence of
+    /// cases is designed to exercise. The final check on `mark` itself
+    /// confirms nothing was left set after the last call.
+    #[test]
+    fn test_resolve_with_marks_matches_resolve_across_reused_buffers() {
+        let mut mark: Vec<i8> = vec![0; 6];
+        let mut touched: Vec<usize> = Vec::new();
+
+        let cases: Vec<(Clause, Clause, usize)> = vec![
+            (vec![1, 2], vec![-1, 3], 1),
+            (vec![2, 3], vec![-2, 4], 2),
+            (vec![1, 2], vec![-1, -2], 1),
+            (vec![3, 4], vec![-3, 4], 3),
+            (vec![5], vec![-5], 5),
+        ];
+
+        for (pos, neg, v) in &cases {
+            let want = resolve(pos, neg, *v);
+            let got = resolve_with_marks(pos, neg, *v, &mut mark, &mut touched);
+            match (&want, &got) {
+                (None, None) => {}
+                (Some(w), Some(g)) => {
+                    let want_set: HashSet<Literal> = w.iter().copied().collect();
+                    let got_set: HashSet<Literal> = g.iter().copied().collect();
+                    assert_eq!(got_set, want_set, "pos={pos:?} neg={neg:?} v={v}");
+                }
+                _ => panic!(
+                    "pos={pos:?} neg={neg:?} v={v}: resolve = {want:?}, resolve_with_marks = {got:?}"
+                ),
+            }
+        }
+
+        assert!(mark.iter().all(|&m| m == 0), "leaked mark: {mark:?}");
+    }
+
+    /// A `BVE_WORK_BUDGET_FACTOR`-style budget large enough that no
+    /// test using it is exercising STAGE31.md's work-budget cap --
+    /// that cap has its own dedicated tests below; every other
+    /// `eliminate_variables` test wants the pre-STAGE31.md, uncapped
+    /// behavior.
+    fn huge_budget() -> usize {
+        1 << 30
+    }
+
     #[test]
     fn test_eliminate_variables_non_increasing() {
         let mut clauses = vec![vec![1, 2], vec![-1, 3]];
         let assignment = assignment::new(3);
 
-        let steps = eliminate_variables(&mut clauses, &assignment, 3);
+        let steps = eliminate_variables(&mut clauses, &assignment, 3, &mut huge_budget());
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].var, 1);
         assert_eq!(clauses.len(), 1);
@@ -1228,8 +1466,156 @@ mod tests {
         ];
         let assignment = assignment::new(6);
 
-        let steps = eliminate_variables(&mut clauses, &assignment, 6);
+        let steps = eliminate_variables(&mut clauses, &assignment, 6, &mut huge_budget());
         assert!(steps.is_empty());
+    }
+
+    /// A deliberately naive, obviously-correct reference implementation
+    /// of bounded variable elimination -- exactly what
+    /// `eliminate_variables` itself was before STAGE31.md's
+    /// incremental-occurrence-list rewrite (see reports/REPORT31.md),
+    /// kept here purely as a test oracle rather than shipped in the
+    /// real preprocessing path. Used by
+    /// `test_eliminate_variables_matches_brute_force_on_random_formulas`
+    /// to build confidence in the fast version's correctness across
+    /// many random cases, not just the small number of hand-picked
+    /// examples above.
+    fn brute_force_eliminate_variables(
+        clauses: &mut Vec<Clause>,
+        assignment: &Assignment,
+        num_vars: usize,
+    ) -> Vec<EliminationStep> {
+        let mut steps = Vec::new();
+
+        loop {
+            let mut positive: Vec<Vec<usize>> = vec![Vec::new(); num_vars + 1];
+            let mut negative: Vec<Vec<usize>> = vec![Vec::new(); num_vars + 1];
+            for (i, clause) in clauses.iter().enumerate() {
+                for &lit in clause {
+                    let v = cnf::literal_var(lit);
+                    if cnf::literal_is_negative(lit) {
+                        negative[v].push(i);
+                    } else {
+                        positive[v].push(i);
+                    }
+                }
+            }
+
+            let mut eliminated_this_pass = false;
+            for v in 1..=num_vars {
+                if assignment[v] != Value::Unassigned {
+                    continue;
+                }
+                let pos_idx = &positive[v];
+                let neg_idx = &negative[v];
+                if pos_idx.is_empty() || neg_idx.is_empty() {
+                    continue;
+                }
+
+                let mut resolvents = Vec::new();
+                for &pi in pos_idx {
+                    for &ni in neg_idx {
+                        if let Some(resolvent) = resolve(&clauses[pi], &clauses[ni], v) {
+                            resolvents.push(resolvent);
+                        }
+                    }
+                }
+
+                let removed_count = pos_idx.len() + neg_idx.len();
+                if resolvents.len() > removed_count {
+                    continue;
+                }
+
+                let positive_clauses: Vec<Clause> =
+                    pos_idx.iter().map(|&i| clauses[i].clone()).collect();
+                let negative_clauses: Vec<Clause> =
+                    neg_idx.iter().map(|&i| clauses[i].clone()).collect();
+                steps.push(EliminationStep {
+                    var: v,
+                    positive: positive_clauses,
+                    negative: negative_clauses,
+                });
+
+                let mut remove_set = vec![false; clauses.len()];
+                for &idx in pos_idx.iter().chain(neg_idx.iter()) {
+                    remove_set[idx] = true;
+                }
+                let mut survivors: Vec<Clause> = clauses
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !remove_set[*i])
+                    .map(|(_, clause)| clause.clone())
+                    .collect();
+                survivors.extend(resolvents);
+                *clauses = survivors;
+
+                eliminated_this_pass = true;
+                break;
+            }
+
+            if !eliminated_this_pass {
+                return steps;
+            }
+        }
+    }
+
+    /// Reports whether `a` and `b` record the same eliminated variable
+    /// from the same positive/negative clauses.
+    fn same_elimination_step(a: &EliminationStep, b: &EliminationStep) -> bool {
+        a.var == b.var && a.positive == b.positive && a.negative == b.negative
+    }
+
+    /// Fuzz-tests the incremental-occurrence-list rewrite
+    /// (STAGE31.md/REPORT31.md) against `brute_force_eliminate_variables`
+    /// across many random small clause sets, reusing Stage 30's
+    /// `random_clause_set` generator. Both algorithms restart their
+    /// elimination scan from `v=1` after every single elimination and
+    /// call `resolve`/`resolve_with_marks` in the same order, so
+    /// REPORT31.md's claim that this stage changed only internal
+    /// bookkeeping -- never which variables get eliminated, in what
+    /// order, or what the final clauses are -- is checked here as
+    /// exact equality (steps and surviving clauses, both in order),
+    /// not merely a weaker "still satisfiable" property.
+    #[test]
+    fn test_eliminate_variables_matches_brute_force_on_random_formulas() {
+        let mut rng = StdRng::seed_from_u64(2468013579);
+        const TRIALS: usize = 500;
+        for trial in 0..TRIALS {
+            let num_vars: i32 = 1 + rng.random_range(0..8);
+            let num_clauses = rng.random_range(0..20);
+            let original = random_clause_set(&mut rng, num_vars, num_clauses);
+
+            let mut want = original.clone();
+            let want_steps = brute_force_eliminate_variables(
+                &mut want,
+                &assignment::new(num_vars as usize),
+                num_vars as usize,
+            );
+
+            let mut got = original.clone();
+            let got_steps = eliminate_variables(
+                &mut got,
+                &assignment::new(num_vars as usize),
+                num_vars as usize,
+                &mut huge_budget(),
+            );
+
+            assert_eq!(
+                got_steps.len(),
+                want_steps.len(),
+                "trial {trial} (num_vars={num_vars}, clauses={original:?})"
+            );
+            for (g, w) in got_steps.iter().zip(want_steps.iter()) {
+                assert!(
+                    same_elimination_step(g, w),
+                    "trial {trial}: step {g:?}, want {w:?}"
+                );
+            }
+            assert_eq!(
+                got, want,
+                "trial {trial} (num_vars={num_vars}, clauses={original:?})"
+            );
+        }
     }
 
     #[test]

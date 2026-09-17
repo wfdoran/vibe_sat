@@ -428,6 +428,16 @@ func resolve(pos, neg cnf.Clause, v int) (resolvent cnf.Clause, ok bool) {
 	// a map here too, and this also drops a per-call map allocation
 	// that resolve paid on every single one of its (often numerous:
 	// pos-occurrences x neg-occurrences per candidate variable) calls.
+	//
+	// STAGE31.md: this O(clause length^2) version (each of up to
+	// len(pos)+len(neg) literals does an O(seen) slices.Contains scan,
+	// twice) is kept only as eliminateVariables's test oracle now --
+	// REPORT31.md's profiling found it was 74% of one real file's
+	// entire preprocessing time by itself, called by the thousands for
+	// a single high-degree variable. resolveWithMarks below computes
+	// the identical result in O(clause length) using a reusable
+	// mark array instead of repeated linear scans; eliminateVariables
+	// uses that version exclusively.
 	seen := make(cnf.Clause, 0, len(pos)+len(neg))
 	add := func(lit cnf.Literal) bool {
 		if lit.Var() == v {
@@ -455,6 +465,87 @@ func resolve(pos, neg cnf.Clause, v int) (resolvent cnf.Clause, ok bool) {
 	return resolvent, true
 }
 
+// resolveWithMarks computes exactly the same result as resolve (the
+// resolvent of pos and neg on variable v, or ok=false if it would be
+// a tautology), but in O(len(pos)+len(neg)) instead of resolve's
+// O((len(pos)+len(neg))^2): mark[w] records whether variable w has
+// been seen in this call's resolvent so far, and if so with which
+// sign (+1, -1, or 0 for not yet seen), replacing resolve's repeated
+// slices.Contains scans with a single O(1) array lookup per literal.
+//
+// mark must be sized numVars+1 and start (and end, which this
+// function guarantees by cleaning up after itself via *touched)
+// entirely zeroed, so the same mark/touched pair can be reused across
+// every call in a single eliminateVariables run without reallocating
+// or re-zeroing an O(numVars) array each time -- only the entries
+// this call actually touches are reset, in *touched's O(resolvent
+// length) cleanup pass at the end.
+func resolveWithMarks(pos, neg cnf.Clause, v int, mark []int8, touched *[]int) (resolvent cnf.Clause, ok bool) {
+	ts := (*touched)[:0]
+	reset := func() {
+		for _, w := range ts {
+			mark[w] = 0
+		}
+		*touched = ts[:0]
+	}
+
+	consider := func(lit cnf.Literal) bool {
+		w := lit.Var()
+		if w == v {
+			return true
+		}
+		sign := int8(1)
+		if lit.IsNegative() {
+			sign = -1
+		}
+		switch mark[w] {
+		case sign:
+			return true // duplicate literal, already in resolvent
+		case -sign:
+			return false // tautology: lit and -lit both present
+		default:
+			mark[w] = sign
+			ts = append(ts, w)
+			resolvent = append(resolvent, lit)
+			return true
+		}
+	}
+
+	for _, lit := range pos {
+		if !consider(lit) {
+			reset()
+			return nil, false
+		}
+	}
+	for _, lit := range neg {
+		if !consider(lit) {
+			reset()
+			return nil, false
+		}
+	}
+	reset()
+	return resolvent, true
+}
+
+// compactLiveOccurrences filters list in place, dropping any index no
+// longer live (STAGE31.md: eliminateVariables's occurrence lists are
+// maintained incrementally -- entries are tombstoned via live, not
+// physically removed from the list, when the clause they refer to is
+// replaced -- so a variable's occurrence list must be compacted like
+// this immediately before it is used, to skip stale indices left
+// over from an earlier elimination). Reuses list's own backing array
+// (the write cursor never exceeds the read cursor), so this never
+// allocates.
+func compactLiveOccurrences(list []int, live []bool) []int {
+	out := list[:0]
+	for _, idx := range list {
+		if live[idx] {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
 // eliminateVariables applies bounded variable elimination (the
 // NiVER rule: Subbarayan & Pradhan, SAT 2004): a variable v is
 // eliminated by resolving every clause containing +v against every
@@ -468,80 +559,204 @@ func resolve(pos, neg cnf.Clause, v int) (resolvent cnf.Clause, ok bool) {
 // polarities (pure literals) or do not appear at all are left alone
 // here; eliminatePureLiterals and Run's outer fixpoint loop handle
 // those cases.
-func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, numVars int) []EliminationStep {
+//
+// STAGE31.md: before this stage, every single elimination rebuilt
+// both occurrence-list arrays and rescanned the entire clause set
+// from scratch (both O(clauses)) before looking for the next one --
+// REPORT31.md's profiling found this was the dominant cost on some
+// real SAT Competition files, to the point of not finishing at all
+// within any reasonable time. This version builds the occurrence
+// lists once and maintains them incrementally: a clause is never
+// physically removed (that would require renumbering every later
+// index, right back to an O(clauses) cost), only tombstoned in live;
+// a variable's occurrence list is compacted -- lazily, only when that
+// variable is next considered, and reusing its own backing array, so
+// this never costs more in total than the number of tombstones ever
+// created -- immediately before use via compactLiveOccurrences.
+// Newly created resolvents are appended to the end of clauses (never
+// inserted or reordered), and their literals' occurrence lists get
+// exactly the new append each needs, in O(resolvent length).
+//
+// The elimination order, and therefore the exact sequence of Steps
+// and the exact final surviving clauses, is unchanged from before
+// this stage: this still restarts its scan from v=1 after every
+// single elimination (mirroring the pre-STAGE31.md control flow
+// exactly), which is what lets TestEliminateVariablesMatchesBruteForceOnRandomFormulas
+// assert byte-for-byte equality against bruteForceEliminateVariables
+// (a kept-for-testing copy of the pre-STAGE31.md algorithm) rather
+// than only a weaker "still satisfiability-preserving" property. What
+// changed is entirely internal bookkeeping, never what gets
+// eliminated or in what order -- up to bveWorkBudgetFactor's cap
+// below, which is new this stage and can change the outcome (always
+// towards "less eliminated", never towards incorrectness) once
+// tripped.
+//
+// bveWorkBudgetFactor sizes the total number of resolveWithMarks
+// calls Run allows bounded variable elimination across a *whole*
+// preprocessing run (every round, not just one call to
+// eliminateVariables -- see budget's doc comment on the parameter
+// below for why that distinction matters), as a multiple of the
+// original clause count. The same kind of safety net
+// STAGE30.md/REPORT30.md added for subsumption elimination, once that
+// technique's own occurrence-list rewrite stopped being the dominant
+// cost and exposed BVE as the next one (REPORT31.md). Even with the
+// algorithmic fixes above, a single variable that genuinely occurs in
+// thousands of clauses on both polarities still costs
+// O(occurrences^2) resolveWithMarks calls if its elimination is
+// ultimately accepted (the early-exit above only helps the *rejected*
+// case) -- REPORT31.md's profiling measured real, legitimate files
+// needing up to ~994x their clause count in resolve calls to complete
+// BVE fully, and a genuinely pathological one exceeding 2845x (and
+// still climbing) without this cap. 2000 sits comfortably above every
+// legitimate value measured while cutting off runaway growth well
+// before it becomes a multi-second, let alone unbounded, cost.
+// Running out of budget is always safe, for the same reason it was
+// for subsumption: abandoning an in-progress or not-yet-attempted
+// elimination never changes whether the formula is satisfiable, only
+// how compact it ends up.
+const bveWorkBudgetFactor = 2000
+
+// eliminateVariables applies bounded variable elimination once,
+// consuming from *budget as it goes. budget is a pointer, not a
+// value, because Run calls this once per preprocessing round: a
+// budget freshly reset to bveWorkBudgetFactor*len(clauses) on every
+// call would let a single variable whose exploration alone exceeds
+// the whole budget get retried from scratch, with a brand new budget,
+// every single round -- up to maxRounds times -- since exhausting the
+// budget partway through examining v neither eliminates v (so it
+// stays a candidate) nor marks it rejected (so nothing else remembers
+// to leave it alone next round either. A caller-owned budget shared
+// across every round closes that hole: once it reaches zero, every
+// later call in the same Run bails out on its very first candidate
+// pair, for the cost of a handful of array accesses, rather than
+// re-attempting the same expensive variable from zero each time.
+func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, numVars int, budget *int) []EliminationStep {
 	var steps []EliminationStep
 
-	for {
-		positive := make([][]int, numVars+1) // positive[v] = indices of clauses containing +v
-		negative := make([][]int, numVars+1)
-		for i, clause := range *clauses {
-			for _, lit := range clause {
-				if lit.IsNegative() {
-					negative[lit.Var()] = append(negative[lit.Var()], i)
-				} else {
-					positive[lit.Var()] = append(positive[lit.Var()], i)
-				}
+	cs := *clauses
+	live := make([]bool, len(cs))
+	for i := range live {
+		live[i] = true
+	}
+
+	positive := make([][]int, numVars+1) // positive[v] = indices of clauses containing +v
+	negative := make([][]int, numVars+1)
+	for i, clause := range cs {
+		for _, lit := range clause {
+			if lit.IsNegative() {
+				negative[lit.Var()] = append(negative[lit.Var()], i)
+			} else {
+				positive[lit.Var()] = append(positive[lit.Var()], i)
 			}
 		}
+	}
 
+	// Reused across every resolveWithMarks call in this run; see that
+	// function's doc comment for why this avoids an O(numVars)
+	// allocate-and-zero on every single resolution.
+	mark := make([]int8, numVars+1)
+	var touched []int
+
+	for {
 		eliminatedThisPass := false
+		budgetExhausted := false
 		for v := 1; v <= numVars; v++ {
 			if assignment[v] != assign.Unassigned {
 				continue
 			}
+			positive[v] = compactLiveOccurrences(positive[v], live)
+			negative[v] = compactLiveOccurrences(negative[v], live)
 			posIdx, negIdx := positive[v], negative[v]
 			if len(posIdx) == 0 || len(negIdx) == 0 {
 				continue // not eliminable here: pure or absent
 			}
 
+			removedCount := len(posIdx) + len(negIdx)
 			var resolvents []cnf.Clause
+			exceeded := false
+		resolveLoop:
 			for _, pi := range posIdx {
 				for _, ni := range negIdx {
-					if resolvent, ok := resolve((*clauses)[pi], (*clauses)[ni], v); ok {
-						resolvents = append(resolvents, resolvent)
+					if *budget <= 0 {
+						budgetExhausted = true
+						break resolveLoop
+					}
+					*budget--
+					resolvent, ok := resolveWithMarks(cs[pi], cs[ni], v, mark, &touched)
+					if !ok {
+						continue
+					}
+					resolvents = append(resolvents, resolvent)
+					if len(resolvents) > removedCount {
+						// STAGE31.md: bail out as soon as the
+						// non-increasing check below is guaranteed to
+						// reject v, instead of computing every
+						// remaining resolvent (REPORT31.md's
+						// profiling found resolve calls for
+						// ultimately-rejected high-degree variables
+						// were a large share of total preprocessing
+						// time). Once this count is exceeded it can
+						// only grow, never shrink, so the eventual
+						// decision below is already determined.
+						exceeded = true
+						break resolveLoop
 					}
 				}
 			}
-
-			removedCount := len(posIdx) + len(negIdx)
-			if len(resolvents) > removedCount {
+			if budgetExhausted {
+				// Not enough budget left to even fully evaluate this
+				// variable, let alone any variable after it -- stop
+				// attempting further eliminations entirely rather
+				// than accept v based on an incomplete resolvent set.
+				break
+			}
+			if exceeded {
 				continue // would increase the clause count; not worth it
 			}
 
 			step := EliminationStep{Var: v}
 			for _, pi := range posIdx {
-				step.Positive = append(step.Positive, (*clauses)[pi])
+				step.Positive = append(step.Positive, cs[pi])
 			}
 			for _, ni := range negIdx {
-				step.Negative = append(step.Negative, (*clauses)[ni])
+				step.Negative = append(step.Negative, cs[ni])
 			}
 			steps = append(steps, step)
 
-			// STAGE25.md: removeSet was a map[int]bool; clause indices
-			// are already a dense range, so a plain boolean slice
-			// (direct O(1) indexing, no hashing) is both simpler and
-			// faster.
-			removeSet := make([]bool, len(*clauses))
 			for _, idx := range posIdx {
-				removeSet[idx] = true
+				live[idx] = false
 			}
 			for _, idx := range negIdx {
-				removeSet[idx] = true
+				live[idx] = false
 			}
-			var survivors []cnf.Clause
-			for i, clause := range *clauses {
-				if !removeSet[i] {
-					survivors = append(survivors, clause)
+			for _, resolvent := range resolvents {
+				newIdx := len(cs)
+				cs = append(cs, resolvent)
+				live = append(live, true)
+				for _, lit := range resolvent {
+					if lit.IsNegative() {
+						negative[lit.Var()] = append(negative[lit.Var()], newIdx)
+					} else {
+						positive[lit.Var()] = append(positive[lit.Var()], newIdx)
+					}
 				}
 			}
-			*clauses = append(survivors, resolvents...)
 
 			eliminatedThisPass = true
-			break // occurrence lists above are now stale; rebuild and retry
+			break // restart from v=1, exactly as before STAGE31.md
 		}
 
-		if !eliminatedThisPass {
-			return steps
+		if budgetExhausted || !eliminatedThisPass {
+			break
 		}
 	}
+
+	final := make([]cnf.Clause, 0, len(cs))
+	for i, clause := range cs {
+		if live[i] {
+			final = append(final, clause)
+		}
+	}
+	*clauses = final
+	return steps
 }
