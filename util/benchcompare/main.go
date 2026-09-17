@@ -57,9 +57,11 @@ func runMain() error {
 		projectRootFlag = flag.String("project-root", "", "path to the vibe_sat repository root (default: auto-detected by walking up from the current directory)")
 		goBinFlag       = flag.String("go-bin", "", "path to a pre-built go vibe_sat binary (default: build one from go_src)")
 		rustBinFlag     = flag.String("rust-bin", "", "path to a pre-built rust vibe_sat binary (default: build one, in release mode, from rust_src)")
-		dirsFlag        = flag.String("dirs", "", "comma-separated benchmark/ subdirectory names to draw .cnf files from, e.g. uf250-1065,uuf250-1065 (required)")
-		sampleFlag      = flag.Int("sample", 0, "sample at most this many files per directory (0 = use every file)")
+		dirsFlag        = flag.String("dirs", "", "comma-separated benchmark/ subdirectory names to draw .cnf files from, e.g. uf250-1065,uuf250-1065 (at least one of --dirs/--paths is required)")
+		pathsFlag       = flag.String("paths", "", "comma-separated literal directory paths (absolute, or relative to the current directory) to draw .cnf files from -- for a local-only benchmark set that isn't under benchmark/ at all, e.g. --paths=../../sat_comp/2018 (at least one of --dirs/--paths is required)")
+		sampleFlag      = flag.Int("sample", 0, "sample at most this many files per --dirs/--paths entry (0 = use every file)")
 		seedFlag        = flag.Int64("seed", 1, "seed for --sample's file selection, for a reproducible sweep across runs")
+		maxSizeMBFlag   = flag.Int("max-size-mb", 0, "exclude any .cnf file larger than this many megabytes (0 = no limit) -- see README.md for why a large, unfamiliar benchmark set should usually set this")
 		algorithmFlag   = flag.String("algorithm", "", "vibe_sat --algorithm value: hc, ws, dfs, or cdcl (required)")
 		algParamsFlag   = flag.String("alg-params", "", "space-separated --alg-params values, passed through verbatim, e.g. \"2 4\"")
 		timeLimitFlag   = flag.Int("time-limit-secs", 0, "vibe_sat --time-limit-secs value (0 = omit the flag entirely)")
@@ -71,8 +73,8 @@ func runMain() error {
 	)
 	flag.Parse()
 
-	if *dirsFlag == "" {
-		return fmt.Errorf("--dirs is required")
+	if *dirsFlag == "" && *pathsFlag == "" {
+		return fmt.Errorf("at least one of --dirs or --paths is required")
 	}
 	if *algorithmFlag == "" {
 		return fmt.Errorf("--algorithm is required")
@@ -110,12 +112,25 @@ func runMain() error {
 		}
 	}
 
-	files, err := selectFiles(projectRoot, strings.Split(*dirsFlag, ","), *sampleFlag, *seedFlag)
-	if err != nil {
-		return err
+	maxSizeBytes := int64(*maxSizeMBFlag) * 1024 * 1024
+
+	var files []string
+	if *dirsFlag != "" {
+		dirFiles, err := selectFiles(projectRoot, strings.Split(*dirsFlag, ","), *sampleFlag, *seedFlag, maxSizeBytes)
+		if err != nil {
+			return err
+		}
+		files = append(files, dirFiles...)
+	}
+	if *pathsFlag != "" {
+		pathFiles, err := selectPaths(strings.Split(*pathsFlag, ","), *sampleFlag, *seedFlag, maxSizeBytes)
+		if err != nil {
+			return err
+		}
+		files = append(files, pathFiles...)
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("no .cnf files found under the requested --dirs")
+		return fmt.Errorf("no .cnf files found under the requested --dirs/--paths (or all were excluded by --max-size-mb)")
 	}
 
 	var algParams []string
@@ -224,7 +239,9 @@ func looksLikeProjectRoot(dir string) bool {
 // dirNames, then, if sample > 0, deterministically (given seed)
 // samples at most that many files from each directory -- so a large
 // directory like uf250-1065's 100 files can be swept at a manageable
-// size without the selection changing from run to run.
+// size without the selection changing from run to run. maxSizeBytes,
+// if positive, silently excludes any file larger than that (see
+// selectFromDir's doc comment for why this exists).
 //
 // The recursive walk matters: benchmark/'s subdirectories are not all
 // laid out the same way -- most (e.g. uf250-1065) hold their .cnf
@@ -232,7 +249,7 @@ func looksLikeProjectRoot(dir string) bool {
 // uuf75-325) have an extra nested folder level, a leftover of how
 // their original SATLIB tarball extracted. Walking recursively handles
 // both without needing special-case knowledge of which is which.
-func selectFiles(projectRoot string, dirNames []string, sample int, seed int64) ([]string, error) {
+func selectFiles(projectRoot string, dirNames []string, sample int, seed int64, maxSizeBytes int64) ([]string, error) {
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0x9e3779b97f4a7c15))
 
 	var all []string
@@ -242,29 +259,91 @@ func selectFiles(projectRoot string, dirNames []string, sample int, seed int64) 
 			continue
 		}
 		dir := filepath.Join(projectRoot, "benchmark", name)
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			return nil, fmt.Errorf("benchmark directory %q does not exist", dir)
-		}
-		var found []string
-		walkErr := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if !d.IsDir() && strings.HasSuffix(d.Name(), ".cnf") {
-				found = append(found, path)
-			}
-			return nil
-		})
-		if walkErr != nil {
-			return nil, fmt.Errorf("reading benchmark directory %q: %w", dir, walkErr)
-		}
-		sort.Strings(found) // deterministic order before sampling
-		if sample > 0 && len(found) > sample {
-			rng.Shuffle(len(found), func(i, j int) { found[i], found[j] = found[j], found[i] })
-			found = found[:sample]
-			sort.Strings(found) // deterministic printing order after sampling too
+		found, err := selectFromDir(dir, sample, maxSizeBytes, rng)
+		if err != nil {
+			return nil, fmt.Errorf("benchmark directory %q: %w", dir, err)
 		}
 		all = append(all, found...)
 	}
 	return all, nil
+}
+
+// selectPaths is selectFiles' counterpart for literal filesystem
+// paths rather than names relative to benchmark/ -- STAGE29.md's
+// sat_comp/2018 (deliberately kept outside benchmark/ and out of the
+// repository entirely; see reports/REPORT29.md) is exactly the case
+// this exists for: a local-only benchmark set this tool still needs
+// to be able to point at, now and in any future stage, without it
+// ever being committed. Each entry in dirPaths is resolved relative to
+// the current working directory (or used as-is if already absolute),
+// not projectRoot, since a local-only benchmark set has no fixed
+// location inside this repository to be relative to.
+func selectPaths(dirPaths []string, sample int, seed int64, maxSizeBytes int64) ([]string, error) {
+	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0x9e3779b97f4a7c15))
+
+	var all []string
+	for _, dir := range dirPaths {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		found, err := selectFromDir(dir, sample, maxSizeBytes, rng)
+		if err != nil {
+			return nil, fmt.Errorf("path %q: %w", dir, err)
+		}
+		all = append(all, found...)
+	}
+	return all, nil
+}
+
+// selectFromDir recursively finds every *.cnf file under dir, drops
+// any larger than maxSizeBytes (if positive -- 0 means no limit), and,
+// if sample > 0, deterministically (via rng) samples at most that many
+// of what remains.
+//
+// The size cap exists because of a real hazard REPORT29.md hit
+// directly: a single multi-hundred-megabyte, multi-million-clause CNF
+// file can exhaust available memory or blow through an intended time
+// limit by more than an order of magnitude (dfs's per-branch watch-
+// state cloning in particular -- see REPORT9.md's own flagged
+// scalability tradeoff), and unlike a slow-but-safe run,
+// --hard-timeout-secs cannot save you from an OOM kill that happens
+// before the timeout would even fire. A sweep across an unfamiliar,
+// wildly-size-varying benchmark set should default to excluding the
+// files most likely to cause that, not discover the hazard the hard
+// way on every single run.
+func selectFromDir(dir string, sample int, maxSizeBytes int64, rng *rand.Rand) ([]string, error) {
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("directory does not exist")
+	}
+	var found []string
+	walkErr := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".cnf") {
+			return nil
+		}
+		if maxSizeBytes > 0 {
+			info, statErr := d.Info()
+			if statErr != nil {
+				return statErr
+			}
+			if info.Size() > maxSizeBytes {
+				return nil
+			}
+		}
+		found = append(found, path)
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("reading directory: %w", walkErr)
+	}
+	sort.Strings(found) // deterministic order before sampling
+	if sample > 0 && len(found) > sample {
+		rng.Shuffle(len(found), func(i, j int) { found[i], found[j] = found[j], found[i] })
+		found = found[:sample]
+		sort.Strings(found) // deterministic printing order after sampling too
+	}
+	return found, nil
 }
