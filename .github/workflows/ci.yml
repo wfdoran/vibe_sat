@@ -1,0 +1,105 @@
+# Continuous integration (STAGE28.md / reports/REPORT28.md).
+#
+# Runs the same checks this project has always run by hand at the end
+# of every stage -- go build/vet/gofmt/test, cargo fmt/clippy/build/test
+# -- automatically, on GitHub's own servers, every time anything is
+# pushed to this repository or a pull request is opened against it.
+# See reports/REPORT28.md for a full explanation of where this
+# actually runs, what it costs, and how you find out about a failure.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    name: Go (build, vet, gofmt, test -race)
+    runs-on: ubuntu-latest
+    # A generous but finite ceiling: without this, a hung job (e.g. a
+    # future concurrency bug that deadlocks instead of failing fast)
+    # would otherwise be allowed to run for up to GitHub's own default
+    # of 6 hours before being killed, silently burning through the
+    # account's included Actions minutes the whole time.
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: go_src
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Reads the "go 1.26.5" directive straight out of go_src/go.mod,
+          # so this workflow never needs updating by hand when that
+          # changes.
+          go-version-file: go_src/go.mod
+          # go_src has no external dependencies (PROMPT.md's Go
+          # constraint) and so no go.sum for setup-go's built-in
+          # dependency cache to key off of; caching would be a no-op
+          # here, so it's turned off rather than left to print a
+          # harmless-but-noisy warning on every run.
+          cache: false
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test (with the race detector)
+        run: go test -race ./...
+
+  rust:
+    name: Rust (fmt, clippy, build, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rust_src
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+
+      # rust_src does depend on a handful of ordinary crates (clap,
+      # rand, crossbeam-deque, arc-swap -- see PROMPT.md's "crates are
+      # inevitable" note), so, unlike Go above, there's real compiled
+      # output worth reusing between runs. Keyed on Cargo.lock's
+      # contents: any dependency-version change gets a fresh cache
+      # automatically.
+      - name: Cache the cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust_src/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust_src/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (release)
+        run: cargo test --release

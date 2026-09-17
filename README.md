@@ -1,5 +1,7 @@
 # vibe_sat
 
+[![CI](https://github.com/wfdoran/vibe_sat/actions/workflows/ci.yml/badge.svg)](https://github.com/wfdoran/vibe_sat/actions/workflows/ci.yml)
+
 `vibe_sat` is a command line SAT solver, implemented twice from the
 same specification — once in Go, once in Rust — and developed side by
 side, one stage at a time.
