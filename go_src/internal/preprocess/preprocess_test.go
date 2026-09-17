@@ -1,6 +1,7 @@
 package preprocess
 
 import (
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -83,6 +84,32 @@ func TestEliminatePureLiterals(t *testing.T) {
 	}
 }
 
+// TestTrySubsumeFromGenericRespectsZeroWorkBudget confirms the
+// STAGE30.md/REPORT30.md work-budget safety net actually does nothing
+// (removes nothing, touches no keep bit) once the budget is exhausted,
+// rather than, say, panicking on an unexpected state or ignoring the
+// budget entirely -- directly, deterministically, rather than trying
+// to organically construct a formula large enough to exhaust the real
+// default budget.
+func TestTrySubsumeFromGenericRespectsZeroWorkBudget(t *testing.T) {
+	clauses := []cnf.Clause{
+		{cnf.Literal(1)},
+		{cnf.Literal(1), cnf.Literal(2)},
+	}
+	occ := buildLiteralOccurrenceLists(clauses, 2)
+	keep := []bool{true, true}
+	budget := 0
+
+	trySubsumeFromGeneric(clauses, occ, len(clauses),
+		func(i int) bool { return keep[i] },
+		func(i int) { keep[i] = false },
+		0, len(clauses), &budget)
+
+	if !keep[0] || !keep[1] {
+		t.Errorf("a zero work budget should have removed nothing; keep = %v", keep)
+	}
+}
+
 // TestEliminateSubsumedClausesRemovesSuperset verifies that a longer
 // clause subsumed by a shorter one is removed.
 func TestEliminateSubsumedClausesRemovesSuperset(t *testing.T) {
@@ -90,7 +117,7 @@ func TestEliminateSubsumedClausesRemovesSuperset(t *testing.T) {
 		{cnf.Literal(1), cnf.Literal(2)},
 		{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)},
 	}
-	numRemoved := eliminateSubsumedClauses(&clauses)
+	numRemoved := eliminateSubsumedClauses(&clauses, 3)
 	if numRemoved != 1 {
 		t.Fatalf("numRemoved = %d, want 1", numRemoved)
 	}
@@ -106,7 +133,7 @@ func TestEliminateSubsumedClausesRemovesDuplicates(t *testing.T) {
 		{cnf.Literal(1), cnf.Literal(-2)},
 		{cnf.Literal(1), cnf.Literal(-2)},
 	}
-	numRemoved := eliminateSubsumedClauses(&clauses)
+	numRemoved := eliminateSubsumedClauses(&clauses, 2)
 	if numRemoved != 1 {
 		t.Fatalf("numRemoved = %d, want 1", numRemoved)
 	}
@@ -144,11 +171,11 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialChained(t *testing.T) 
 	}
 
 	want := cloneClauses(original)
-	wantRemoved := eliminateSubsumedClauses(&want)
+	wantRemoved := eliminateSubsumedClauses(&want, 4)
 
 	for _, numThreads := range []int{1, 2, 3, 4, 8} {
 		got := cloneClauses(original)
-		gotRemoved := eliminateSubsumedClausesParallel(&got, numThreads)
+		gotRemoved := eliminateSubsumedClausesParallel(&got, 4, numThreads)
 		if gotRemoved != wantRemoved {
 			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
 		}
@@ -175,14 +202,14 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialOnRealFile(t *testing.
 	}
 
 	want := cloneClauses(problem.Clauses)
-	wantRemoved := eliminateSubsumedClauses(&want)
+	wantRemoved := eliminateSubsumedClauses(&want, problem.NumVars)
 	if wantRemoved == 0 {
 		t.Fatal("test file has nothing to subsume; pick a different file")
 	}
 
 	for _, numThreads := range []int{1, 2, 3, 4, 8, 16} {
 		got := cloneClauses(problem.Clauses)
-		gotRemoved := eliminateSubsumedClausesParallel(&got, numThreads)
+		gotRemoved := eliminateSubsumedClausesParallel(&got, problem.NumVars, numThreads)
 		if gotRemoved != wantRemoved {
 			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
 		}
@@ -192,6 +219,110 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialOnRealFile(t *testing.
 		for i := range want {
 			if !slices.Equal(got[i], want[i]) {
 				t.Errorf("numThreads=%d: clauses[%d] = %v, want %v", numThreads, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// bruteForceSubsumedClauses is a deliberately naive, obviously-correct
+// O(clauses^2) reference implementation of subsumption elimination --
+// exactly what eliminateSubsumedClauses itself was before STAGE30.md's
+// occurrence-list rewrite (see reports/REPORT30.md), kept here purely
+// as a test oracle rather than shipped in the real preprocessing path.
+// Used by TestEliminateSubsumedClausesMatchesBruteForceOnRandomFormulas
+// to build confidence in the fast version's correctness across many
+// random cases, not just the small number of hand-picked and
+// real-file examples above.
+func bruteForceSubsumedClauses(clauses []cnf.Clause) []cnf.Clause {
+	keep := make([]bool, len(clauses))
+	for i := range keep {
+		keep[i] = true
+	}
+	for i := range clauses {
+		if !keep[i] {
+			continue
+		}
+		for j := range clauses {
+			if i == j || !keep[j] {
+				continue
+			}
+			if len(clauses[i]) > len(clauses[j]) {
+				continue
+			}
+			if len(clauses[i]) == len(clauses[j]) && i > j {
+				continue
+			}
+			if isSubsetOf(clauses[i], clauses[j]) {
+				keep[j] = false
+			}
+		}
+	}
+	var kept []cnf.Clause
+	for i, c := range clauses {
+		if keep[i] {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
+// randomClauseSet generates a random, small clause set over variables
+// 1..numVars, with clause lengths and repeated/overlapping literals
+// deliberately likely (a small numVars relative to clause count all
+// but guarantees plenty of real subsumption relationships to exercise,
+// unlike sampling from a huge variable space where clauses would
+// almost never overlap at all).
+func randomClauseSet(rng *rand.Rand, numVars, numClauses int) []cnf.Clause {
+	clauses := make([]cnf.Clause, numClauses)
+	for i := range clauses {
+		length := 1 + rng.IntN(4)
+		clause := make(cnf.Clause, length)
+		for j := range clause {
+			v := 1 + rng.IntN(numVars)
+			if rng.IntN(2) == 0 {
+				v = -v
+			}
+			clause[j] = cnf.Literal(v)
+		}
+		clauses[i] = clause
+	}
+	return clauses
+}
+
+// TestEliminateSubsumedClausesMatchesBruteForceOnRandomFormulas fuzz-
+// tests the occurrence-list-based rewrite (STAGE30.md/REPORT30.md)
+// against bruteForceSubsumedClauses across many random small clause
+// sets, small enough (numVars/numClauses chosen so
+// subsumptionWorkBudgetFactor's default budget is never remotely
+// exhausted) that any discrepancy can only be a correctness bug in the
+// occurrence-list restriction itself, not the work-budget safety net
+// kicking in. This is the strongest correctness check in this file for
+// the rewrite: REPORT30.md's whole argument for why restricting
+// candidates to a clause's rarest literal's occurrence list can never
+// miss a real subsumption only has to be right once in the reasoning,
+// but many random trials are cheap insurance against a transcription
+// bug in the code that implements that reasoning.
+func TestEliminateSubsumedClausesMatchesBruteForceOnRandomFormulas(t *testing.T) {
+	rng := rand.New(rand.NewPCG(12345, 67890))
+	const trials = 500
+	for trial := 0; trial < trials; trial++ {
+		numVars := 1 + rng.IntN(8)
+		numClauses := rng.IntN(20)
+		original := randomClauseSet(rng, numVars, numClauses)
+
+		want := bruteForceSubsumedClauses(original)
+
+		got := cloneClauses(original)
+		eliminateSubsumedClauses(&got, numVars)
+
+		if len(got) != len(want) {
+			t.Fatalf("trial %d (numVars=%d, clauses=%v): got %d surviving clauses %v, want %d %v",
+				trial, numVars, original, len(got), got, len(want), want)
+		}
+		for i := range want {
+			if !slices.Equal(got[i], want[i]) {
+				t.Fatalf("trial %d (numVars=%d, clauses=%v): clauses[%d] = %v, want %v",
+					trial, numVars, original, i, got[i], want[i])
 			}
 		}
 	}

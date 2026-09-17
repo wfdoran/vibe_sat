@@ -13,6 +13,7 @@
 //! for Preprocessing SAT Instances," SAT 2004 (the specific, simpler
 //! elimination bound used here).
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -154,7 +155,8 @@ pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessRes
         stats.pure_literals_fixed += pure_fixed;
         changed |= pure_fixed > 0;
 
-        let subsumed = eliminate_subsumed_clauses_parallel(&mut clauses, num_threads);
+        let subsumed =
+            eliminate_subsumed_clauses_parallel(&mut clauses, problem.num_vars, num_threads);
         stats.clauses_subsumed += subsumed;
         changed |= subsumed > 0;
 
@@ -449,54 +451,207 @@ fn eliminate_pure_literals(clauses: &mut Vec<Clause>, assignment: &mut Assignmen
     }
 }
 
+/// Bounds the total number of subsumer/candidate pairs
+/// `eliminate_subsumed_clauses`/`eliminate_subsumed_clauses_parallel`
+/// will ever examine, as a multiple of the clause count -- see
+/// `eliminate_subsumed_clauses`'s own doc comment for why this exists
+/// (STAGE30.md/REPORT30.md) and what it trades away. Chosen generously
+/// (most real instances' occurrence lists are far smaller than this)
+/// but small enough to guarantee the whole function is `O(clauses)` in
+/// the worst case: even a literal appearing in every single clause can
+/// only ever contribute this many candidate checks in total before the
+/// budget runs out.
+const SUBSUMPTION_WORK_BUDGET_FACTOR: usize = 64;
+
+/// Maps each literal (by variable and sign, the same convention
+/// `eliminate_variables`'s `positive`/`negative` arrays use) to the
+/// indices of every clause in which it appears.
+struct LiteralOccurrence {
+    positive: Vec<Vec<usize>>,
+    negative: Vec<Vec<usize>>,
+}
+
+impl LiteralOccurrence {
+    /// Computes, once, the clause indices each literal appears in --
+    /// shared, read-only input for every subsumer clause's candidate
+    /// search below, so it only ever needs building a single time
+    /// regardless of how many threads
+    /// `eliminate_subsumed_clauses_parallel` uses.
+    fn build(clauses: &[Clause], num_vars: usize) -> Self {
+        let mut occ = LiteralOccurrence {
+            positive: vec![Vec::new(); num_vars + 1],
+            negative: vec![Vec::new(); num_vars + 1],
+        };
+        for (i, clause) in clauses.iter().enumerate() {
+            for &lit in clause {
+                if cnf::literal_is_negative(lit) {
+                    occ.negative[cnf::literal_var(lit)].push(i);
+                } else {
+                    occ.positive[cnf::literal_var(lit)].push(i);
+                }
+            }
+        }
+        occ
+    }
+
+    /// Returns the occurrence list for `lit` specifically (as opposed
+    /// to its variable's other polarity).
+    fn of(&self, lit: Literal) -> &[usize] {
+        if cnf::literal_is_negative(lit) {
+            &self.negative[cnf::literal_var(lit)]
+        } else {
+            &self.positive[cnf::literal_var(lit)]
+        }
+    }
+}
+
+/// Returns the occurrence list of whichever literal in `clause`
+/// appears in the fewest clauses overall -- the smallest set that is
+/// guaranteed to contain every clause `eliminate_subsumed_clauses`'s
+/// caller could possibly subsume via `clause` (see
+/// `eliminate_subsumed_clauses`'s own doc comment for why that
+/// guarantee holds). Returns `None` only for a genuinely empty clause,
+/// which (by construction -- `run` always calls `unit_propagate`,
+/// which detects an empty clause as UNSAT and returns immediately,
+/// before any subsumption pass ever sees the clause set) should never
+/// actually reach this function in practice.
+fn rarest_literal_occurrences<'a>(
+    occ: &'a LiteralOccurrence,
+    clause: &Clause,
+) -> Option<&'a [usize]> {
+    let (&first, rest) = clause.split_first()?;
+    let mut best = occ.of(first);
+    for &lit in rest {
+        let candidate = occ.of(lit);
+        if candidate.len() < best.len() {
+            best = candidate;
+        }
+    }
+    Some(best)
+}
+
+/// `eliminate_subsumed_clauses`'/`eliminate_subsumed_clauses_parallel`'s
+/// shared core: for every subsumer index `i` in `lo..hi`, look only at
+/// the candidates `rarest_literal_occurrences` says could possibly be
+/// subsumed by `cs[i]`, and mark each genuine subset removed via
+/// `mark_removed`. `*budget` is decremented by the number of
+/// candidates actually examined, and processing stops early, leaving
+/// every remaining clause's keep bit untouched, the moment it runs out
+/// -- see `eliminate_subsumed_clauses`'s doc comment for why that is
+/// always a safe (if possibly less thorough) outcome.
+///
+/// `is_kept`/`mark_removed` read and write the caller's "keep" bits,
+/// rather than this function taking a keep slice directly, so this one
+/// implementation serves both `eliminate_subsumed_clauses` (plain
+/// `Vec<bool>`, no concurrency at all) and
+/// `eliminate_subsumed_clauses_parallel` (`Vec<AtomicBool>`, shared
+/// across threads) without duplicating this loop for each.
+#[allow(clippy::too_many_arguments)]
+fn try_subsume_from(
+    cs: &[Clause],
+    occ: &LiteralOccurrence,
+    n: usize,
+    is_kept: impl Fn(usize) -> bool,
+    mark_removed: impl Fn(usize),
+    lo: usize,
+    hi: usize,
+    budget: &mut usize,
+) {
+    for i in lo..hi {
+        if *budget == 0 {
+            return;
+        }
+        let Some(candidates) = rarest_literal_occurrences(occ, &cs[i]) else {
+            continue;
+        };
+        *budget = budget.saturating_sub(candidates.len());
+        for &j in candidates {
+            if j == i || j >= n || !is_kept(j) {
+                continue;
+            }
+            if cs[i].len() > cs[j].len() {
+                continue;
+            }
+            if cs[i].len() == cs[j].len() && i > j {
+                // Equal-length duplicates: keep only the first one seen.
+                continue;
+            }
+            if cs[i].iter().all(|lit| cs[j].contains(lit)) {
+                mark_removed(j);
+            }
+        }
+    }
+}
+
 /// Removes every clause that is subsumed by some other (shorter or
 /// equal-length) clause in `clauses`: if clause A is a subset of
 /// clause B, then A already enforces at least as much as B does,
 /// making B redundant. Returns how many clauses were removed.
+/// `num_vars` must be at least as large as the largest variable number
+/// appearing in `clauses` (`run` always passes the problem's own
+/// `num_vars`).
 ///
-/// STAGE25.md: this used to check subset membership against a
-/// `HashSet<Literal>` built once per clause (the `sets` vector
-/// below, now removed). Profiling this exact function with `perf`
-/// found that hashing dominated: `RandomState::hash_one` alone
-/// accounted for ~44% of total preprocessing time on
-/// `benchmark/blocksworld/bw_large.c.cnf` (see REPORT25.md), not the
-/// `eliminate_variables` (BVE) pass REPORT22.md guessed was the
-/// bottleneck. This project's clauses are almost always short (a
-/// handful of literals, occasionally a few dozen for structured
-/// instances), and Rust's default hasher (`SipHash`, chosen for
-/// DoS-resistance against adversarial input, not speed) costs more
-/// per lookup than just scanning that many literals directly with
-/// `[Literal]::contains` -- no hash computation, no allocation, and
-/// better cache locality for a slice this small.
-fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>) -> usize {
-    let mut keep = vec![true; clauses.len()];
+/// STAGE30.md/REPORT30.md: this used to check every one of the
+/// `O(clauses^2)` ordered pairs directly (REPORT25.md's own
+/// multithreaded version of that same all-pairs loop). REPORT29.md
+/// found that quadratic cost is a severe, widely-triggered problem on
+/// real SAT Competition instances -- not just the handful of largest
+/// files REPORT25.md had seen -- so this stage replaces the all-pairs
+/// scan with the standard technique real preprocessors use (SatELite,
+/// MiniSat): for clause A to subsume any clause B, every literal of A,
+/// including whichever one of A's own literals occurs in the *fewest*
+/// clauses overall, must appear in B -- so B can only ever be found in
+/// that one literal's occurrence list, never anywhere else. Checking
+/// only that list instead of every other clause in the formula turns
+/// the common case from `O(clauses)` candidates per clause into
+/// `O(how often A's rarest literal actually recurs)`, which for most
+/// real CNF instances (each variable appearing in a bounded number of
+/// clauses) is close to a small constant -- i.e. close to linear
+/// overall, not quadratic. This is an exact restriction, not an
+/// approximation: it can never miss a real subsumption, since any B
+/// that A subsumes is *guaranteed* to be in that occurrence list by
+/// definition.
+///
+/// This does not change the worst-case complexity class in general --
+/// a literal that occurs in every clause (or a formula constructed
+/// adversarially so every clause's rarest literal still has a huge
+/// occurrence list) still makes this `O(clauses^2)`, and there is no
+/// known algorithm that avoids that in the worst case; see
+/// REPORT30.md's discussion of the Orthogonal Vectors problem for why
+/// this project believes (without proving) that no such algorithm
+/// exists. `SUBSUMPTION_WORK_BUDGET_FACTOR` is this function's answer
+/// to that: a hard cap on total candidate-pair work, expressed as a
+/// multiple of the clause count, so a pathological or merely very
+/// dense formula degrades to "less subsumption found" rather than
+/// "this function's running time is unbounded." Running out of budget
+/// is always safe: skipping a possible subsumption never changes
+/// whether the formula is satisfiable, only how compact it ends up.
+fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>, num_vars: usize) -> usize {
+    let occ = LiteralOccurrence::build(clauses, num_vars);
+    // Cell, not a plain bool, purely so the read closure and the write
+    // closure below can both capture `keep` (immutably, via Cell's
+    // interior mutability) at once -- there is no actual concurrency
+    // here (this whole function is single-threaded), just two
+    // `Fn` closures that would otherwise alias a `&mut`.
+    let keep: Vec<Cell<bool>> = vec![Cell::new(true); clauses.len()];
 
-    for i in 0..clauses.len() {
-        if !keep[i] {
-            continue;
-        }
-        for j in 0..clauses.len() {
-            if i == j || !keep[j] {
-                continue;
-            }
-            if clauses[i].len() > clauses[j].len() {
-                continue;
-            }
-            if clauses[i].len() == clauses[j].len() && i > j {
-                // Equal-length duplicates: keep only the first one seen.
-                continue;
-            }
-            if clauses[i].iter().all(|lit| clauses[j].contains(lit)) {
-                keep[j] = false;
-            }
-        }
-    }
+    let mut budget = SUBSUMPTION_WORK_BUDGET_FACTOR * clauses.len();
+    try_subsume_from(
+        clauses,
+        &occ,
+        clauses.len(),
+        |i| keep[i].get(),
+        |i| keep[i].set(false),
+        0,
+        clauses.len(),
+        &mut budget,
+    );
 
     let mut num_removed = 0;
     let old = std::mem::take(clauses);
     let mut kept = Vec::with_capacity(old.len());
     for (i, clause) in old.into_iter().enumerate() {
-        if keep[i] {
+        if keep[i].get() {
             kept.push(clause);
         } else {
             num_removed += 1;
@@ -508,87 +663,79 @@ fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>) -> usize {
 
 /// Computes exactly the same result as [`eliminate_subsumed_clauses`]
 /// (the set of clauses removed, and the surviving clauses in their
-/// original relative order), but splits the outer `i` loop across
-/// `num_threads` OS threads. `num_threads <= 1` just calls
+/// original relative order) whenever both are given the same,
+/// unexhausted work budget, but splits the outer subsumer-clause loop
+/// across `num_threads` OS threads. `num_threads <= 1` just calls
 /// `eliminate_subsumed_clauses` directly.
 ///
 /// STAGE25.md/REPORT25.md: profiling found subsumption elimination is
 /// the single largest cost in preprocessing on real, clause-count-heavy
 /// benchmark instances (87-94% of total preprocessing time on
-/// `benchmark/blocksworld/bw_large.c.cnf`/`.d.cnf`) -- its
+/// `benchmark/blocksworld/bw_large.c.cnf`/`.d.cnf`) -- its (worst-case)
 /// `O(clauses^2)` pairwise comparison is the natural target for
 /// `--num-threads`, far more than `eliminate_variables` (BVE), which
 /// REPORT22.md had guessed was the bottleneck (see `run`'s doc comment
-/// for why BVE itself is not also threaded this stage).
+/// for why BVE itself is not also threaded).
 ///
 /// The key fact that makes this a safe, provably-equivalent
-/// parallelization, not just an approximation:
-/// `eliminate_subsumed_clauses`'s own `if !keep[i] { continue }` skip
-/// is a pure optimization, never required for correctness. If some
-/// clause `i` is itself later found to be subsumed by another clause
-/// `i2` (`i2` is a subset of `i`), then `i2` is also, by transitivity
-/// of the subset relation, a subset of anything `i` itself is a subset
-/// of -- so whatever `j`'s `i` would go on to mark non-keep, `i2` marks
-/// too, independently, when `i2`'s own turn as an outer index comes
-/// around (whether that happens before or after `i`'s own turn does
-/// not matter: either `i2` runs first and already caught every such
-/// `j` directly, in which case `i`'s own attempt would have been
-/// entirely redundant anyway, or `i2` runs later, in which case `i`
-/// had already done its own full pass -- including marking every `j`
-/// it subsumes -- before anyone marked `i` itself non-keep). So
-/// evaluating every ordered pair `(i, j)` against the fixed input
-/// snapshot, regardless of any other pair's outcome, yields the exact
-/// same final "keep" set as the sequential, short-circuiting version.
-/// That is exactly what this function does: it never reads `keep[i]`
-/// as an outer-loop skip (only `keep[j]`, purely to avoid redundant
-/// writes to an already-false entry -- itself just as harmless to skip
-/// or not), so every thread's chunk of `i` values can run against a
-/// read-only `clauses` slice with no coordination beyond `keep`'s
-/// atomic writes. `test_eliminate_subsumed_clauses_parallel_matches_sequential_chained`
-/// and `test_eliminate_subsumed_clauses_parallel_matches_sequential_on_real_file`
-/// verify this holds in practice, including the exact "i2 subsumes i,
-/// i subsumes j" chain this argument depends on, not just in theory.
+/// parallelization, not just an approximation, is unchanged from
+/// REPORT25.md's original version of this function (see its own
+/// historical discussion, preserved in version control, for the full
+/// transitivity argument): `eliminate_subsumed_clauses`'s own
+/// `if !keep[i] { continue }` skip is a pure optimization, never
+/// required for correctness, so every thread's chunk of subsumer
+/// indices can run against the same read-only clauses/occurrence-list
+/// data with no coordination beyond `keep`'s atomic writes. Restricting
+/// each subsumer's candidates to its rarest literal's occurrence list
+/// (this stage's change) does not affect that argument at all: it is an
+/// exact restriction (see `eliminate_subsumed_clauses`'s doc comment),
+/// so it changes *which pairs are ever compared*, never *what the
+/// comparison would have found* had it been made.
 ///
-/// `keep` is monotonic (`true` -> `false`, never back) and every write
-/// stores the same value (`false`) every time, so concurrent
-/// unsynchronized writes from different threads are semantically
-/// harmless -- but Rust's aliasing rules still require a real atomic
-/// type for two threads to safely touch the same memory location at
-/// all (a plain `Vec<bool>` would not even compile here without
-/// `unsafe`), hence `AtomicBool` rather than a plain `Vec<bool>`.
-fn eliminate_subsumed_clauses_parallel(clauses: &mut Vec<Clause>, num_threads: usize) -> usize {
+/// The work budget is split evenly across threads
+/// (`budget / num_threads` each) rather than shared through one atomic
+/// counter: a shared counter would need its own synchronization (and
+/// associated contention) for a value that only exists to bound
+/// worst-case time in the first place, which would be a strange thing
+/// to spend synchronization overhead on. Splitting it evenly still
+/// bounds total work at exactly the same budget, just distributed
+/// rather than pooled, which only matters for exactly how much
+/// subsumption gets found in the (rare, already-degraded) case where
+/// the budget actually runs out.
+fn eliminate_subsumed_clauses_parallel(
+    clauses: &mut Vec<Clause>,
+    num_vars: usize,
+    num_threads: usize,
+) -> usize {
     if num_threads <= 1 {
-        return eliminate_subsumed_clauses(clauses);
+        return eliminate_subsumed_clauses(clauses, num_vars);
     }
 
     let n = clauses.len();
+    let occ = LiteralOccurrence::build(clauses, num_vars);
     let keep: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(true)).collect();
     let cs: &Vec<Clause> = clauses;
     let chunk = n.div_ceil(num_threads).max(1);
+    let per_thread_budget = (SUBSUMPTION_WORK_BUDGET_FACTOR * n) / num_threads;
 
     thread::scope(|scope| {
         let mut start = 0;
         while start < n {
             let end = (start + chunk).min(n);
             let keep = &keep;
+            let occ = &occ;
             scope.spawn(move || {
-                for i in start..end {
-                    for j in 0..n {
-                        if i == j || !keep[j].load(Ordering::SeqCst) {
-                            continue;
-                        }
-                        if cs[i].len() > cs[j].len() {
-                            continue;
-                        }
-                        if cs[i].len() == cs[j].len() && i > j {
-                            // Equal-length duplicates: keep only the first one seen.
-                            continue;
-                        }
-                        if cs[i].iter().all(|lit| cs[j].contains(lit)) {
-                            keep[j].store(false, Ordering::SeqCst);
-                        }
-                    }
-                }
+                let mut budget = per_thread_budget;
+                try_subsume_from(
+                    cs,
+                    occ,
+                    n,
+                    |i| keep[i].load(Ordering::SeqCst),
+                    |i| keep[i].store(false, Ordering::SeqCst),
+                    start,
+                    end,
+                    &mut budget,
+                );
             });
             start = end;
         }
@@ -739,6 +886,9 @@ fn eliminate_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use std::collections::HashSet;
 
     fn all_satisfied(clauses: &[Clause], assignment: &Assignment) -> bool {
@@ -788,10 +938,42 @@ mod tests {
         assert!(clauses.is_empty());
     }
 
+    /// Confirms the STAGE30.md/REPORT30.md work-budget safety net
+    /// actually does nothing (removes nothing, touches no keep bit)
+    /// once the budget is exhausted, rather than, say, panicking on an
+    /// unexpected state or ignoring the budget entirely -- directly,
+    /// deterministically, rather than trying to organically construct
+    /// a formula large enough to exhaust the real default budget.
+    #[test]
+    fn test_try_subsume_from_respects_zero_work_budget() {
+        let clauses: Vec<Clause> = vec![vec![1], vec![1, 2]];
+        let occ = LiteralOccurrence::build(&clauses, 2);
+        let keep = [Cell::new(true), Cell::new(true)];
+        let mut budget = 0;
+
+        try_subsume_from(
+            &clauses,
+            &occ,
+            clauses.len(),
+            |i| keep[i].get(),
+            |i| keep[i].set(false),
+            0,
+            clauses.len(),
+            &mut budget,
+        );
+
+        assert!(
+            keep[0].get() && keep[1].get(),
+            "a zero work budget should have removed nothing; keep = [{}, {}]",
+            keep[0].get(),
+            keep[1].get()
+        );
+    }
+
     #[test]
     fn test_eliminate_subsumed_clauses_removes_superset() {
         let mut clauses = vec![vec![1, 2], vec![1, 2, 3]];
-        let num_removed = eliminate_subsumed_clauses(&mut clauses);
+        let num_removed = eliminate_subsumed_clauses(&mut clauses, 3);
         assert_eq!(num_removed, 1);
         assert_eq!(clauses.len(), 1);
     }
@@ -799,7 +981,7 @@ mod tests {
     #[test]
     fn test_eliminate_subsumed_clauses_removes_duplicates() {
         let mut clauses = vec![vec![1, -2], vec![1, -2]];
-        let num_removed = eliminate_subsumed_clauses(&mut clauses);
+        let num_removed = eliminate_subsumed_clauses(&mut clauses, 2);
         assert_eq!(num_removed, 1);
         assert_eq!(clauses.len(), 1);
     }
@@ -819,11 +1001,11 @@ mod tests {
         let original: Vec<Clause> = vec![vec![1], vec![1, 2], vec![1, 2, 4]];
 
         let mut want = original.clone();
-        let want_removed = eliminate_subsumed_clauses(&mut want);
+        let want_removed = eliminate_subsumed_clauses(&mut want, 4);
 
         for num_threads in [1, 2, 3, 4, 8] {
             let mut got = original.clone();
-            let got_removed = eliminate_subsumed_clauses_parallel(&mut got, num_threads);
+            let got_removed = eliminate_subsumed_clauses_parallel(&mut got, 4, num_threads);
             assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
             assert_eq!(got, want, "num_threads={num_threads}");
         }
@@ -839,7 +1021,7 @@ mod tests {
             cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
         let mut want = problem.clauses.clone();
-        let want_removed = eliminate_subsumed_clauses(&mut want);
+        let want_removed = eliminate_subsumed_clauses(&mut want, problem.num_vars);
         assert!(
             want_removed > 0,
             "test file has nothing to subsume; pick a different file"
@@ -847,9 +1029,104 @@ mod tests {
 
         for num_threads in [1, 2, 3, 4, 8, 16] {
             let mut got = problem.clauses.clone();
-            let got_removed = eliminate_subsumed_clauses_parallel(&mut got, num_threads);
+            let got_removed =
+                eliminate_subsumed_clauses_parallel(&mut got, problem.num_vars, num_threads);
             assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
             assert_eq!(got, want, "num_threads={num_threads}");
+        }
+    }
+
+    /// A deliberately naive, obviously-correct `O(clauses^2)` reference
+    /// implementation of subsumption elimination -- exactly what
+    /// `eliminate_subsumed_clauses` itself was before STAGE30.md's
+    /// occurrence-list rewrite (see reports/REPORT30.md), kept here
+    /// purely as a test oracle rather than shipped in the real
+    /// preprocessing path. Used by
+    /// `test_eliminate_subsumed_clauses_matches_brute_force_on_random_formulas`
+    /// to build confidence in the fast version's correctness across
+    /// many random cases, not just the small number of hand-picked and
+    /// real-file examples above.
+    fn brute_force_subsumed_clauses(clauses: &[Clause]) -> Vec<Clause> {
+        let mut keep = vec![true; clauses.len()];
+        for i in 0..clauses.len() {
+            if !keep[i] {
+                continue;
+            }
+            for j in 0..clauses.len() {
+                if i == j || !keep[j] {
+                    continue;
+                }
+                if clauses[i].len() > clauses[j].len() {
+                    continue;
+                }
+                if clauses[i].len() == clauses[j].len() && i > j {
+                    continue;
+                }
+                if clauses[i].iter().all(|lit| clauses[j].contains(lit)) {
+                    keep[j] = false;
+                }
+            }
+        }
+        clauses
+            .iter()
+            .zip(keep)
+            .filter(|&(_, k)| k)
+            .map(|(c, _)| c.clone())
+            .collect()
+    }
+
+    /// Generates a random, small clause set over variables `1..=num_vars`,
+    /// with clause lengths and repeated/overlapping literals
+    /// deliberately likely (a small `num_vars` relative to clause count
+    /// all but guarantees plenty of real subsumption relationships to
+    /// exercise, unlike sampling from a huge variable space where
+    /// clauses would almost never overlap at all).
+    fn random_clause_set(rng: &mut StdRng, num_vars: i32, num_clauses: usize) -> Vec<Clause> {
+        (0..num_clauses)
+            .map(|_| {
+                let length = 1 + rng.random_range(0..4);
+                (0..length)
+                    .map(|_| {
+                        let v = 1 + rng.random_range(0..num_vars);
+                        if rng.random_range(0..2) == 0 { -v } else { v }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Fuzz-tests the occurrence-list-based rewrite
+    /// (STAGE30.md/REPORT30.md) against `brute_force_subsumed_clauses`
+    /// across many random small clause sets, small enough
+    /// (`num_vars`/`num_clauses` chosen so
+    /// `SUBSUMPTION_WORK_BUDGET_FACTOR`'s default budget is never
+    /// remotely exhausted) that any discrepancy can only be a
+    /// correctness bug in the occurrence-list restriction itself, not
+    /// the work-budget safety net kicking in. This is the strongest
+    /// correctness check in this file for the rewrite: REPORT30.md's
+    /// whole argument for why restricting candidates to a clause's
+    /// rarest literal's occurrence list can never miss a real
+    /// subsumption only has to be right once in the reasoning, but many
+    /// random trials are cheap insurance against a transcription bug in
+    /// the code that implements that reasoning.
+    #[test]
+    fn test_eliminate_subsumed_clauses_matches_brute_force_on_random_formulas() {
+        let mut rng = StdRng::seed_from_u64(1234567890);
+        const TRIALS: usize = 500;
+        for trial in 0..TRIALS {
+            let num_vars: i32 = 1 + rng.random_range(0..8);
+            let num_clauses = rng.random_range(0..20);
+            let original = random_clause_set(&mut rng, num_vars, num_clauses);
+
+            let want = brute_force_subsumed_clauses(&original);
+
+            let mut got = original.clone();
+            eliminate_subsumed_clauses(&mut got, num_vars as usize);
+
+            assert_eq!(
+                got, want,
+                "trial {trial} (num_vars={num_vars}, clauses={original:?})"
+            );
         }
     }
 

@@ -144,38 +144,73 @@ func isSubsetOf(small, big cnf.Clause) bool {
 	return true
 }
 
+// subsumptionWorkBudgetFactor bounds the total number of
+// subsumer/candidate pairs eliminateSubsumedClauses/
+// eliminateSubsumedClausesParallel will ever examine, as a multiple of
+// the clause count -- see eliminateSubsumedClauses's own doc comment
+// for why this exists (STAGE30.md/REPORT30.md) and what it trades
+// away. Chosen generously (most real instances' occurrence lists are
+// far smaller than this) but small enough to guarantee the whole
+// function is O(clauses) in the worst case: even a literal appearing
+// in every single clause can only ever contribute this many candidate
+// checks in total before the budget runs out.
+const subsumptionWorkBudgetFactor = 64
+
 // eliminateSubsumedClauses removes every clause that is subsumed by
 // some other (shorter or equal-length) clause in clauses: if clause A
 // is a subset of clause B, then A already enforces at least as much
 // as B does, making B redundant. It returns how many clauses were
-// removed.
-func eliminateSubsumedClauses(clauses *[]cnf.Clause) (numRemoved int) {
+// removed. numVars must be at least as large as the largest variable
+// number appearing in clauses (Run always passes the problem's own
+// NumVars).
+//
+// STAGE30.md/REPORT30.md: this used to check every one of the
+// O(clauses^2) ordered pairs directly (REPORT25.md's own
+// multithreaded version of that same all-pairs loop). REPORT29.md
+// found that quadratic cost is a severe, widely-triggered problem on
+// real SAT Competition instances -- not just the handful of largest
+// files REPORT25.md had seen -- so this stage replaces the all-pairs
+// scan with the standard technique real preprocessors use (SatELite,
+// MiniSat): for clause A to subsume any clause B, every literal of A,
+// including whichever one of A's own literals occurs in the *fewest*
+// clauses overall, must appear in B -- so B can only ever be found in
+// that one literal's occurrence list, never anywhere else. Checking
+// only that list instead of every other clause in the formula turns
+// the common case from O(clauses) candidates per clause into O(how
+// often A's rarest literal actually recurs), which for most real CNF
+// instances (each variable appearing in a bounded number of clauses)
+// is close to a small constant -- i.e. close to linear overall, not
+// quadratic. This is an exact restriction, not an approximation: it
+// can never miss a real subsumption, since any B that A subsumes is
+// *guaranteed* to be in that occurrence list by definition.
+//
+// This does not change the worst-case complexity class in general --
+// a literal that occurs in every clause (or a formula constructed
+// adversarially so every clause's rarest literal still has a huge
+// occurrence list) still makes this O(clauses^2), and there is no
+// known algorithm that avoids that in the worst case; see
+// REPORT30.md's discussion of the Orthogonal Vectors problem for why
+// this project believes (without proving) that no such algorithm
+// exists. subsumptionWorkBudgetFactor is this function's answer to
+// that: a hard cap on total candidate-pair work, expressed as a
+// multiple of the clause count, so a pathological or merely very
+// dense formula degrades to "less subsumption found" rather than
+// "this function's running time is unbounded." Running out of budget
+// is always safe: skipping a possible subsumption never changes
+// whether the formula is satisfiable, only how compact it ends up.
+func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int) (numRemoved int) {
 	cs := *clauses
+	occ := buildLiteralOccurrenceLists(cs, numVars)
 	keep := make([]bool, len(cs))
 	for i := range cs {
 		keep[i] = true
 	}
 
-	for i := range cs {
-		if !keep[i] {
-			continue
-		}
-		for j := range cs {
-			if i == j || !keep[j] {
-				continue
-			}
-			if len(cs[i]) > len(cs[j]) {
-				continue
-			}
-			if len(cs[i]) == len(cs[j]) && i > j {
-				// Equal-length duplicates: keep only the first one seen.
-				continue
-			}
-			if isSubsetOf(cs[i], cs[j]) {
-				keep[j] = false
-			}
-		}
-	}
+	budget := subsumptionWorkBudgetFactor * len(cs)
+	trySubsumeFromGeneric(cs, occ, len(cs),
+		func(i int) bool { return keep[i] },
+		func(i int) { keep[i] = false },
+		0, len(cs), &budget)
 
 	kept := cs[:0]
 	for i, clause := range cs {
@@ -189,66 +224,168 @@ func eliminateSubsumedClauses(clauses *[]cnf.Clause) (numRemoved int) {
 	return numRemoved
 }
 
+// literalOccurrence maps each literal (by variable and sign, the same
+// convention eliminateVariables' positive/negative arrays use) to the
+// indices of every clause in which it appears.
+type literalOccurrence struct {
+	positive [][]int // positive[v] = indices of clauses containing +v
+	negative [][]int // negative[v] = indices of clauses containing -v
+}
+
+// buildLiteralOccurrenceLists computes, once, the clause indices each
+// literal appears in -- shared, read-only input for every subsumer
+// clause's candidate search below, so it only ever needs building a
+// single time regardless of how many threads
+// eliminateSubsumedClausesParallel uses.
+func buildLiteralOccurrenceLists(cs []cnf.Clause, numVars int) *literalOccurrence {
+	occ := &literalOccurrence{
+		positive: make([][]int, numVars+1),
+		negative: make([][]int, numVars+1),
+	}
+	for i, clause := range cs {
+		for _, lit := range clause {
+			if lit.IsNegative() {
+				occ.negative[lit.Var()] = append(occ.negative[lit.Var()], i)
+			} else {
+				occ.positive[lit.Var()] = append(occ.positive[lit.Var()], i)
+			}
+		}
+	}
+	return occ
+}
+
+// of returns the occurrence list for lit specifically (as opposed to
+// its variable's other polarity).
+func (occ *literalOccurrence) of(lit cnf.Literal) []int {
+	if lit.IsNegative() {
+		return occ.negative[lit.Var()]
+	}
+	return occ.positive[lit.Var()]
+}
+
+// rarestLiteralOccurrences returns the occurrence list of whichever
+// literal in clause appears in the fewest clauses overall -- the
+// smallest set that is guaranteed to contain every clause
+// eliminateSubsumedClauses's caller could possibly subsume via clause
+// (see eliminateSubsumedClauses's own doc comment for why that
+// guarantee holds). ok is false only for
+// a genuinely empty clause, which (by construction -- Run always runs
+// UnitPropagate, which detects an empty clause as UNSAT and returns
+// immediately, before any subsumption pass ever sees the clause set)
+// should never actually reach this function in practice.
+func rarestLiteralOccurrences(occ *literalOccurrence, clause cnf.Clause) (list []int, ok bool) {
+	if len(clause) == 0 {
+		return nil, false
+	}
+	best := occ.of(clause[0])
+	for _, lit := range clause[1:] {
+		if candidate := occ.of(lit); len(candidate) < len(best) {
+			best = candidate
+		}
+	}
+	return best, true
+}
+
+// trySubsumeFromGeneric is eliminateSubsumedClauses'/
+// eliminateSubsumedClausesParallel's shared core: for every subsumer
+// index i in [lo, hi), look only at the candidates
+// rarestLiteralOccurrences says could possibly be subsumed by cs[i],
+// and mark each genuine subset removed via markRemoved. *budget is
+// decremented by the number of candidates actually examined, and
+// processing stops early, leaving every remaining clause's keep bit
+// untouched, the moment it runs out -- see eliminateSubsumedClauses's
+// doc comment for why that is always a safe (if possibly less
+// thorough) outcome.
+//
+// isKept/markRemoved read and write the caller's "keep" bits, rather
+// than this function taking a keep slice directly, so this one
+// implementation serves both eliminateSubsumedClauses (plain []bool,
+// no concurrency at all) and eliminateSubsumedClausesParallel
+// ([]atomic.Bool, shared across goroutines) without duplicating this
+// loop for each.
+func trySubsumeFromGeneric(cs []cnf.Clause, occ *literalOccurrence, n int, isKept func(int) bool, markRemoved func(int), lo, hi int, budget *int) {
+	for i := lo; i < hi; i++ {
+		if *budget <= 0 {
+			return
+		}
+		candidates, ok := rarestLiteralOccurrences(occ, cs[i])
+		if !ok {
+			continue
+		}
+		*budget -= len(candidates)
+		for _, j := range candidates {
+			if j == i || j >= n || !isKept(j) {
+				continue
+			}
+			if len(cs[i]) > len(cs[j]) {
+				continue
+			}
+			if len(cs[i]) == len(cs[j]) && i > j {
+				// Equal-length duplicates: keep only the first one seen.
+				continue
+			}
+			if isSubsetOf(cs[i], cs[j]) {
+				markRemoved(j)
+			}
+		}
+	}
+}
+
 // eliminateSubsumedClausesParallel computes exactly the same result as
 // eliminateSubsumedClauses (the set of clauses removed, and the
-// surviving clauses in their original relative order), but splits the
-// outer i loop across numThreads goroutines. numThreads <= 1 just
-// calls eliminateSubsumedClauses directly.
+// surviving clauses in their original relative order) whenever both
+// are given the same, unexhausted work budget, but splits the outer
+// subsumer-clause loop across numThreads goroutines. numThreads <= 1
+// just calls eliminateSubsumedClauses directly.
 //
 // STAGE25.md/REPORT25.md: profiling found subsumption elimination is
 // the single largest cost in preprocessing on real, clause-count-heavy
 // benchmark instances (87-94% of total preprocessing time on
-// benchmark/blocksworld/bw_large.c.cnf/.d.cnf) -- its O(clauses^2)
-// pairwise comparison is the natural target for --num-threads, far
-// more than eliminateVariables (BVE), which REPORT22.md had guessed
-// was the bottleneck (see Run's doc comment for why BVE itself is not
-// also threaded this stage).
+// benchmark/blocksworld/bw_large.c.cnf/.d.cnf) -- its (worst-case)
+// O(clauses^2) pairwise comparison is the natural target for
+// --num-threads, far more than eliminateVariables (BVE), which
+// REPORT22.md had guessed was the bottleneck (see Run's doc comment
+// for why BVE itself is not also threaded).
 //
 // The key fact that makes this a safe, provably-equivalent
-// parallelization, not just an approximation: eliminateSubsumedClauses's
-// own "if !keep[i] { continue }" skip is a pure optimization, never
-// required for correctness. If some clause i is itself later found to
-// be subsumed by another clause i2 (i2 is a subset of i), then i2 is
-// also, by transitivity of the subset relation, a subset of anything i
-// itself is a subset of -- so whatever j's i would go on to mark
-// non-keep, i2 marks too, independently, when i2's own turn as an
-// outer index comes around (whether that happens before or after i's
-// own turn does not matter: either i2 runs first and already caught
-// every such j directly, in which case i's own attempt would have been
-// entirely redundant anyway, or i2 runs later, in which case i had
-// already done its own full pass -- including marking every j it
-// subsumes -- before anyone marked i itself non-keep). So evaluating
-// every ordered pair (i, j) against the fixed input snapshot,
-// regardless of any other pair's outcome, yields the exact same final
-// "keep" set as the sequential, short-circuiting version. That is
-// exactly what this function does: it never reads keep[i] as an
-// outer-loop skip (only keep[j], purely to avoid redundant writes to
-// an already-false entry -- itself just as harmless to skip or not),
-// so every goroutine's chunk of i values can run against a read-only
-// clauses slice with no coordination beyond keep's atomic writes.
-// TestEliminateSubsumedClausesParallelMatchesSequential and
-// TestEliminateSubsumedClausesParallelHandlesChainedSubsumption verify
-// this holds in practice, including the exact "i2 subsumes i, i
-// subsumes j" chain this argument depends on, not just in theory.
+// parallelization, not just an approximation, is unchanged from
+// REPORT25.md's original version of this function (see its own
+// historical discussion, preserved in version control, for the full
+// transitivity argument): eliminateSubsumedClauses's own
+// "if !keep[i] { continue }" skip is a pure optimization, never
+// required for correctness, so every goroutine's chunk of subsumer
+// indices can run against the same read-only clauses/occurrence-list
+// data with no coordination beyond keep's atomic writes. Restricting
+// each subsumer's candidates to its rarest literal's occurrence list
+// (this stage's change) does not affect that argument at all: it is an
+// exact restriction (see eliminateSubsumedClauses's doc comment), so
+// it changes *which pairs are ever compared*, never *what the
+// comparison would have found* had it been made.
 //
-// keep is monotonic (true -> false, never back) and every write
-// stores the same value (false) every time, so concurrent unsynchronized
-// writes from different goroutines are semantically harmless -- but
-// Go's memory model still requires a real synchronization primitive
-// for two goroutines to safely touch the same memory location at all
-// (this is exactly what go test -race checks and would catch), hence
-// atomic.Bool rather than a plain []bool here.
-func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numThreads int) (numRemoved int) {
+// The work budget is split evenly across threads (budget/numThreads
+// each) rather than shared through one atomic counter: a shared
+// counter would need its own synchronization (and associated
+// contention) for a value that only exists to bound worst-case time in
+// the first place, which would be a strange thing to spend
+// synchronization overhead on. Splitting it evenly still bounds total
+// work at exactly the same budget, just distributed rather than
+// pooled, which only matters for exactly how much subsumption gets
+// found in the (rare, already-degraded) case where the budget actually
+// runs out.
+func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThreads int) (numRemoved int) {
 	if numThreads <= 1 {
-		return eliminateSubsumedClauses(clauses)
+		return eliminateSubsumedClauses(clauses, numVars)
 	}
 
 	cs := *clauses
 	n := len(cs)
+	occ := buildLiteralOccurrenceLists(cs, numVars)
 	keep := make([]atomic.Bool, n)
 	for i := range keep {
 		keep[i].Store(true)
 	}
+
+	perThreadBudget := (subsumptionWorkBudgetFactor * n) / numThreads
 
 	chunk := (n + numThreads - 1) / numThreads
 	var wg sync.WaitGroup
@@ -257,23 +394,11 @@ func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numThreads int) (nu
 		wg.Add(1)
 		go func(start, end int) {
 			defer wg.Done()
-			for i := start; i < end; i++ {
-				for j := 0; j < n; j++ {
-					if i == j || !keep[j].Load() {
-						continue
-					}
-					if len(cs[i]) > len(cs[j]) {
-						continue
-					}
-					if len(cs[i]) == len(cs[j]) && i > j {
-						// Equal-length duplicates: keep only the first one seen.
-						continue
-					}
-					if isSubsetOf(cs[i], cs[j]) {
-						keep[j].Store(false)
-					}
-				}
-			}
+			budget := perThreadBudget
+			trySubsumeFromGeneric(cs, occ, n,
+				func(i int) bool { return keep[i].Load() },
+				func(i int) { keep[i].Store(false) },
+				start, end, &budget)
 		}(start, end)
 	}
 	wg.Wait()

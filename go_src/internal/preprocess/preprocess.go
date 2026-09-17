@@ -139,7 +139,7 @@ func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
 			changed = true
 		}
 
-		if subsumed := eliminateSubsumedClausesParallel(&clauses, numThreads); subsumed > 0 {
+		if subsumed := eliminateSubsumedClausesParallel(&clauses, problem.NumVars, numThreads); subsumed > 0 {
 			stats.ClausesSubsumed += subsumed
 			changed = true
 		}
