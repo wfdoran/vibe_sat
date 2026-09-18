@@ -174,6 +174,31 @@ worker 2 Luby, worker 3 back to polynomial, and so on — deliberately
 diversifying the portfolio (see "multi-threaded CDCL" below) rather
 than racing several identical searches against each other.
 
+A fifth schedule, **Glucose's own data-driven policy** (`val2=5`;
+Audemard & Simon, IJCAI 2009 — see [references.md](references.md)),
+restarts on a signal from the search itself rather than a fixed
+conflict count: it tracks a short-term moving average of the last 50
+learned clauses' "Literal Block Distance" (LBD — the number of
+distinct decision levels among a clause's literals, also used by
+clause-database management below) alongside the all-time average
+since the search began, and restarts whenever the recent average
+looks close to or worse than the global one. Not (yet) this project's
+default; see `reports/REPORT34.md` for why.
+
+## Clause-database management
+
+Learned clauses accumulate without bound unless something prunes
+them, so once an optional memory limit (`--alg-params val3`) is
+exceeded, `cdcl` deletes roughly the least useful half of the
+clauses that are safe to delete (not currently locked as some
+variable's reason, and not part of the original problem). "Useful" is
+now judged by LBD first, MiniSat-style activity decay only as a
+tiebreak: a clause at or below an LBD of 2 ("glue," in Glucose's
+terminology) is never deleted regardless of activity, and among the
+rest, the least "compact" (highest-LBD) clauses go first. Before
+`reports/REPORT34.md` this was pure activity decay, with no notion of
+LBD anywhere in `cdcl`.
+
 ## Non-chronological backtracking
 
 Plain DPLL (what `dfs` does) backtracks *chronologically*: hit a

@@ -130,12 +130,18 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 		t.Fatalf("propagate() found no conflict; expected clause {-2,-4} to be falsified")
 	}
 
-	learned, backtrackLevel := s.analyze(confl)
+	learned, backtrackLevel, lbd := s.analyze(confl)
 	if backtrackLevel != 0 {
 		t.Errorf("backtrackLevel = %d, want 0", backtrackLevel)
 	}
 	if len(learned) != 1 || learned[0] != cnf.Literal(-2) {
 		t.Errorf("learned = %v, want [-2]", learned)
+	}
+	// Both x2 and x4 (the conflicting clause's falsified literals) sit
+	// at decision level 1, and the seed level (s.currentLevel, also 1)
+	// coincides with them, so the distinct-level count is exactly 1.
+	if lbd != 1 {
+		t.Errorf("lbd = %d, want 1 (x2 and x4 are both at decision level 1)", lbd)
 	}
 }
 
@@ -151,7 +157,7 @@ func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 	}
 	before := len(s.clauses)
 
-	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1)})
+	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1)}, 1)
 	if idx != noReason {
 		t.Errorf("addLearnedClause() = %d, want noReason", idx)
 	}
@@ -173,7 +179,7 @@ func TestAddLearnedClauseWatchesAssertingLiteralAndHighestLevel(t *testing.T) {
 	s.level[2] = 1
 	s.level[3] = 3 // higher than variable 2's level
 
-	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2), cnf.Literal(3)})
+	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2), cnf.Literal(3)}, 3)
 	if idx == noReason {
 		t.Fatal("addLearnedClause() returned noReason for a length-3 clause")
 	}
@@ -321,9 +327,12 @@ func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
 
-	idxLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)})
-	idxLocked := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)})
-	idxHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-3), cnf.Literal(5)})
+	// LBD 3 (above glueClauseLBDThreshold) on all three, so this test
+	// exercises the activity tiebreak among equal-LBD clauses, not the
+	// glue-clause protection (see TestReduceClauseDatabaseProtectsGlueClauses).
+	idxLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)}, 3)
+	idxLocked := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}, 3)
+	idxHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-3), cnf.Literal(5)}, 3)
 	s.clauseActivity[idxLow] = 1.0
 	s.clauseActivity[idxHigh] = 100.0
 
@@ -368,7 +377,7 @@ func TestReduceClauseDatabaseNoOpWhenNothingEligible(t *testing.T) {
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
-	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2)})
+	idx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2)}, 3)
 	s.x[2] = assign.True
 	s.reason[2] = idx
 
@@ -732,7 +741,7 @@ func TestMaybeRestartTriggersAtThresholdAndResets(t *testing.T) {
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
-	learnedIdx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2)})
+	learnedIdx := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(2)}, 3)
 	beforeClauses := len(s.clauses)
 
 	s.currentLevel = 1
@@ -818,6 +827,182 @@ func TestRunWithRestartsStillFindsSatisfiableFormula(t *testing.T) {
 				t.Errorf("restart strategy %v: clause %d (%v) not satisfied by %v", restartStrategy, ci, clause, result.Assignment)
 			}
 		}
+	}
+}
+
+// TestReduceClauseDatabaseProtectsGlueClauses verifies STAGE34.md's
+// glue-clause protection: a clause at glueClauseLBDThreshold, given
+// the lowest possible activity (0.0, the single most "deletable"
+// value under the old pure-activity policy), must still survive,
+// while the correct clause -- the lower-activity one among the
+// remaining, non-glue-eligible clauses -- is deleted instead.
+func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 6, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	idxGlue := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)}, glueClauseLBDThreshold)
+	idxNonGlueLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}, glueClauseLBDThreshold+1)
+	idxNonGlueHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-5), cnf.Literal(6)}, glueClauseLBDThreshold+1)
+	s.clauseActivity[idxGlue] = 0.0
+	s.clauseActivity[idxNonGlueLow] = 0.5
+	s.clauseActivity[idxNonGlueHigh] = 100.0
+
+	before := len(s.clauses)
+	s.reduceClauseDatabase()
+
+	if len(s.clauses) != before-1 {
+		t.Fatalf("len(s.clauses) = %d, want %d (exactly one clause removed)", len(s.clauses), before-1)
+	}
+	found := map[string]bool{}
+	for _, c := range s.clauses {
+		found[fmt.Sprint(c)] = true
+	}
+	if !found[fmt.Sprint(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)})] {
+		t.Error("glue clause {-1,3} should have survived despite its rock-bottom activity")
+	}
+	if found[fmt.Sprint(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)})] {
+		t.Error("non-glue clause {-2,4} (lower activity among the non-glue clauses) should have been deleted")
+	}
+	if !found[fmt.Sprint(cnf.Clause{cnf.Literal(-5), cnf.Literal(6)})] {
+		t.Error("non-glue clause {-5,6} (higher activity) should have survived")
+	}
+}
+
+// TestReduceClauseDatabaseSortsByLBDBeforeActivity verifies that,
+// among eligible clauses, a higher LBD is deleted before a lower one
+// even when the higher-LBD clause has much higher activity -- LBD is
+// the primary sort key, activity only a tiebreak among equal LBDs.
+func TestReduceClauseDatabaseSortsByLBDBeforeActivity(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	idxHighLBDHighActivity := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)}, 10)
+	idxLowLBDLowActivity := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}, 3)
+	s.clauseActivity[idxHighLBDHighActivity] = 1000.0
+	s.clauseActivity[idxLowLBDLowActivity] = 0.0
+
+	before := len(s.clauses)
+	s.reduceClauseDatabase()
+
+	if len(s.clauses) != before-1 {
+		t.Fatalf("len(s.clauses) = %d, want %d (exactly one clause removed)", len(s.clauses), before-1)
+	}
+	found := map[string]bool{}
+	for _, c := range s.clauses {
+		found[fmt.Sprint(c)] = true
+	}
+	if found[fmt.Sprint(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)})] {
+		t.Error("the high-LBD clause {-1,3} should have been deleted despite its high activity")
+	}
+	if !found[fmt.Sprint(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)})] {
+		t.Error("the low-LBD clause {-2,4} should have survived despite its low activity")
+	}
+}
+
+// TestGlucoseShouldRestart exercises glucoseShouldRestart directly
+// with a fabricated sequence of LBDs: it must not trigger before the
+// recent window is full, and its trigger decision afterward must
+// match a hand-computed recentAvg*glucoseK >= globalAvg comparison.
+func TestGlucoseShouldRestart(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 1, Clauses: nil}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	// Fill all but one slot of the recent window with LBD 2 (low/good);
+	// the window isn't full yet, so this must never trigger regardless
+	// of how bad a single additional LBD looks.
+	for i := 0; i < glucoseWindowSize-1; i++ {
+		s.recordLBD(2)
+		if s.glucoseShouldRestart() {
+			t.Fatalf("glucoseShouldRestart() = true before the recent window (size %d) is full (i=%d)", glucoseWindowSize, i)
+		}
+	}
+
+	// One more low-LBD conflict fills the window at a recent average of
+	// 2, equal to the global average (also 2) -- recentAvg*glucoseK
+	// (2*0.8=1.6) is well below globalAvg (2), so no restart yet.
+	s.recordLBD(2)
+	if s.glucoseShouldRestart() {
+		t.Fatal("glucoseShouldRestart() = true with recent and global averages both at their best (LBD 2)")
+	}
+
+	// Now drive the recent window to a much worse (higher) LBD than the
+	// global history: after glucoseWindowSize more conflicts at LBD 20,
+	// the recent window average is 20 (all glucoseWindowSize slots hold
+	// 20), while the global average is dragged only partway up, so
+	// recentAvg*glucoseK must exceed it and a restart must be signaled.
+	for i := 0; i < glucoseWindowSize; i++ {
+		s.recordLBD(20)
+	}
+	recentAvg := float64(s.lbdRecentSum) / float64(glucoseWindowSize)
+	globalAvg := float64(s.lbdGlobalSum) / float64(s.lbdGlobalCount)
+	want := recentAvg*glucoseK >= globalAvg
+	if got := s.glucoseShouldRestart(); got != want {
+		t.Errorf("glucoseShouldRestart() = %v, want %v (recentAvg=%v globalAvg=%v)", got, want, recentAvg, globalAvg)
+	}
+	if !want {
+		t.Fatal("test setup error: expected the LBD-20 run to make recentAvg*glucoseK >= globalAvg true")
+	}
+}
+
+// TestMaybeRestartDoesNotPanicAtRootLevel is a regression test for a
+// bug this stage's own benchcompare sweep found (STAGE34.md): a
+// restart signaled immediately after a conflict resolves to a
+// level-0 learned unit clause -- s.currentLevel is already 0 by then
+// -- used to panic inside backtrackTo(0), which indexes
+// s.trailLim[1], an index that only exists when s.currentLevel > 0.
+// RestartGlucose's much higher restart frequency (roughly every
+// glucoseWindowSize conflicts, versus the fixed strategies' bases in
+// the hundreds to tens of thousands) made this reachable on real
+// benchmark files (benchmark/blocksworld/bw_large.{c,d}.cnf);
+// maybeRestart now returns immediately whenever s.currentLevel == 0,
+// regardless of strategy, since there is nothing to restart from the
+// root anyway.
+func TestMaybeRestartDoesNotPanicAtRootLevel(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	// s.currentLevel is 0 here (freshly constructed, no decisions
+	// made yet) -- exactly the state learnAndBackjump leaves it in
+	// right after a level-0 learned unit clause.
+	if s.currentLevel != 0 {
+		t.Fatalf("test setup error: currentLevel = %d, want 0", s.currentLevel)
+	}
+	// Force glucoseShouldRestart() to report true, so maybeRestart
+	// actually attempts a restart rather than skipping for an
+	// unrelated reason: establish a low-LBD baseline global average,
+	// then drive the recent window to a much worse LBD (mirroring
+	// TestGlucoseShouldRestart's own setup).
+	for i := 0; i < glucoseWindowSize; i++ {
+		s.recordLBD(2)
+	}
+	for i := 0; i < glucoseWindowSize; i++ {
+		s.recordLBD(20)
+	}
+	if !s.glucoseShouldRestart() {
+		t.Fatal("test setup error: expected glucoseShouldRestart() = true")
+	}
+
+	conflictsBefore := s.conflictsSinceRestart
+	restartCountBefore := s.restartCount
+
+	s.maybeRestart() // must not panic
+
+	if s.restartCount != restartCountBefore {
+		t.Errorf("restartCount = %d, want unchanged at %d (no restart actually happens at the root)", s.restartCount, restartCountBefore)
+	}
+	if s.conflictsSinceRestart != conflictsBefore {
+		t.Errorf("conflictsSinceRestart = %d, want unchanged at %d", s.conflictsSinceRestart, conflictsBefore)
 	}
 }
 

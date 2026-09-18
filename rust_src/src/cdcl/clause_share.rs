@@ -146,6 +146,7 @@ pub(crate) fn maybe_import(
     watch: &mut Vec<[crate::cnf::Literal; 2]>,
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
+    clause_lbd: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) {
     if peers.is_empty() {
@@ -163,6 +164,7 @@ pub(crate) fn maybe_import(
                 watch,
                 x,
                 clause_activity,
+                clause_lbd,
                 estimated_bytes,
             );
         }
@@ -200,6 +202,19 @@ pub(crate) fn maybe_import(
 /// additional complexity for a case that resolves itself for free --
 /// if the clause is genuinely useful to this thread, this thread will
 /// pick it up on a later check once its own trail has changed.
+///
+/// STAGE34.md: the exporting thread's true LBD for this clause isn't
+/// available here (it was computed against that thread's own decision
+/// levels, meaningless in this thread's), so this uses `lits.len()` as
+/// a safe stand-in -- LBD can never exceed a clause's literal count,
+/// since each literal contributes at most one distinct level, so this
+/// is always a conservative (never too favorable) estimate. A useful
+/// side effect: since only clauses of length <= `EXPORT_MAX_CLAUSE_LEN`
+/// are ever exported, and most shared clauses are short, this
+/// correctly treats every exported binary clause as automatically glue
+/// (length 2 = `super::GLUE_CLAUSE_LBD_THRESHOLD`), which is actually
+/// exact, not just conservative, for those.
+#[allow(clippy::too_many_arguments)]
 fn import_clause(
     lits: &Clause,
     clauses: &mut Vec<Clause>,
@@ -207,6 +222,7 @@ fn import_clause(
     watch: &mut Vec<[crate::cnf::Literal; 2]>,
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
+    clause_lbd: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) {
     let Some(first) = super::choose_watch(lits, x, None) else {
@@ -219,6 +235,7 @@ fn import_clause(
     let idx = clauses.len();
     clauses.push(lits.clone());
     clause_activity.push(0.0);
+    clause_lbd.push(lits.len());
     *estimated_bytes += super::clause_byte_cost(lits);
     for &lit in lits {
         let v = crate::cnf::literal_var(lit);

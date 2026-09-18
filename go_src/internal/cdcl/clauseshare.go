@@ -142,6 +142,18 @@ func (s *solver) maybeImport() {
 // identical terms to a self-learned one, no special-casing needed),
 // same memory-limit accounting.
 //
+// STAGE34.md: the exporting thread's true LBD for this clause isn't
+// available here (it was computed against that thread's own decision
+// levels, meaningless in this thread's), so this uses len(clause) as
+// a safe stand-in -- LBD can never exceed a clause's literal count,
+// since each literal contributes at most one distinct level, so this
+// is always a conservative (never too favorable) estimate. A useful
+// side effect: since only clauses of length <= exportMaxClauseLen are
+// ever exported, and exportMaxClauseLen's own doc comment notes most
+// shared clauses are short, this correctly treats every exported
+// binary clause as automatically glue (length 2 = glueClauseLBDThreshold),
+// which is actually exact, not just conservative, for those.
+//
 // The one real question importing raises that self-learning never
 // does: lits was derived from a *different* thread's search state, so
 // unlike a clause this thread just learned itself (whose asserting
@@ -177,6 +189,7 @@ func (s *solver) importClause(lits cnf.Clause) {
 	idx := len(s.clauses)
 	s.clauses = append(s.clauses, clause)
 	s.clauseActivity = append(s.clauseActivity, 0.0)
+	s.clauseLBD = append(s.clauseLBD, len(clause))
 	s.estimatedBytes += clauseByteCost(clause)
 	for _, lit := range clause {
 		v := lit.Var()

@@ -391,11 +391,11 @@ func TestParseCDCLAcceptsRestartStrategy(t *testing.T) {
 }
 
 // TestParseCDCLRejectsOutOfRangeRestartStrategy verifies that
-// --algorithm=cdcl rejects a second --alg-params value outside 0-4
-// (STAGE21.md added 4 = round-robin, so 5 is now the first invalid
-// value on that side).
+// --algorithm=cdcl rejects a second --alg-params value outside 0-5
+// (STAGE34.md added 5 = Glucose, so 6 is now the first invalid value
+// on that side).
 func TestParseCDCLRejectsOutOfRangeRestartStrategy(t *testing.T) {
-	for _, restart := range []string{"5", "-1"} {
+	for _, restart := range []string{"6", "-1"} {
 		_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", restart})
 		if err == nil {
 			t.Errorf("expected error for --alg-params 2 %s with --algorithm=cdcl", restart)
@@ -413,6 +413,19 @@ func TestParseCDCLAcceptsRoundRobinRestartStrategy(t *testing.T) {
 	}
 	if len(args.AlgParams) != 2 || args.AlgParams[1] != 4 {
 		t.Errorf("AlgParams = %v, want [2 4]", args.AlgParams)
+	}
+}
+
+// TestParseCDCLAcceptsGlucoseRestartStrategy verifies that
+// --algorithm=cdcl accepts 5 (Glucose's data-driven policy,
+// STAGE34.md) as a second --alg-params value.
+func TestParseCDCLAcceptsGlucoseRestartStrategy(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", "5"})
+	if err != nil {
+		t.Fatalf("Parse() with --alg-params 2 5 returned error: %v", err)
+	}
+	if len(args.AlgParams) != 2 || args.AlgParams[1] != 5 {
+		t.Errorf("AlgParams = %v, want [2 5]", args.AlgParams)
 	}
 }
 

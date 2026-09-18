@@ -37,6 +37,12 @@ flagged explicitly where that happened).
 - Eén & Sörensson, "An Extensible SAT-solver," SAT 2003 (MiniSat).
   Clause activity bumping/decay and the learned-clause database
   reduction policy `cdcl` uses. (`reports/REPORT12.md`)
+- Audemard & Simon, "Predicting Learnt Clauses Quality in Modern SAT
+  Solvers," IJCAI 2009 (Glucose). "Literal Block Distance" (LBD)
+  scoring for learned clauses — `cdcl`'s glue-clause protection and
+  LBD-primary sort in its clause-deletion policy (`--alg-params
+  val2=5`'s restart policy is also this paper's; see "Restarts"
+  below). (`reports/REPORT33.md`, `reports/REPORT34.md`)
 - Nadel & Ryvchin, "Chronological Backtracking," SAT 2018, and Möhle &
   Biere, "Backing Backtracking?," SAT 2019. Surveyed as a possible
   refinement to `cdcl`'s backjumping; not implemented.
@@ -72,6 +78,12 @@ flagged explicitly where that happened).
   (2007-era MiniSat/RSat-lineage literature). Phase saving —
   remembering and reusing each variable's last-assigned polarity — is
   unconditionally on in `cdcl`. (`reports/REPORT14.md`)
+- Audemard & Simon, "Predicting Learnt Clauses Quality in Modern SAT
+  Solvers," IJCAI 2009 (Glucose). `cdcl`'s fifth restart strategy
+  (`--alg-params val2=5`): restart when a moving average of recent
+  learned-clause LBDs looks close to or worse than the all-time
+  average, rather than on a fixed conflict-count schedule.
+  (`reports/REPORT33.md`, `reports/REPORT34.md`)
 
 **A note on this project's own restart-schedule naming**: `STAGE15.md`
 originally asked for a "geometric" growth sequence specified as

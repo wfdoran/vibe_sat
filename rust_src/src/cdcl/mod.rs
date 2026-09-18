@@ -123,6 +123,32 @@
 //! `GEOMETRIC_GROWTH_FACTOR` for how each schedule's scale constant(s)
 //! were chosen.
 //!
+//! STAGE34.md adds "Literal Block Distance" (LBD) clause management
+//! (Audemard & Simon, "Predicting Learnt Clauses Quality in Modern SAT
+//! Solvers," IJCAI 2009 -- the paper introducing Glucose): the number
+//! of distinct decision levels represented among a learned clause's
+//! literals (see [`analyze`]'s third return value), computed once per
+//! conflict in the same pass that already computes `backtrack_level`.
+//! A low LBD ("glue clause," at or below `GLUE_CLAUSE_LBD_THRESHOLD`)
+//! means the clause is "compact" and likely to remain useful; LBD is
+//! used two ways here, both new with this stage:
+//!
+//! - [`reduce_clause_database`] now sorts eligible clauses by LBD
+//!   first (higher LBD deleted first) with activity only a tiebreak
+//!   among equal LBDs, and never considers a glue clause eligible for
+//!   deletion at all, regardless of its activity.
+//! - `RestartStrategy::Glucose` (see [`glucose_should_restart`])
+//!   restarts not on a fixed conflict-count schedule but whenever a
+//!   short-term moving average of recent LBDs looks close to or worse
+//!   than the all-time average -- a sign the search has drifted into
+//!   learning less useful clauses than its own history.
+//!
+//! Selected via `--alg-params` val2=5; the default remains
+//! `RestartStrategy::Polynomial` (see [`run`]'s doc comment) since
+//! this project's benchmark-driven-default convention means
+//! `RestartStrategy::Glucose` earns that status only once a real
+//! benchmark comparison shows it ahead on this project's own set.
+//!
 //! STAGE20.md/STAGE21.md add multithreading: [`run_parallel`]
 //! implements Option B of `reports/REPORT20.md` (a continuously
 //! shared clause pool; every worker otherwise runs the ordinary
@@ -207,6 +233,12 @@ pub enum RestartStrategy {
     /// workers as `num_threads` allows, rather than every worker
     /// racing with the identical restart cadence.
     RoundRobin,
+    /// STAGE34.md's addition: Glucose's own data-driven restart policy
+    /// (see the module doc comment and [`glucose_should_restart`]),
+    /// rather than a fixed conflict-count schedule like the four
+    /// strategies above. Not part of [`RestartStrategy::RoundRobin`]'s
+    /// rotation -- see [`ROUND_ROBIN_STRATEGIES`].
+    Glucose,
 }
 
 /// [`RestartStrategy::RoundRobin`]'s resolution order (see
@@ -355,7 +387,95 @@ fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) ->
         // resolve RoundRobin away via resolve_restart_strategy before
         // any restart_threshold call is possible with it.
         RestartStrategy::RoundRobin => 0,
+        // Never actually consulted: maybe_restart special-cases
+        // RestartStrategy::Glucose before ever calling this function
+        // (see glucose_should_restart instead).
+        RestartStrategy::Glucose => 0,
     }
+}
+
+/// STAGE34.md: `GLUE_CLAUSE_LBD_THRESHOLD` is the LBD at or below
+/// which a learned clause is a "glue clause" -- protected from
+/// [`reduce_clause_database`] regardless of activity. `GLUCOSE_K` and
+/// `GLUCOSE_WINDOW_SIZE` are Glucose's own restart policy's
+/// parameters (see [`glucose_should_restart`]): the literature's usual
+/// choices (a 50-conflict recent window, K=0.8) are used unchanged
+/// here, matching this project's general preference for literature
+/// defaults absent its own benchmark evidence favoring something else
+/// (see `LUBY_BASE_CONFLICTS`'s neighboring precedent for why that
+/// preference sometimes gets overridden, and why it isn't here yet).
+const GLUE_CLAUSE_LBD_THRESHOLD: usize = 2;
+const GLUCOSE_WINDOW_SIZE: usize = 50;
+const GLUCOSE_K: f64 = 0.8;
+
+/// STAGE34.md's Glucose-restart bookkeeping: a fixed-size ring buffer
+/// of the last `GLUCOSE_WINDOW_SIZE` learned clauses' LBDs (kept as an
+/// incrementally-updated sum, so [`record_lbd`] is O(1) regardless of
+/// window size) alongside an all-time running sum/count -- never
+/// reset, including across restarts, since restarts don't erase
+/// learned clauses or their LBDs either. Allocated unconditionally
+/// (cheap: one `[usize; 50]` plus four scalars) but only ever
+/// consulted when `restart_strategy` is actually
+/// `RestartStrategy::Glucose`.
+struct GlucoseState {
+    recent_buf: [usize; GLUCOSE_WINDOW_SIZE],
+    recent_pos: usize,
+    recent_sum: usize,
+    recent_filled: bool,
+    global_sum: u64,
+    global_count: u64,
+}
+
+impl GlucoseState {
+    fn new() -> Self {
+        Self {
+            recent_buf: [0; GLUCOSE_WINDOW_SIZE],
+            recent_pos: 0,
+            recent_sum: 0,
+            recent_filled: false,
+            global_sum: 0,
+            global_count: 0,
+        }
+    }
+}
+
+/// Folds one freshly learned clause's LBD into `glucose`'s moving
+/// averages (STAGE34.md). Called once per conflict, immediately after
+/// [`analyze`], regardless of which restart strategy is active, so
+/// that switching strategies mid-run (not currently possible, but
+/// kept simple) would never find the averages cold.
+fn record_lbd(glucose: &mut GlucoseState, lbd: usize) {
+    glucose.recent_sum -= glucose.recent_buf[glucose.recent_pos];
+    glucose.recent_buf[glucose.recent_pos] = lbd;
+    glucose.recent_sum += lbd;
+    glucose.recent_pos += 1;
+    if glucose.recent_pos == GLUCOSE_WINDOW_SIZE {
+        glucose.recent_pos = 0;
+        glucose.recent_filled = true;
+    }
+
+    glucose.global_sum += lbd as u64;
+    glucose.global_count += 1;
+}
+
+/// Implements Glucose's own data-driven restart policy (Audemard &
+/// Simon, IJCAI 2009; see the module doc comment): restart when the
+/// recent window's average LBD is close to or worse than (i.e. at
+/// least `GLUCOSE_K` times) the all-time global average -- a sign
+/// the search has drifted into a region where it's learning less
+/// compact, less reusable clauses than its own history, and is better
+/// off abandoning the current decision stack. Requires at least one
+/// full recent window's worth of learned clauses before ever
+/// triggering, both because the ring buffer isn't a meaningful
+/// average until then and because `global_count` must be positive to
+/// divide by.
+fn glucose_should_restart(glucose: &GlucoseState) -> bool {
+    if !glucose.recent_filled {
+        return false;
+    }
+    let recent_avg = glucose.recent_sum as f64 / GLUCOSE_WINDOW_SIZE as f64;
+    let global_avg = glucose.global_sum as f64 / glucose.global_count as f64;
+    recent_avg * GLUCOSE_K >= global_avg
 }
 
 /// Implements STAGE15.md's restart schedules (see the module doc
@@ -371,6 +491,28 @@ fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) ->
 /// every conflict is otherwise handled (i.e. after the backjump and
 /// its bookkeeping, in [`run`]); a no-op if `restart_strategy` is
 /// `RestartStrategy::None`.
+///
+/// STAGE34.md: `RestartStrategy::Glucose` is handled separately from
+/// the four fixed-schedule strategies above -- it doesn't consult
+/// [`restart_threshold`] or `*conflicts_since_restart`'s count against
+/// a precomputed number at all, only [`glucose_should_restart`]'s
+/// data-driven comparison of recent vs. global average LBD (see the
+/// module doc comment).
+///
+/// STAGE34.md also fixes a latent bug this stage's testing surfaced:
+/// `backtrack_to(0, ...)` indexes `trail_lim[1]`, which only exists if
+/// `*current_level > 0`. Immediately after a conflict resolves to a
+/// level-0 learned unit clause, `*current_level` is already 0 by the
+/// time this runs (the conflict-handling code's own `backtrack_to`
+/// already got there); calling `backtrack_to(0, ...)` again here would
+/// panic. The fixed-threshold strategies' large bases (hundreds to
+/// tens of thousands of conflicts) made this coincidence essentially
+/// unreachable in practice, but `RestartStrategy::Glucose` can trigger
+/// every ~`GLUCOSE_WINDOW_SIZE` conflicts, hitting it on real
+/// benchmark files. There is nothing to restart when already at the
+/// root regardless of strategy, so this simply defers to the next
+/// conflict -- without resetting `*conflicts_since_restart` or
+/// advancing `*restart_count`, since no restart actually happened.
 #[allow(clippy::too_many_arguments)]
 fn maybe_restart(
     restart_strategy: RestartStrategy,
@@ -385,11 +527,19 @@ fn maybe_restart(
     num_conflicts: usize,
     lrb: &mut LrbState,
     saved_phase: &mut [Value],
+    glucose: &GlucoseState,
 ) {
     if restart_strategy == RestartStrategy::None {
         return;
     }
-    if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count) {
+    if *current_level == 0 {
+        return;
+    }
+    if restart_strategy == RestartStrategy::Glucose {
+        if !glucose_should_restart(glucose) {
+            return;
+        }
+    } else if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count) {
         return;
     }
     backtrack_to(
@@ -877,6 +1027,21 @@ fn run_loop<R: Rng>(
     let mut clause_activity_increment = 1.0f64;
     let mut estimated_bytes: i64 = working_problem.clauses.iter().map(clause_byte_cost).sum();
 
+    // STAGE34.md: clause_lbd is kept parallel to clauses/clause_activity
+    // (see reduce_clause_database and add_learned_clause); the original
+    // problem's clauses never participate in LBD-based eligibility
+    // (reduce_clause_database only ever considers indices >=
+    // num_original_clauses to begin with), so their placeholder value
+    // here is never read. lbd_scratch is analyze's reused scratch
+    // buffer for its distinct-decision-level count; glucose is
+    // RestartStrategy::Glucose's own moving-average bookkeeping (see
+    // the module doc comment), allocated unconditionally like vsids/lrb
+    // below but only consulted when restart_strategy actually calls
+    // for it.
+    let mut clause_lbd = vec![0usize; num_original_clauses];
+    let mut lbd_scratch: Vec<usize> = Vec::new();
+    let mut glucose = GlucoseState::new();
+
     // STAGE13.md's VSIDS/LRB bookkeeping; always allocated (cheap,
     // O(num_vars)) but only ever read or written when variant
     // actually calls for it.
@@ -953,7 +1118,7 @@ fn run_loop<R: Rng>(
                 };
             }
 
-            let (learned, backtrack_level) = analyze(
+            let (learned, backtrack_level, lbd) = analyze(
                 c,
                 &working_problem.clauses,
                 &trail,
@@ -968,7 +1133,9 @@ fn run_loop<R: Rng>(
                 variant,
                 &mut vsids,
                 &mut lrb,
+                &mut lbd_scratch,
             );
+            record_lbd(&mut glucose, lbd);
             backtrack_to(
                 backtrack_level,
                 &mut trail,
@@ -983,11 +1150,13 @@ fn run_loop<R: Rng>(
             );
             let new_clause = add_learned_clause(
                 &learned,
+                lbd,
                 &mut working_problem.clauses,
                 &mut lists,
                 &mut watch,
                 &level,
                 &mut clause_activity,
+                &mut clause_lbd,
                 &mut estimated_bytes,
             );
             // STAGE20.md/STAGE21.md's Option B: publish learned to
@@ -1046,6 +1215,7 @@ fn run_loop<R: Rng>(
                     &mut lists,
                     &mut watch,
                     &mut clause_activity,
+                    &mut clause_lbd,
                     &mut estimated_bytes,
                     &x,
                     &mut reason,
@@ -1068,6 +1238,7 @@ fn run_loop<R: Rng>(
                 &mut watch,
                 &x,
                 &mut clause_activity,
+                &mut clause_lbd,
                 &mut estimated_bytes,
             );
 
@@ -1085,6 +1256,7 @@ fn run_loop<R: Rng>(
                 num_conflicts,
                 &mut lrb,
                 &mut saved_phase,
+                &glucose,
             );
             continue;
         }
@@ -1341,6 +1513,14 @@ fn propagate(
 /// conflict the variable has contributed to since it was last
 /// assigned (see [`backtrack_to`] for where that turns into an
 /// updated Q-value).
+///
+/// STAGE34.md's third return value is the learned clause's LBD --
+/// the number of distinct decision levels represented among its
+/// literals (see the module doc comment) -- computed in this same
+/// pass via `lbd_scratch` (reused scratch space, like `seen`, cleared
+/// at the start of this function rather than reallocated) since every
+/// literal that will end up in the learned clause is already being
+/// visited here regardless.
 #[allow(clippy::too_many_arguments)]
 fn analyze(
     confl: usize,
@@ -1357,7 +1537,8 @@ fn analyze(
     variant: SelectVarVariant,
     vsids: &mut VsidsState,
     lrb: &mut LrbState,
-) -> (Clause, usize) {
+    lbd_scratch: &mut Vec<usize>,
+) -> (Clause, usize, usize) {
     for s in seen.iter_mut() {
         *s = false;
     }
@@ -1418,13 +1599,18 @@ fn analyze(
     result.extend(learned);
 
     let mut backtrack_level = 0;
+    lbd_scratch.clear();
+    lbd_scratch.push(current_level);
     for &lit in &result[1..] {
         let lv = level[cnf::literal_var(lit)];
         if lv > backtrack_level {
             backtrack_level = lv;
         }
+        if !lbd_scratch.contains(&lv) {
+            lbd_scratch.push(lv);
+        }
     }
-    (result, backtrack_level)
+    (result, backtrack_level, lbd_scratch.len())
 }
 
 /// Returns the literal on variable `v` that evaluates to true under
@@ -1527,17 +1713,20 @@ fn backtrack_to(
 /// (asserting) literal is about to become a permanent level-0 fact,
 /// exactly like a variable fixed by the bootstrap unit propagation in
 /// [`bootstrap`]. Returns the new clause's index, or `None` if none
-/// was stored. `activity` gets a fresh `0.0` entry and
-/// `estimated_bytes` is increased by [`clause_byte_cost`] for the new
-/// clause (STAGE12.md), kept parallel to `clauses`/`watch`.
+/// was stored. `activity` gets a fresh `0.0` entry, `clause_lbd` gets
+/// `lbd` (STAGE34.md), and `estimated_bytes` is increased by
+/// [`clause_byte_cost`] for the new clause (STAGE12.md), all kept
+/// parallel to `clauses`/`watch`.
 #[allow(clippy::too_many_arguments)]
 fn add_learned_clause(
     learned: &Clause,
+    lbd: usize,
     clauses: &mut Vec<Clause>,
     lists: &mut Lists,
     watch: &mut Vec<[Literal; 2]>,
     level: &[usize],
     clause_activity: &mut Vec<f64>,
+    clause_lbd: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) -> Option<usize> {
     if learned.len() == 1 {
@@ -1547,6 +1736,7 @@ fn add_learned_clause(
     let idx = clauses.len();
     clauses.push(learned.clone());
     clause_activity.push(0.0);
+    clause_lbd.push(lbd);
     *estimated_bytes += clause_byte_cost(learned);
     for &lit in learned {
         let v = cnf::literal_var(lit);
@@ -1594,12 +1784,24 @@ fn add_learned_clause(
 /// literals) operation, which is fine since it only runs when the
 /// configured memory limit is actually exceeded, not on every
 /// conflict.
+///
+/// STAGE34.md: a clause is also excluded from `eligible` -- "glue
+/// clause" protection, on top of the pre-existing `locked` exclusion
+/// -- if its LBD is at or below `GLUE_CLAUSE_LBD_THRESHOLD`,
+/// regardless of how low its activity has fallen, since a low LBD is
+/// itself strong independent evidence the clause is worth keeping
+/// even if it hasn't happened to participate in a conflict recently.
+/// Among the clauses that remain eligible, the sort is now LBD
+/// ascending first (higher LBD = less "compact" = deleted first) with
+/// activity descending only as a tiebreak among equal-LBD clauses,
+/// rather than pure activity as before.
 #[allow(clippy::too_many_arguments)]
 fn reduce_clause_database(
     clauses: &mut Vec<Clause>,
     lists: &mut Lists,
     watch: &mut Vec<[Literal; 2]>,
     clause_activity: &mut Vec<f64>,
+    clause_lbd: &mut Vec<usize>,
     estimated_bytes: &mut i64,
     x: &Assignment,
     reason: &mut [Option<usize>],
@@ -1615,9 +1817,12 @@ fn reduce_clause_database(
     }
 
     let mut eligible: Vec<usize> = (num_original_clauses..clauses.len())
-        .filter(|&idx| !locked[idx])
+        .filter(|&idx| !locked[idx] && clause_lbd[idx] > GLUE_CLAUSE_LBD_THRESHOLD)
         .collect();
-    eligible.sort_by(|&a, &b| clause_activity[a].partial_cmp(&clause_activity[b]).unwrap());
+    eligible.sort_by(|&a, &b| match clause_lbd[b].cmp(&clause_lbd[a]) {
+        std::cmp::Ordering::Equal => clause_activity[a].partial_cmp(&clause_activity[b]).unwrap(),
+        other => other,
+    });
 
     let num_to_delete = eligible.len() / 2;
     if num_to_delete == 0 {
@@ -1632,6 +1837,7 @@ fn reduce_clause_database(
     let mut new_clauses = Vec::with_capacity(clauses.len() - num_to_delete);
     let mut new_watch = Vec::with_capacity(clauses.len() - num_to_delete);
     let mut new_activity = Vec::with_capacity(clauses.len() - num_to_delete);
+    let mut new_lbd = Vec::with_capacity(clauses.len() - num_to_delete);
     for (idx, clause) in clauses.iter().enumerate() {
         if to_delete[idx] {
             continue;
@@ -1640,6 +1846,7 @@ fn reduce_clause_database(
         new_clauses.push(clause.clone());
         new_watch.push(watch[idx]);
         new_activity.push(clause_activity[idx]);
+        new_lbd.push(clause_lbd[idx]);
     }
 
     for (v, &value) in x.iter().enumerate().skip(1) {
@@ -1659,6 +1866,7 @@ fn reduce_clause_database(
     *clauses = temp_problem.clauses;
     *watch = new_watch;
     *clause_activity = new_activity;
+    *clause_lbd = new_lbd;
 }
 
 /// Scans `clause` for a literal that is not false under `assignment`
@@ -1712,6 +1920,7 @@ fn describe_params(
         RestartStrategy::Polynomial => 2,
         RestartStrategy::Geometric => 3,
         RestartStrategy::RoundRobin => 4,
+        RestartStrategy::Glucose => 5,
     };
     match time_limit {
         Some(limit) => format!(
@@ -1913,8 +2122,9 @@ mod tests {
         .expect("expected clause {-2,-4} to be falsified");
 
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut lbd_scratch: Vec<usize> = Vec::new();
 
-        let (learned, backtrack_level) = analyze(
+        let (learned, backtrack_level, lbd) = analyze(
             confl,
             &working_problem.clauses,
             &trail,
@@ -1929,10 +2139,16 @@ mod tests {
             SelectVarVariant::Weighted,
             &mut vsids,
             &mut lrb,
+            &mut lbd_scratch,
         );
 
         assert_eq!(backtrack_level, 0);
         assert_eq!(learned, vec![-2]);
+        // Both x2 and x4 (the conflicting clause's falsified literals)
+        // sit at decision level 1, and the seed level (current_level,
+        // also 1) coincides with them, so the distinct-level count is
+        // exactly 1.
+        assert_eq!(lbd, 1);
     }
 
     #[test]
@@ -1949,13 +2165,16 @@ mod tests {
         let mut estimated_bytes = 0i64;
         let before = working_problem.clauses.len();
 
+        let mut clause_lbd: Vec<usize> = Vec::new();
         let idx = add_learned_clause(
             &vec![-1],
+            1,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         );
 
@@ -1978,13 +2197,16 @@ mod tests {
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut estimated_bytes = 0i64;
 
+        let mut clause_lbd: Vec<usize> = Vec::new();
         let idx = add_learned_clause(
             &vec![-1, 2, 3],
+            3,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause for a length-3 learned clause");
@@ -2104,36 +2326,47 @@ mod tests {
         let level = vec![0usize; 6];
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 6];
 
+        // LBD 3 (above GLUE_CLAUSE_LBD_THRESHOLD) on all three, so this
+        // test exercises the activity tiebreak among equal-LBD clauses,
+        // not the glue-clause protection (see
+        // test_reduce_clause_database_protects_glue_clauses).
         let idx_low = add_learned_clause(
             &vec![-1, 3],
+            3,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
         let idx_locked = add_learned_clause(
             &vec![-2, 4],
+            3,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
         let idx_high = add_learned_clause(
             &vec![-3, 5],
+            3,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -2149,6 +2382,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -2193,16 +2427,19 @@ mod tests {
         let level = vec![0usize; 3];
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 3];
 
         let idx = add_learned_clause(
             &vec![-1, 2],
+            3,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -2215,6 +2452,7 @@ mod tests {
             &mut lists,
             &mut watch,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -2222,6 +2460,289 @@ mod tests {
         );
 
         assert_eq!(working_problem.clauses.len(), before);
+    }
+
+    /// STAGE34.md: verifies glue-clause protection -- a clause at
+    /// GLUE_CLAUSE_LBD_THRESHOLD, given the lowest possible activity
+    /// (0.0, the single most "deletable" value under the old
+    /// pure-activity policy), must still survive, while the correct
+    /// clause -- the lower-activity one among the remaining,
+    /// non-glue-eligible clauses -- is deleted instead.
+    #[test]
+    fn test_reduce_clause_database_protects_glue_clauses() {
+        let problem = Problem {
+            num_vars: 6,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let level = vec![0usize; 7];
+        let num_original_clauses = working_problem.clauses.len();
+        let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut estimated_bytes: i64 = 0;
+        let mut reason: Vec<Option<usize>> = vec![None; 7];
+
+        let idx_glue = add_learned_clause(
+            &vec![-1, 3],
+            GLUE_CLAUSE_LBD_THRESHOLD,
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        let idx_non_glue_low = add_learned_clause(
+            &vec![-2, 4],
+            GLUE_CLAUSE_LBD_THRESHOLD + 1,
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        let idx_non_glue_high = add_learned_clause(
+            &vec![-5, 6],
+            GLUE_CLAUSE_LBD_THRESHOLD + 1,
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        clause_activity[idx_glue] = 0.0;
+        clause_activity[idx_non_glue_low] = 0.5;
+        clause_activity[idx_non_glue_high] = 100.0;
+
+        let before = working_problem.clauses.len();
+        reduce_clause_database(
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+            &x,
+            &mut reason,
+            num_original_clauses,
+        );
+
+        assert_eq!(working_problem.clauses.len(), before - 1);
+        assert!(
+            working_problem.clauses.contains(&vec![-1, 3]),
+            "glue clause {{-1,3}} should have survived despite its rock-bottom activity"
+        );
+        assert!(
+            !working_problem.clauses.contains(&vec![-2, 4]),
+            "non-glue clause {{-2,4}} (lower activity among the non-glue clauses) should have been deleted"
+        );
+        assert!(
+            working_problem.clauses.contains(&vec![-5, 6]),
+            "non-glue clause {{-5,6}} (higher activity) should have survived"
+        );
+    }
+
+    /// STAGE34.md: verifies that, among eligible clauses, a higher LBD
+    /// is deleted before a lower one even when the higher-LBD clause
+    /// has much higher activity -- LBD is the primary sort key,
+    /// activity only a tiebreak among equal LBDs.
+    #[test]
+    fn test_reduce_clause_database_sorts_by_lbd_before_activity() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let level = vec![0usize; 5];
+        let num_original_clauses = working_problem.clauses.len();
+        let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut estimated_bytes: i64 = 0;
+        let mut reason: Vec<Option<usize>> = vec![None; 5];
+
+        let idx_high_lbd_high_activity = add_learned_clause(
+            &vec![-1, 3],
+            10,
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        let idx_low_lbd_low_activity = add_learned_clause(
+            &vec![-2, 4],
+            3,
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause");
+        clause_activity[idx_high_lbd_high_activity] = 1000.0;
+        clause_activity[idx_low_lbd_low_activity] = 0.0;
+
+        let before = working_problem.clauses.len();
+        reduce_clause_database(
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watch,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+            &x,
+            &mut reason,
+            num_original_clauses,
+        );
+
+        assert_eq!(working_problem.clauses.len(), before - 1);
+        assert!(
+            !working_problem.clauses.contains(&vec![-1, 3]),
+            "the high-LBD clause {{-1,3}} should have been deleted despite its high activity"
+        );
+        assert!(
+            working_problem.clauses.contains(&vec![-2, 4]),
+            "the low-LBD clause {{-2,4}} should have survived despite its low activity"
+        );
+    }
+
+    /// STAGE34.md: exercises glucose_should_restart directly with a
+    /// fabricated sequence of LBDs: it must not trigger before the
+    /// recent window is full, and its trigger decision afterward must
+    /// match a hand-computed recent_avg*GLUCOSE_K >= global_avg
+    /// comparison.
+    #[test]
+    fn test_glucose_should_restart() {
+        let mut glucose = GlucoseState::new();
+
+        // Fill all but one slot of the recent window with LBD 2
+        // (low/good); the window isn't full yet, so this must never
+        // trigger regardless of how bad a single additional LBD looks.
+        for i in 0..GLUCOSE_WINDOW_SIZE - 1 {
+            record_lbd(&mut glucose, 2);
+            assert!(
+                !glucose_should_restart(&glucose),
+                "glucose_should_restart() = true before the recent window (size {GLUCOSE_WINDOW_SIZE}) is full (i={i})"
+            );
+        }
+
+        // One more low-LBD conflict fills the window at a recent
+        // average of 2, equal to the global average (also 2) --
+        // recent_avg*GLUCOSE_K (2*0.8=1.6) is well below global_avg
+        // (2), so no restart yet.
+        record_lbd(&mut glucose, 2);
+        assert!(
+            !glucose_should_restart(&glucose),
+            "glucose_should_restart() = true with recent and global averages both at their best (LBD 2)"
+        );
+
+        // Now drive the recent window to a much worse (higher) LBD
+        // than the global history: after GLUCOSE_WINDOW_SIZE more
+        // conflicts at LBD 20, the recent window average is 20 (all
+        // GLUCOSE_WINDOW_SIZE slots hold 20), while the global average
+        // is dragged only partway up, so recent_avg*GLUCOSE_K must
+        // exceed it and a restart must be signaled.
+        for _ in 0..GLUCOSE_WINDOW_SIZE {
+            record_lbd(&mut glucose, 20);
+        }
+        let recent_avg = glucose.recent_sum as f64 / GLUCOSE_WINDOW_SIZE as f64;
+        let global_avg = glucose.global_sum as f64 / glucose.global_count as f64;
+        let want = recent_avg * GLUCOSE_K >= global_avg;
+        assert!(
+            want,
+            "test setup error: expected the LBD-20 run to make recent_avg*GLUCOSE_K >= global_avg true"
+        );
+        assert_eq!(
+            glucose_should_restart(&glucose),
+            want,
+            "recent_avg={recent_avg} global_avg={global_avg}"
+        );
+    }
+
+    /// Regression test for a bug this stage's own benchcompare sweep
+    /// found (STAGE34.md): a restart signaled immediately after a
+    /// conflict resolves to a level-0 learned unit clause --
+    /// `current_level` is already 0 by then -- used to panic inside
+    /// `backtrack_to(0, ...)`, which indexes `trail_lim[1]`, an index
+    /// that only exists when `current_level > 0`.
+    /// `RestartStrategy::Glucose`'s much higher restart frequency
+    /// (roughly every `GLUCOSE_WINDOW_SIZE` conflicts, versus the
+    /// fixed strategies' bases in the hundreds to tens of thousands)
+    /// made this reachable on real benchmark files
+    /// (`benchmark/blocksworld/bw_large.{c,d}.cnf`); `maybe_restart`
+    /// now returns immediately whenever `*current_level == 0`,
+    /// regardless of strategy, since there is nothing to restart from
+    /// the root anyway.
+    #[test]
+    fn test_maybe_restart_does_not_panic_at_root_level() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (_working_problem, _watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut trail: Vec<usize> = Vec::new();
+        let mut trail_lim: Vec<usize> = vec![0];
+        let mut current_level = 0usize; // matches the state right after a level-0 learned unit clause
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(2);
+        let mut saved_phase = vec![Value::False; 3];
+        let mut conflicts_since_restart = 0usize;
+        let mut restart_count = 0usize;
+
+        // Force glucose_should_restart to report true, so maybe_restart
+        // actually attempts a restart rather than skipping for an
+        // unrelated reason: establish a low-LBD baseline global
+        // average, then drive the recent window to a much worse LBD
+        // (mirroring test_glucose_should_restart's own setup).
+        let mut glucose = GlucoseState::new();
+        for _ in 0..GLUCOSE_WINDOW_SIZE {
+            record_lbd(&mut glucose, 2);
+        }
+        for _ in 0..GLUCOSE_WINDOW_SIZE {
+            record_lbd(&mut glucose, 20);
+        }
+        assert!(
+            glucose_should_restart(&glucose),
+            "test setup error: expected glucose_should_restart() = true"
+        );
+
+        maybe_restart(
+            // must not panic
+            RestartStrategy::Glucose,
+            &mut conflicts_since_restart,
+            &mut restart_count,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+            &mut saved_phase,
+            &glucose,
+        );
+
+        assert_eq!(restart_count, 0, "no restart actually happens at the root");
+        assert_eq!(conflicts_since_restart, 0);
     }
 
     /// The strongest available test of the whole reduction pipeline:
@@ -2354,6 +2875,7 @@ mod tests {
         .expect("expected clause {-2,-4} to be falsified");
 
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut lbd_scratch: Vec<usize> = Vec::new();
         analyze(
             confl,
             &working_problem.clauses,
@@ -2369,6 +2891,7 @@ mod tests {
             SelectVarVariant::Vsids,
             &mut vsids,
             &mut lrb,
+            &mut lbd_scratch,
         );
 
         assert!(
@@ -2645,6 +3168,7 @@ mod tests {
         let mut saved_phase = vec![Value::False; 3];
         let mut conflicts_since_restart = 1_000_000usize;
         let mut restart_count = 0usize;
+        let glucose = GlucoseState::new();
 
         maybe_restart(
             RestartStrategy::None,
@@ -2659,6 +3183,7 @@ mod tests {
             0,
             &mut lrb,
             &mut saved_phase,
+            &glucose,
         );
 
         assert_eq!(restart_count, 0, "RestartStrategy::None must never restart");
@@ -2682,14 +3207,17 @@ mod tests {
         let mut lists = occurrence::build(&working_problem);
         let mut level = vec![0usize; 3];
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
         let mut estimated_bytes = 0i64;
         let learned_idx = add_learned_clause(
             &vec![-1, 2],
+            3,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
             &level,
             &mut clause_activity,
+            &mut clause_lbd,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -2702,6 +3230,7 @@ mod tests {
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
         let mut saved_phase = vec![Value::False; 3];
+        let glucose = GlucoseState::new();
 
         current_level += 1;
         trail_lim.push(trail.len());
@@ -2733,6 +3262,7 @@ mod tests {
             0,
             &mut lrb,
             &mut saved_phase,
+            &glucose,
         );
         assert_eq!(restart_count, 0, "below threshold, must not restart yet");
         assert_ne!(
@@ -2755,6 +3285,7 @@ mod tests {
             0,
             &mut lrb,
             &mut saved_phase,
+            &glucose,
         );
 
         assert_eq!(restart_count, 1, "threshold reached");

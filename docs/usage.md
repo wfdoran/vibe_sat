@@ -137,7 +137,7 @@ the first, even if it's just the default.
 | Value | Meaning |
 |---|---|
 | `val1` | Variable-selection heuristic. `0`/`1`: same as `dfs`'s `val1`. `2` (default): VSIDS — scores variables by how often they've recently appeared while resolving a conflict, decayed over time. `3`: LRB — scores variables by how often they've recently *participated* in producing a learned clause, per conflict they've been assigned for. |
-| `val2` | Restart strategy. `0`: no restarts. `1`: the Luby sequence. `2` (default with `--num-threads=1`): a quadratic "polynomial" growth sequence. `3`: a true geometric growth sequence (constant ratio between restart intervals). `4` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{2, 3, 1}` in turn, so no two threads restart on the same cadence. |
+| `val2` | Restart strategy. `0`: no restarts. `1`: the Luby sequence. `2` (default with `--num-threads=1`): a quadratic "polynomial" growth sequence. `3`: a true geometric growth sequence (constant ratio between restart intervals). `4` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{2, 3, 1}` in turn, so no two threads restart on the same cadence. `5`: Glucose's data-driven policy — restart when a moving average of recent learned-clause LBDs looks close to or worse than the all-time average, rather than on a fixed conflict-count schedule. |
 | `val3` | Learned-clause database memory limit. Either a plain integer (bytes) or an integer with a `k`/`kb`/`m`/`mb`/`g`/`gb` suffix (case-insensitive), e.g. `100MB`. Unbounded by default. |
 
 `cdcl`'s defaults (VSIDS over LRB, the polynomial restart schedule over

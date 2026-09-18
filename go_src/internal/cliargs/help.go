@@ -117,6 +117,14 @@ Options:
                      on, so each strategy runs on close to an equal
                      share of the workers instead of every worker
                      racing with the same restart cadence.
+                 5 = Glucose's own data-driven policy (STAGE34.md):
+                     restarts not on a fixed conflict-count schedule
+                     but whenever the moving average LBD ("Literal
+                     Block Distance", Audemard & Simon 2009) of the
+                     last 50 learned clauses is close to or worse than
+                     the all-time average LBD -- a sign the search has
+                     drifted into learning less useful clauses than
+                     its own history and is better off restarting.
                Optional; defaults to 2 (polynomial) with --num-threads=1
                (this project's own benchmark comparison,
                reports/REPORT15.md, found the polynomial schedule

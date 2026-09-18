@@ -239,6 +239,14 @@ Options:
                      on, so each strategy runs on close to an equal
                      share of the workers instead of every worker
                      racing with the same restart cadence.
+                 5 = Glucose's own data-driven policy (STAGE34.md):
+                     restarts not on a fixed conflict-count schedule
+                     but whenever the moving average LBD ("Literal
+                     Block Distance", Audemard & Simon 2009) of the
+                     last 50 learned clauses is close to or worse than
+                     the all-time average LBD -- a sign the search has
+                     drifted into learning less useful clauses than
+                     its own history and is better off restarting.
                Optional; defaults to 2 (polynomial) with --num-threads=1
                (this project's own benchmark comparison,
                reports/REPORT15.md, found the polynomial schedule
@@ -355,7 +363,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         if raw.algorithm == "cdcl" {
             if values.len() > 3 {
                 return Err(
-                    "for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-4 selecting the restart strategy, and an optional learned-clause database memory limit)"
+                    "for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, and an optional learned-clause database memory limit)"
                         .to_string(),
                 );
             }
@@ -543,7 +551,7 @@ fn validate(args: &Args) -> Result<(), String> {
             // k/kb/m/mb/g/gb suffix) were already enforced in
             // build_args, since that's where the raw tokens are
             // available; only the remaining business rules (variant
-            // is 0-3; restart strategy is 0-4; the limit, if given,
+            // is 0-3; restart strategy is 0-5; the limit, if given,
             // is positive) are checked here. STAGE13.md extends the
             // first value's range from dfs's 0/1 (Weighted/Fast) to
             // also allow 2 (VSIDS) and 3 (LRB), both cdcl-only.
@@ -552,7 +560,10 @@ fn validate(args: &Args) -> Result<(), String> {
             // STAGE21.md adds a fourth restart-strategy value (4 =
             // round-robin across quadratic/geometric/Luby by worker
             // index, meaningful with --num-threads > 1; see
-            // cdcl::RestartStrategy::RoundRobin).
+            // cdcl::RestartStrategy::RoundRobin). STAGE34.md adds a
+            // fifth restart-strategy value (5 = Glucose's own
+            // data-driven policy based on LBD; see
+            // cdcl::RestartStrategy::Glucose).
             if let Some(params) = &args.alg_params
                 && !(0..=3).contains(&params[0])
             {
@@ -563,10 +574,10 @@ fn validate(args: &Args) -> Result<(), String> {
             }
             if let Some(params) = &args.alg_params
                 && let Some(&restart) = params.get(1)
-                && !(0..=4).contains(&restart)
+                && !(0..=5).contains(&restart)
             {
                 return Err(
-                    "for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, 3, or 4 (selecting the restart strategy)"
+                    "for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, 3, 4, or 5 (selecting the restart strategy)"
                         .to_string(),
                 );
             }
@@ -932,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_rejects_out_of_range_restart_strategy() {
-        for restart in ["5", "-1"] {
+        for restart in ["6", "-1"] {
             let result = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",
@@ -960,6 +971,20 @@ mod tests {
         ])
         .expect("Parse with --alg-params 2 4 should succeed");
         assert_eq!(args.alg_params.as_deref(), Some(&[2, 4][..]));
+    }
+
+    #[test]
+    fn test_parse_cdcl_accepts_glucose_restart_strategy() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "2",
+            "5",
+        ])
+        .expect("Parse with --alg-params 2 5 should succeed");
+        assert_eq!(args.alg_params.as_deref(), Some(&[2, 5][..]));
     }
 
     #[test]

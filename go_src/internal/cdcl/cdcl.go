@@ -117,12 +117,40 @@
 // lubyBaseConflicts/polynomialBaseConflicts/geometricBaseConflicts and
 // geometricGrowthFactor for how each schedule's scale constant(s) were
 // chosen.
+//
+// STAGE34.md adds LBD-based clause management (Audemard & Simon,
+// "Predicting Learnt Clauses Quality in Modern SAT Solvers," IJCAI
+// 2009 -- the paper that introduced Glucose): every learned clause's
+// "Literal Block Distance" (see computeLBD) is computed once, when it
+// is learned, and used two ways:
+//
+//   - reduceClauseDatabase now sorts eligible learned clauses by LBD
+//     ascending (lowest first) rather than by activity, and never
+//     deletes a "glue clause" (LBD <= glueClauseLBDThreshold) at all,
+//     matching Glucose's own policy -- a clause spanning very few
+//     decision levels is disproportionately likely to be useful again
+//     regardless of how recently it fired, which is exactly what LBD
+//     measures and pure activity does not.
+//   - RestartGlucose is a fifth restart schedule (see RestartStrategy),
+//     unlike the four schedule-based ones entirely data-driven: it
+//     restarts whenever the moving average LBD of the last
+//     glucoseWindowSize learned clauses is close to or worse than the
+//     global average LBD since the search began (see
+//     glucoseShouldRestart), the sign Glucose's own authors use for
+//     "the search is currently producing low-quality clauses, a fresh
+//     start is more likely to help than persisting." Selected via
+//     --alg-params val2=5; the default remains RestartPolynomial (see
+//     Run's doc comment for why), since this project's own
+//     benchmark-driven-default convention means RestartGlucose earns
+//     that status only if a future stage's measurement shows it
+//     deserves to, not by literature reputation alone.
 package cdcl
 
 import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -190,6 +218,26 @@ const (
 // value from within that range instead, as a documented
 // simplification (see the package doc comment).
 const lrbAlpha = 0.4
+
+// glueClauseLBDThreshold is Glucose's own "glue clause" cutoff
+// (Audemard & Simon 2009): a learned clause whose LBD is at or below
+// this is never a reduceClauseDatabase deletion candidate, regardless
+// of activity or memory pressure -- treated as close to permanently
+// useful, the same protection original (bootstrapped) clauses already
+// get. 2 is Glucose's own published value and the one essentially
+// every LBD-using solver since has kept unchanged.
+//
+// glucoseWindowSize and glucoseK are RestartGlucose's own parameters
+// (see glucoseShouldRestart): glucoseWindowSize is how many of the
+// most recently learned clauses' LBDs make up the "recent" moving
+// average (Glucose's own published window), and glucoseK is the
+// factor the recent average is compared against the all-time global
+// average by. Both are Glucose's own originally published values.
+const (
+	glueClauseLBDThreshold = 2
+	glucoseWindowSize      = 50
+	glucoseK               = 0.8
+)
 
 // lubyBaseConflicts and polynomialBaseConflicts are STAGE15.md's "b"
 // and "a": the scale constants for the Luby and polynomial restart
@@ -296,6 +344,12 @@ const (
 	// share of threads as num_threads allows, rather than every thread
 	// racing with the identical restart cadence.
 	RestartRoundRobin RestartStrategy = 4
+	// RestartGlucose is STAGE34.md's addition: Glucose's own data-driven
+	// restart policy (see the package doc comment and
+	// glucoseShouldRestart), rather than a fixed conflict-count
+	// schedule like the four strategies above. Not part of
+	// RestartRoundRobin's rotation -- see roundRobinStrategies.
+	RestartGlucose RestartStrategy = 5
 )
 
 // roundRobinStrategies is RestartRoundRobin's resolution order (see
@@ -378,6 +432,36 @@ type solver struct {
 	// written, since original clauses are never deletion candidates.
 	clauseActivity          []float64
 	clauseActivityIncrement float64
+
+	// clauseLBD holds one STAGE34.md Literal Block Distance value
+	// (see computeLBD) per clause, parallel to clauses/clauseActivity;
+	// like clauseActivity, only entries at index >= numOriginalClauses
+	// are ever meaningful (original clauses are stored as 0, never
+	// read). lbdScratch is computeLBD's own reusable scratch space (an
+	// unsorted linear-scan set of decision levels seen so far), reused
+	// across calls purely to avoid an allocation per conflict -- see
+	// computeLBD's doc comment for why a linear scan beats a map here,
+	// the same reasoning used throughout this project for small-N sets.
+	//
+	// lbdRecentBuf/lbdRecentPos/lbdRecentSum/lbdRecentFilled implement
+	// RestartGlucose's "recent" moving average as a fixed-size ring
+	// buffer of the last glucoseWindowSize learned clauses' LBDs (see
+	// recordLBD): lbdRecentSum is always the current sum of whatever is
+	// in the buffer, maintained incrementally (subtract the slot being
+	// overwritten, add the new value) rather than resummed each time.
+	// lbdGlobalSum/lbdGlobalCount are the corresponding all-time
+	// running sum/count since the search began (never reset, including
+	// across restarts -- see the package doc comment for why Glucose's
+	// own policy compares "recent" against "ever," not "since the last
+	// restart").
+	clauseLBD       []int
+	lbdScratch      []int
+	lbdRecentBuf    [glucoseWindowSize]int
+	lbdRecentPos    int
+	lbdRecentSum    int
+	lbdRecentFilled bool
+	lbdGlobalSum    int64
+	lbdGlobalCount  int64
 
 	// estimatedBytes tracks clauseByteCost summed over every current
 	// clause, kept up to date incrementally as clauses are learned or
@@ -524,6 +608,7 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		numOriginalClauses:      len(clauses),
 		clauseActivity:          make([]float64, len(clauses)),
 		clauseActivityIncrement: 1.0,
+		clauseLBD:               make([]int, len(clauses)),
 		estimatedBytes:          estimatedBytes,
 		memoryLimitBytes:        memoryLimitBytes,
 		variant:                 variant,
@@ -972,9 +1057,10 @@ func (s *solver) propagate() int {
 // the natural point to check, since it's already the point where this
 // thread's own local database just changed shape.
 func (s *solver) learnAndBackjump(confl int) {
-	learned, backtrackLevel := s.analyze(confl)
+	learned, backtrackLevel, lbd := s.analyze(confl)
+	s.recordLBD(lbd)
 	s.backtrackTo(backtrackLevel)
-	newClause := s.addLearnedClause(learned)
+	newClause := s.addLearnedClause(learned, lbd)
 	s.assignLiteral(learned[0], backtrackLevel, newClause)
 
 	s.clauseActivityIncrement /= clauseActivityDecay
@@ -1014,8 +1100,42 @@ func (s *solver) learnAndBackjump(confl int) {
 // bookkeeping. Called once after every conflict is otherwise handled
 // (i.e. after learnAndBackjump); a no-op if s.restartStrategy is
 // RestartNone.
+//
+// STAGE34.md: RestartGlucose is handled separately from the four
+// fixed-schedule strategies below -- it doesn't consult
+// restartThreshold or s.conflictsSinceRestart's count against a
+// precomputed number at all, only glucoseShouldRestart's data-driven
+// comparison of recent vs. global average LBD (see the package doc
+// comment).
+//
+// STAGE34.md also fixes a latent bug this stage's testing surfaced:
+// backtrackTo(0) indexes s.trailLim[1], which only exists if
+// s.currentLevel > 0. Immediately after a conflict resolves to a
+// level-0 learned unit clause, s.currentLevel is already 0 by the
+// time this runs (learnAndBackjump's own backtrackTo already got
+// there); calling backtrackTo(0) again here would panic. The fixed-
+// threshold strategies' large bases (hundreds to tens of thousands of
+// conflicts) made this coincidence essentially unreachable in
+// practice, but RestartGlucose can trigger every ~glucoseWindowSize
+// conflicts, hitting it on real benchmark files. There is nothing to
+// restart when already at the root regardless of strategy, so this
+// simply defers to the next conflict -- without resetting
+// conflictsSinceRestart or advancing restartCount, since no restart
+// actually happened.
 func (s *solver) maybeRestart() {
 	if s.restartStrategy == RestartNone {
+		return
+	}
+	if s.currentLevel == 0 {
+		return
+	}
+	if s.restartStrategy == RestartGlucose {
+		if !s.glucoseShouldRestart() {
+			return
+		}
+		s.backtrackTo(0)
+		s.conflictsSinceRestart = 0
+		s.restartCount++
 		return
 	}
 	if s.conflictsSinceRestart < s.restartThreshold() {
@@ -1024,6 +1144,51 @@ func (s *solver) maybeRestart() {
 	s.backtrackTo(0)
 	s.conflictsSinceRestart = 0
 	s.restartCount++
+}
+
+// recordLBD folds one freshly learned clause's LBD into both of
+// glucoseShouldRestart's moving averages (STAGE34.md): the
+// fixed-size "recent" window (a ring buffer of the last
+// glucoseWindowSize LBDs, incrementally summed so updating it is
+// O(1) regardless of window size) and the all-time global average
+// (a running sum/count, never reset -- including across restarts,
+// since restarts don't erase learned clauses or their LBDs either).
+// Called once per conflict, immediately after analyze, regardless of
+// which restart strategy is active, so that switching strategies
+// mid-run (not currently possible, but kept simple) would never find
+// the averages cold.
+func (s *solver) recordLBD(lbd int) {
+	s.lbdRecentSum -= s.lbdRecentBuf[s.lbdRecentPos]
+	s.lbdRecentBuf[s.lbdRecentPos] = lbd
+	s.lbdRecentSum += lbd
+	s.lbdRecentPos++
+	if s.lbdRecentPos == glucoseWindowSize {
+		s.lbdRecentPos = 0
+		s.lbdRecentFilled = true
+	}
+
+	s.lbdGlobalSum += int64(lbd)
+	s.lbdGlobalCount++
+}
+
+// glucoseShouldRestart implements Glucose's own data-driven restart
+// policy (Audemard & Simon, IJCAI 2009; see the package doc comment):
+// restart when the recent window's average LBD is close to or worse
+// than (i.e. at least glucoseK times) the all-time global average --
+// a sign that the search has drifted into a region where it's
+// learning less compact, less reusable clauses than its own history,
+// and is better off abandoning the current decision stack. Requires
+// at least one full recent window's worth of learned clauses before
+// ever triggering, both because the ring buffer isn't a meaningful
+// average until then and because lbdGlobalCount must be positive to
+// divide by.
+func (s *solver) glucoseShouldRestart() bool {
+	if !s.lbdRecentFilled {
+		return false
+	}
+	recentAvg := float64(s.lbdRecentSum) / float64(glucoseWindowSize)
+	globalAvg := float64(s.lbdGlobalSum) / float64(s.lbdGlobalCount)
+	return recentAvg*glucoseK >= globalAvg
 }
 
 // restartThreshold returns the number of conflicts that must elapse
@@ -1114,7 +1279,19 @@ func lubyTerm(i int) int {
 // increments lrbParticipated, counting this as one more conflict the
 // variable has contributed to since it was last assigned (see
 // backtrackTo for where that turns into an updated Q-value).
-func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
+//
+// STAGE34.md: lbd is the learned clause's Literal Block Distance --
+// the number of distinct decision levels represented among its
+// literals, computed in the same pass that already finds
+// backtrackLevel (both need exactly the same per-literal level
+// lookups, so this costs nothing extra beyond a small scratch-set
+// membership check per literal; see s.lbdScratch's doc comment for why
+// that's a plain slice, not a map). The asserting literal itself
+// (learned[0], at s.currentLevel by construction -- the first-UIP is
+// always a current-level variable) counts toward the distinct-level
+// set too, matching Audemard & Simon's own definition of LBD as being
+// over the *whole* clause, not just its non-asserting literals.
+func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd int) {
 	for i := range s.seen {
 		s.seen[i] = false
 	}
@@ -1176,12 +1353,17 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int) {
 	learned = append(cnf.Clause{-p}, learned...)
 
 	backtrackLevel = 0
+	s.lbdScratch = append(s.lbdScratch[:0], s.currentLevel)
 	for _, lit := range learned[1:] {
-		if lv := s.level[lit.Var()]; lv > backtrackLevel {
+		lv := s.level[lit.Var()]
+		if lv > backtrackLevel {
 			backtrackLevel = lv
 		}
+		if !slices.Contains(s.lbdScratch, lv) {
+			s.lbdScratch = append(s.lbdScratch, lv)
+		}
 	}
-	return learned, backtrackLevel
+	return learned, backtrackLevel, len(s.lbdScratch)
 }
 
 // literalAssignedTrue returns the literal on variable v that
@@ -1266,7 +1448,7 @@ func (s *solver) backtrackTo(level int) {
 // (returned above, before ever reaching here) are not shared; see
 // exportMaxClauseLen's doc comment for why that's a deliberate,
 // documented simplification rather than an oversight.
-func (s *solver) addLearnedClause(learned cnf.Clause) int {
+func (s *solver) addLearnedClause(learned cnf.Clause, lbd int) int {
 	if len(learned) == 1 {
 		return noReason
 	}
@@ -1277,6 +1459,7 @@ func (s *solver) addLearnedClause(learned cnf.Clause) int {
 	idx := len(s.clauses)
 	s.clauses = append(s.clauses, learned)
 	s.clauseActivity = append(s.clauseActivity, 0.0)
+	s.clauseLBD = append(s.clauseLBD, lbd)
 	s.estimatedBytes += clauseByteCost(learned)
 	for _, lit := range learned {
 		v := lit.Var()
@@ -1323,6 +1506,17 @@ func (s *solver) addLearnedClause(learned cnf.Clause) int {
 // patch each in place. This is an O(current clauses + literals)
 // operation, which is fine since it only runs when the configured
 // memory limit is actually exceeded, not on every conflict.
+//
+// STAGE34.md: a clause is also excluded from eligible -- "glue
+// clause" protection, on top of the pre-existing locked exclusion --
+// if its LBD is at or below glueClauseLBDThreshold, regardless of how
+// low its activity has fallen, since a low LBD is itself strong
+// independent evidence the clause is worth keeping even if it hasn't
+// happened to participate in a conflict recently. Among the clauses
+// that remain eligible, the sort is now LBD ascending first (higher
+// LBD = less "compact" = deleted first) with activity descending only
+// as a tiebreak among equal-LBD clauses, rather than pure activity as
+// before.
 func (s *solver) reduceClauseDatabase() {
 	locked := make([]bool, len(s.clauses))
 	for v := 1; v <= s.numVars; v++ {
@@ -1333,12 +1527,16 @@ func (s *solver) reduceClauseDatabase() {
 
 	var eligible []int
 	for idx := s.numOriginalClauses; idx < len(s.clauses); idx++ {
-		if !locked[idx] {
+		if !locked[idx] && s.clauseLBD[idx] > glueClauseLBDThreshold {
 			eligible = append(eligible, idx)
 		}
 	}
 	sort.Slice(eligible, func(i, j int) bool {
-		return s.clauseActivity[eligible[i]] < s.clauseActivity[eligible[j]]
+		a, b := eligible[i], eligible[j]
+		if s.clauseLBD[a] != s.clauseLBD[b] {
+			return s.clauseLBD[a] > s.clauseLBD[b]
+		}
+		return s.clauseActivity[a] < s.clauseActivity[b]
 	})
 
 	numToDelete := len(eligible) / 2
@@ -1354,6 +1552,7 @@ func (s *solver) reduceClauseDatabase() {
 	newClauses := make([]cnf.Clause, 0, len(s.clauses)-numToDelete)
 	newWatch := make([][2]cnf.Literal, 0, len(s.clauses)-numToDelete)
 	newActivity := make([]float64, 0, len(s.clauses)-numToDelete)
+	newLBD := make([]int, 0, len(s.clauses)-numToDelete)
 	for idx, clause := range s.clauses {
 		if toDelete[idx] {
 			oldToNew[idx] = noReason
@@ -1363,6 +1562,7 @@ func (s *solver) reduceClauseDatabase() {
 		newClauses = append(newClauses, clause)
 		newWatch = append(newWatch, s.watch[idx])
 		newActivity = append(newActivity, s.clauseActivity[idx])
+		newLBD = append(newLBD, s.clauseLBD[idx])
 	}
 
 	for v := 1; v <= s.numVars; v++ {
@@ -1374,6 +1574,7 @@ func (s *solver) reduceClauseDatabase() {
 	s.clauses = newClauses
 	s.watch = newWatch
 	s.clauseActivity = newActivity
+	s.clauseLBD = newLBD
 	s.lists = occurrence.Build(&cnf.Problem{NumVars: s.numVars, Clauses: newClauses})
 
 	s.estimatedBytes = 0

@@ -359,6 +359,7 @@ fn run_cdcl(
         Some([_, 2, ..]) => cdcl::RestartStrategy::Polynomial,
         Some([_, 3, ..]) => cdcl::RestartStrategy::Geometric,
         Some([_, 4, ..]) => cdcl::RestartStrategy::RoundRobin,
+        Some([_, 5, ..]) => cdcl::RestartStrategy::Glucose,
         _ if args.num_threads > 1 => cdcl::RestartStrategy::RoundRobin,
         _ => cdcl::RestartStrategy::Polynomial,
     };
