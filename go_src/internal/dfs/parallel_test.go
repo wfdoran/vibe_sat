@@ -117,6 +117,99 @@ func TestRunParallelProvesUnsatisfiableLargerPigeonhole(t *testing.T) {
 	}
 }
 
+// TestShedFrameMaterializesUntriedSiblingForStealing directly exercises
+// searchState.shedFrame (STAGE32.md/REPORT32.md), rather than relying
+// on shedCheckInterval being reached organically -- with that constant
+// now deliberately very large (see its own doc comment), no small
+// test problem will ever trigger a shed through the normal
+// checkPause path, so this is the only test that ever runs this code
+// at all.
+//
+// Uses SelectVarFast (deterministic, always the lowest-numbered
+// unassigned variable) so the exact search shape is predictable
+// without needing to reason about the weighted heuristic or rng: on a
+// single-clause, 3-variable problem, the very first decision is
+// variable 1. A checkPause that returns true only starting from its
+// second call lets step run exactly one node (var 1 = False, which
+// succeeds since the clause isn't yet violated) and then pause with
+// var 1's frame at frameTryTrue (committed to False, True untried) and
+// var 2's freshly-pushed frame still at frameTryFalse (never
+// attempted) -- exactly the state shedFrame is meant to find useful
+// work in.
+func TestShedFrameMaterializesUntriedSiblingForStealing(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)}}}
+	lists := occurrence.Build(problem)
+	clauses, root, ok := bootstrap(problem)
+	if !ok {
+		t.Fatalf("bootstrap reported UNSAT unexpectedly")
+	}
+	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
+	state := startSearch(clauses, lists, workingProblem, root, SelectVarFast, nil)
+
+	calls := 0
+	checkPause := func(int) bool {
+		calls++
+		return calls > 1
+	}
+	outcome, stepped := state.step(workingProblem, SelectVarFast, nil, checkPause)
+	if outcome != stepPaused || stepped != 1 {
+		t.Fatalf("step() = (%v, %d), want (stepPaused, 1)", outcome, stepped)
+	}
+	if len(state.frames) != 2 || state.frames[0].next != frameTryTrue || state.frames[1].next != frameTryFalse {
+		t.Fatalf("frames = %+v, want [var 1: frameTryTrue, var 2: frameTryFalse]", state.frames)
+	}
+
+	d := newDeque()
+	shedResult, satAssignment := state.shedFrame(d)
+	if shedResult != shedPushed {
+		t.Fatalf("shedFrame() = (%v, %v), want (shedPushed, nil)", shedResult, satAssignment)
+	}
+	if state.frames[0].next != frameExhausted {
+		t.Errorf("shed frame's next = %v, want frameExhausted so this worker never retries it", state.frames[0].next)
+	}
+
+	shed, ok := d.popBottom()
+	if !ok {
+		t.Fatalf("expected shedFrame to have pushed a node onto the deque")
+	}
+	if shed.assignment[1] != assign.True {
+		t.Errorf("shed node's variable 1 = %v, want True (the untried sibling of what this search committed to)", shed.assignment[1])
+	}
+	for v := 2; v <= problem.NumVars; v++ {
+		if shed.assignment[v] != assign.Unassigned {
+			t.Errorf("shed node's variable %d = %v, want Unassigned (this search never descended past variable 1)", v, shed.assignment[v])
+		}
+	}
+
+	// The shed snapshot must be independently explorable to a correct
+	// verdict, exactly like any other searchNode.
+	shedState := startSearch(clauses, lists, workingProblem, shed, SelectVarFast, nil)
+	shedOutcome, _ := shedState.step(workingProblem, SelectVarFast, nil, nil)
+	if shedOutcome != stepSAT {
+		t.Fatalf("exploring the shed snapshot to completion gave %v, want stepSAT (var 1 = True alone already satisfies the only clause)", shedOutcome)
+	}
+	allClausesSatisfiedDFS(t, problem, shedState.x)
+}
+
+// allClausesSatisfiedDFS is TestShedFrameMaterializesUntriedSiblingForStealing's
+// own small helper, named to avoid colliding with any identically-
+// purposed helper in this package's other test files.
+func allClausesSatisfiedDFS(t *testing.T, problem *cnf.Problem, full assign.Assignment) {
+	t.Helper()
+	for i, clause := range problem.Clauses {
+		satisfied := false
+		for _, lit := range clause {
+			if full.LiteralIsTrue(lit) {
+				satisfied = true
+				break
+			}
+		}
+		if !satisfied {
+			t.Errorf("clause %d (%v) not satisfied by %v", i, clause, full)
+		}
+	}
+}
+
 // TestBFSSeedReturnsSATDirectlyWithoutSpawningWorkers verifies
 // STAGE18.md's "BFS solves the problem" SAT case: a formula trivial
 // enough that the very first branch bfsSeed tries already completes

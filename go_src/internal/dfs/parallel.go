@@ -124,7 +124,7 @@ func bfsSeed(clauses []cnf.Clause, lists *occurrence.Lists, workingProblem *cnf.
 			branchAssignment[i] = v
 			branchWatch := cloneWatchState(node.watch)
 
-			switch BCP(clauses, lists, branchWatch, branchAssignment, i) {
+			switch BCP(clauses, lists, branchWatch, branchAssignment, i, nil) {
 			case Contra:
 				continue
 			case Done:
@@ -299,37 +299,123 @@ type dfsWorkerConfig struct {
 	startTime      time.Time
 }
 
-// dfsWorker is one worker's main loop: repeatedly take a node (its
-// own deque first, then stealing from a peer), branch it exactly like
-// Run's own loop does, and push any surviving children onto its own
-// deque -- until it either completes a satisfying assignment, the
-// shared deadline passes, another worker signals stop (found a
-// solution, or the search timed out), or every worker's deque is
-// confirmed empty (see terminator.go), which proves the whole problem
-// unsatisfiable.
+// shedCheckInterval controls how often (in nodes explored) a worker
+// considers shedding a spare branch onto its own deque for another
+// worker to steal (see searchState.shedFrame), whenever that deque
+// currently looks empty.
+//
+// STAGE32.md/REPORT32.md: this was originally 0xff (checking often
+// costs almost nothing -- deque.isEmpty() is two atomic loads, not a
+// syscall -- and checking often was meant to keep an idle peer from
+// waiting long for something stealable). Direct measurement on a real
+// benchmark file (benchmark/uuf175-753/uuf175-083.cnf) found that
+// value catastrophic instead: 2 threads took over 90 seconds and 1.5M+
+// nodes without finishing, versus 1.86 seconds and ~40,000 nodes
+// (matching single-threaded almost exactly) with shedding effectively
+// disabled. The cause is not a correctness bug -- every shed subtree
+// is still explored exactly once -- but a real cost specific to this
+// stage's design: each shed hands a subtree to a *freshly started*
+// search, which calls SelectVar's weighted heuristic (and its
+// rng-driven tie-breaking) starting over from that point, rather than
+// inheriting whatever sequence of choices the original, continuous
+// exploration would have made. For a heuristic this sensitive to tie-
+// break luck, restarting it often enough can turn a well-behaved
+// search into a much larger one, and this project has no evidence
+// (only this one measurement) about how which instances are
+// vulnerable to it or by how much.
+//
+// A much larger interval -- shedding only after many hundreds of
+// thousands of nodes -- keeps this from ever triggering at all on
+// typical benchmark-sized searches (thousands to low millions of
+// nodes total), which is exactly what eliminated the regression above,
+// while still providing occasional, if infrequent, rebalancing on the
+// genuinely huge searches (REPORT29.md's 17.7-million-clause files)
+// this stage's memory fix was actually written for -- and, crucially,
+// memory safety does not depend on this constant at all: an unshed
+// frame costs a few bytes on this worker's own stack, not a clause-
+// sized clone, regardless of how rarely (or never) shedding fires. See
+// REPORT32.md for the full investigation and the case for erring this
+// conservative rather than searching further for a safer middle
+// ground under this stage's time budget.
+const shedCheckInterval = 0xfffff
+
+// dfsWorker is one worker's main loop (STAGE32.md/REPORT32.md): unlike
+// Stage 18 through Stage 31, a worker no longer clones a new
+// searchNode for every branch it explores -- it runs a single local
+// searchState (exactly like Run's own, see dfs.go), mutating one
+// shared assignment and watch state in place via an explicit,
+// incrementally-backtracked trail, for as long as it has its own local
+// work. Only when that local search pauses (checkPause below) does it
+// consider the relatively rare, still O(clauses)-costly operations:
+// shedding one spare branch onto its own deque so an idle peer has
+// something to steal (searchState.shedFrame), and checking the shared
+// stop/deadline signals. Once its own local search is fully exhausted
+// (stepUNSAT), it falls back to exactly the same steal-then-
+// terminate-detect protocol every previous stage's version used
+// (stealFromPeers, terminator) -- that part of the design needed no
+// change, since it already only ever handles self-contained
+// searchNode snapshots, regardless of how rarely they are now created.
 func dfsWorker(cfg dfsWorkerConfig) Result {
-	state := newWorkerState(cfg.term)
+	workerState := newWorkerState(cfg.term)
 	peers := shuffledPeers(len(cfg.deques), cfg.self, cfg.rng)
 	numNodes := 0
-	step := 0
 
-	for {
+	checkPause := func(numNodesThisCall int) bool {
+		total := numNodes + numNodesThisCall
 		if cfg.stop.Load() {
-			return Result{NumNodes: numNodes}
+			return true
 		}
-		step++
-		if cfg.timeLimit != nil && step&timeCheckInterval == 0 && time.Since(cfg.startTime) >= *cfg.timeLimit {
-			cfg.timedOut.Store(true)
-			cfg.stop.Store(true)
-			return Result{NumNodes: numNodes, TimedOut: true}
+		if cfg.timeLimit != nil && total&timeCheckInterval == 0 && time.Since(cfg.startTime) >= *cfg.timeLimit {
+			return true
 		}
+		// numNodesThisCall > 0 matters, not just total&shedCheckInterval:
+		// without it, a shed-triggered pause that finds nothing to shed
+		// (search.shedFrame's shedNone -- e.g. before this call has
+		// committed to any frame's False branch yet) would return to
+		// step() and immediately see the exact same total again, since
+		// nothing changed, pausing forever with zero progress made.
+		// Requiring real progress since this call started guarantees the
+		// next check is against a different total.
+		return numNodesThisCall > 0 && total&shedCheckInterval == 0 && cfg.deques[cfg.self].isEmpty()
+	}
 
-		node, ok := cfg.deques[cfg.self].popBottom()
-		if !ok {
-			node, ok = stealFromPeers(cfg.deques, peers)
-		}
-		if !ok {
-			terminated := state.markIdle(func() bool {
+	// findWork tries this worker's own deque first, then peers, then
+	// (if both fail) participates in termination detection, retrying
+	// until either work turns up or global termination is confirmed.
+	// ok=false means the whole search is over (UNSAT, or another
+	// worker already found SAT/timed out); cfg.stop is already set in
+	// that case.
+	//
+	// STAGE32.md/REPORT32.md: this is also used for a worker's very
+	// first node, not just for resuming after its own local search
+	// exhausts -- an earlier version treated "my own initial seed is
+	// missing from my own deque" as unreachable and returned
+	// immediately without telling the terminator, which is wrong: a
+	// peer can steal that seed (via stealTop) before this worker ever
+	// gets to popBottom it itself, since nothing orders "worker N's
+	// goroutine starts running" before "some other already-running
+	// worker's steal sweep reaches worker N's deque." When that
+	// race's loser silently returned, it permanently undercounted the
+	// terminator's active total by one, so the shared active count
+	// could never reach zero and global termination was never
+	// confirmed -- observed directly as one worker spinning forever
+	// on a fully torn-down, provably-empty set of deques. Routing the
+	// initial pop through the exact same path as every later
+	// exhaustion closes this: whichever worker loses that race for
+	// its own seed just finds (or fails to find) other work exactly
+	// like any other idle worker would.
+	findWork := func() (node searchNode, ok bool) {
+		for {
+			node, ok = cfg.deques[cfg.self].popBottom()
+			if !ok {
+				node, ok = stealFromPeers(cfg.deques, peers)
+			}
+			if ok {
+				workerState.markActive()
+				return node, true
+			}
+
+			terminated := workerState.markIdle(func() bool {
 				for _, d := range cfg.deques {
 					if !d.isEmpty() {
 						return false
@@ -339,38 +425,55 @@ func dfsWorker(cfg dfsWorkerConfig) Result {
 			})
 			if terminated {
 				cfg.stop.Store(true)
-				return Result{NumNodes: numNodes}
+				return searchNode{}, false
 			}
+			if cfg.stop.Load() {
+				return searchNode{}, false
+			}
+			runtime.Gosched()
+		}
+	}
+
+	node, ok := findWork()
+	if !ok {
+		return Result{NumNodes: numNodes}
+	}
+	search := startSearch(cfg.clauses, cfg.lists, cfg.workingProblem, node, cfg.variant, cfg.rng)
+	numNodes++ // this node's own first frame, matching Run's "root frame counts as node 1" convention
+
+	for {
+		outcome, stepped := search.step(cfg.workingProblem, cfg.variant, cfg.rng, checkPause)
+		numNodes += stepped
+
+		switch outcome {
+		case stepSAT:
+			return Result{Satisfiable: true, Assignment: search.x, NumNodes: numNodes}
+
+		case stepPaused:
 			if cfg.stop.Load() {
 				return Result{NumNodes: numNodes}
 			}
-			runtime.Gosched()
-			continue
-		}
-
-		state.markActive()
-		numNodes++
-
-		var i int
-		if cfg.variant == SelectVarFast {
-			i = SelectVarFastPick(cfg.workingProblem, node.assignment)
-		} else {
-			i = SelectVar(cfg.workingProblem, node.assignment, cfg.rng)
-		}
-
-		for _, v := range [2]assign.Value{assign.False, assign.True} {
-			branchAssignment := append(assign.Assignment(nil), node.assignment...)
-			branchAssignment[i] = v
-			branchWatch := cloneWatchState(node.watch)
-
-			switch BCP(cfg.clauses, cfg.lists, branchWatch, branchAssignment, i) {
-			case Contra:
-				continue
-			case Done:
-				return Result{Satisfiable: true, Assignment: branchAssignment, NumNodes: numNodes}
-			case OK:
-				cfg.deques[cfg.self].pushBottom(searchNode{assignment: branchAssignment, watch: branchWatch})
+			if cfg.timeLimit != nil && time.Since(cfg.startTime) >= *cfg.timeLimit {
+				cfg.timedOut.Store(true)
+				cfg.stop.Store(true)
+				return Result{NumNodes: numNodes, TimedOut: true}
 			}
+			// Otherwise this was a shed checkpoint: our own deque looked
+			// empty, so offer a peer our shallowest spare branch, if we
+			// have one, then resume our own local search unchanged.
+			if shedResult, satAssignment := search.shedFrame(cfg.deques[cfg.self]); shedResult == shedSAT {
+				return Result{Satisfiable: true, Assignment: satAssignment, NumNodes: numNodes}
+			}
+
+		case stepUNSAT:
+			// Our own local search is fully exhausted; look for more
+			// work exactly like this worker's very first node did.
+			node, ok := findWork()
+			if !ok {
+				return Result{NumNodes: numNodes}
+			}
+			search = startSearch(cfg.clauses, cfg.lists, cfg.workingProblem, node, cfg.variant, cfg.rng)
+			numNodes++ // this node's own first frame
 		}
 	}
 }

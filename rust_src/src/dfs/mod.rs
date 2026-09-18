@@ -81,13 +81,24 @@ const TIME_CHECK_INTERVAL: usize = 0xfff;
 /// some other not-yet-false literal whenever it can, which is what
 /// makes propagation cheap in the steady state.
 ///
-/// A `WatchState` belongs to exactly one node of the search: each
-/// branch gets its own clone (it derives [`Clone`]), since sibling
-/// branches make different assignments and so may need different
-/// literals watched. This keeps the search's existing "explicit stack
-/// of self-contained nodes" structure from STAGE5.md intact, rather
-/// than requiring the single shared, incrementally backtracked trail
-/// a from-scratch CDCL implementation would normally use.
+/// STAGE32.md/REPORT32.md: before this stage, every branch got its own
+/// clone of `WatchState` (it derives [`Clone`]), matching STAGE5.md's
+/// "explicit stack of self-contained nodes" design rather than the
+/// single shared, incrementally backtracked trail `cdcl` uses. That
+/// was found unsafe at scale (REPORT29.md: a single clone runs 100+ MB
+/// on a 17.7-million-clause file). [`SearchState`] now shares one
+/// `WatchState` for an entire sequential exploration, mutated in place
+/// and never cloned on backtrack -- a watch remains valid as long as
+/// it isn't watching a literal that's currently false, and
+/// backtracking only ever turns assigned literals back into unassigned
+/// ones, so every watch already in place is still legal afterward,
+/// with nothing to undo (see `cdcl`'s `backtrack_to` doc comment for
+/// the identical argument). `WatchState` still derives [`Clone`], but
+/// it's now used only where a genuinely independent snapshot is
+/// needed: [`parallel::bfs_seed`]'s initial per-worker seeds and
+/// [`SearchState::shed_frame`]'s occasional, deliberate materialization
+/// of one snapshot for another worker to steal -- both rare compared
+/// to the total number of nodes explored.
 ///
 /// `watch[c]` is always exactly 2 distinct literals, which requires
 /// every clause to have at least 2 literals; callers must guarantee
@@ -142,16 +153,292 @@ fn is_false(literal: Literal, assignment: &Assignment) -> bool {
     }
 }
 
-/// One entry of [`run`]'s explicit search stack: a partial assignment
-/// together with the watched-literal state describing it. Every
-/// branch gets its own independent `SearchNode` (via `WatchState`'s
-/// `Clone`), matching STAGE5.md's original "stack of full
-/// assignments" design -- STAGE9.md's watched literals speed up the
-/// [`bcp`] call made when creating each node, not the overall search
-/// structure.
+/// A self-contained snapshot of one point in the search tree: a
+/// partial assignment together with the watched-literal state
+/// describing it. Before STAGE32.md, [`run`] kept an explicit stack of
+/// these -- one full clone per branch -- matching STAGE5.md's original
+/// design. REPORT29.md found that design unsafe at scale (a single
+/// stack entry's watch-state clone alone runs 100+ MB on a
+/// 17.7-million-clause file, and a search stack routinely holds many
+/// such entries at once); STAGE32.md/REPORT32.md replaces it with
+/// [`SearchState`]'s single, incrementally-backtracked assignment and
+/// watch state below, matching the persistent-trail design `cdcl` has
+/// used since Stage 11 (see `cdcl`'s `backtrack_to` doc comment for
+/// the same "a watch stays valid across backtracking" argument this
+/// reuses).
+///
+/// `SearchNode` itself still exists, and is still exactly this
+/// expensive to create, but is now used only where a genuinely
+/// independent, self-contained snapshot is actually needed:
+/// [`parallel::run_parallel`]'s initial per-worker seeds
+/// ([`parallel::bfs_seed`]), and a worker's occasional, deliberate
+/// materialization of one snapshot to offer another worker via its
+/// deque (see `parallel::dfs_worker`, which calls
+/// `SearchState::shed_frame` directly) -- both rare compared to the
+/// total number of nodes explored, unlike Stage 5-31's one-per-branch
+/// cost.
 struct SearchNode {
     assignment: Assignment,
     watch: WatchState,
+}
+
+/// One entry of [`SearchState`]'s explicit backtracking stack: it
+/// records enough to retry `variable` with its other value, or
+/// abandon it entirely, without ever needing a stored copy of the
+/// assignment or watch state it was created under -- backtracking
+/// instead undoes exactly the trail entries made since `mark` (see
+/// [`SearchState::undo_to`]).
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    variable: usize,
+    /// `trail.len()` immediately before `variable` was first assigned
+    /// by this frame.
+    mark: usize,
+    next: FrameNext,
+}
+
+/// Identifies which of `False`/`True` a [`Frame`] has left to try, or
+/// that neither is left (`Exhausted`: pop this frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameNext {
+    TryFalse,
+    TryTrue,
+    Exhausted,
+}
+
+impl FrameNext {
+    /// Advances `TryFalse -> TryTrue -> Exhausted`.
+    fn advance(self) -> Self {
+        match self {
+            FrameNext::TryFalse => FrameNext::TryTrue,
+            FrameNext::TryTrue | FrameNext::Exhausted => FrameNext::Exhausted,
+        }
+    }
+}
+
+/// `step`'s own report of why it stopped, distinct from [`Status`]
+/// (`bcp`'s per-attempt report) since `step` runs a whole sequence of
+/// attempts, not just one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepOutcome {
+    /// `checkPause` returned true; frames may still hold pending work.
+    Paused,
+    /// `x` is now a complete satisfying assignment.
+    Sat,
+    /// `frames` is empty: this subtree is fully exhausted.
+    Unsat,
+}
+
+/// The mutable engine behind one sequential depth-first exploration
+/// (STAGE32.md/REPORT32.md): a single assignment and a single
+/// `WatchState`, both shared across the entire exploration and mutated
+/// in place, plus an explicit trail recording every variable assigned
+/// (by either a branch decision or `bcp`'s own forced propagation)
+/// since the search began, and an explicit frame stack mirroring what
+/// a recursive "try `False`, try `True`" call stack would hold.
+/// Backtracking undoes trail entries back to a frame's mark instead of
+/// restoring a stored clone -- there is only ever one assignment and
+/// one watch state alive for the whole exploration, not one per
+/// branch.
+struct SearchState<'a> {
+    clauses: &'a [Clause],
+    lists: &'a Lists,
+    x: Assignment,
+    ws: WatchState,
+    trail: Vec<usize>,
+    frames: Vec<Frame>,
+}
+
+impl<'a> SearchState<'a> {
+    /// Builds a `SearchState` ready to explore beneath `root`: it
+    /// takes ownership of `root`'s assignment and watch state, matching
+    /// the old per-branch clone's ownership convention except there is
+    /// now exactly one live copy for the whole exploration, not one
+    /// per node.
+    fn new(clauses: &'a [Clause], lists: &'a Lists, root: SearchNode) -> Self {
+        SearchState {
+            clauses,
+            lists,
+            x: root.assignment,
+            ws: root.watch,
+            trail: Vec::with_capacity(64),
+            frames: Vec::new(),
+        }
+    }
+
+    /// Truncates `trail` back to `mark`, resetting every variable
+    /// assigned since then back to `Value::Unassigned`. A no-op if the
+    /// trail is already at (or, defensively, before) `mark`.
+    fn undo_to(&mut self, mark: usize) {
+        for &v in self.trail[mark.min(self.trail.len())..].iter().rev() {
+            self.x[v] = Value::Unassigned;
+        }
+        if mark < self.trail.len() {
+            self.trail.truncate(mark);
+        }
+    }
+
+    /// Runs the search forward from `self`'s current frames until one
+    /// of three things happens: a satisfying assignment is found
+    /// (`StepOutcome::Sat`, `self.x` is the assignment); every frame is
+    /// exhausted, proving this exploration's subtree unsatisfiable
+    /// (`StepOutcome::Unsat`); or `check_pause` (which may be `None`)
+    /// reports true, pausing with frames still holding unfinished work
+    /// for a later call to resume (`StepOutcome::Paused`) -- used for
+    /// the time-limit check and, in `run_parallel`'s workers, to
+    /// periodically consider shedding work for other workers to steal
+    /// (see `Self::shed_frame`, called from `parallel::dfs_worker`).
+    /// `check_pause` is passed this call's own running node count (not
+    /// counting nodes from any earlier call), since a single call can
+    /// run for a long time and the
+    /// caller's own total is otherwise unavailable to it until `step`
+    /// finally returns. The returned count is how many new frames were
+    /// pushed (branch points created) during this call, matching the
+    /// pre-STAGE32.md convention of counting once per node expanded.
+    fn step<R: Rng>(
+        &mut self,
+        working_problem: &Problem,
+        variant: SelectVarVariant,
+        rng: &mut R,
+        mut check_pause: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> (StepOutcome, usize) {
+        let mut num_nodes = 0;
+        while let Some(&top) = self.frames.last() {
+            if let Some(check_pause) = check_pause.as_deref_mut()
+                && check_pause(num_nodes)
+            {
+                return (StepOutcome::Paused, num_nodes);
+            }
+
+            if top.next == FrameNext::Exhausted {
+                self.undo_to(top.mark);
+                self.frames.pop();
+                continue;
+            }
+
+            self.undo_to(top.mark); // no-op except when returning here after a pushed child's subtree was fully exhausted
+            let value = if top.next == FrameNext::TryTrue {
+                Value::True
+            } else {
+                Value::False
+            };
+            self.x[top.variable] = value;
+            self.trail.push(top.variable);
+            let last = self.frames.len() - 1;
+            self.frames[last].next = top.next.advance();
+
+            match bcp(
+                self.clauses,
+                self.lists,
+                &mut self.ws,
+                &mut self.x,
+                top.variable,
+                Some(&mut self.trail),
+            ) {
+                Status::Contra => continue, // top is unchanged; next iteration retries it (next value, or exhausted)
+                Status::Done => return (StepOutcome::Sat, num_nodes),
+                Status::Ok => {
+                    let i = match variant {
+                        SelectVarVariant::Fast => select_var_fast_pick(working_problem, &self.x),
+                        SelectVarVariant::Weighted => select_var(working_problem, &self.x, rng),
+                    };
+                    num_nodes += 1;
+                    self.frames.push(Frame {
+                        variable: i,
+                        mark: self.trail.len(),
+                        next: FrameNext::TryFalse,
+                    });
+                }
+            }
+        }
+        (StepOutcome::Unsat, num_nodes)
+    }
+
+    /// Looks for the shallowest frame in `self` whose `False` branch
+    /// has been committed to (`FrameNext::TryTrue`: already explored,
+    /// or still being explored by a descendant frame further up the
+    /// stack) but whose `True` branch has not, and hands that `True`
+    /// branch off: it materializes an independent [`SearchNode`]
+    /// snapshot (an assignment clone covering only the ancestor
+    /// variables locked in before that frame, per REPORT32.md's
+    /// argument for why the *current* watch state remains a legal
+    /// watch for any less-constrained ancestor assignment too) and
+    /// pushes it onto `deque` for another worker to steal, exactly
+    /// like the per-branch clones Stage 5 through Stage 31 made
+    /// unconditionally for *every* branch -- this is the one place
+    /// that cost still exists, but now only when a worker deliberately
+    /// decides to make its own spare capacity available, not once per
+    /// node.
+    ///
+    /// The shed-from frame's own `next` is set to `Exhausted`
+    /// regardless of outcome, since either way this worker no longer
+    /// owns that branch: a pushed snapshot means some worker (this one
+    /// or a thief) now owns it independently; a `Contra` discovered
+    /// while materializing it means it's already provably dead, so
+    /// there is nothing left to shed at all, but this worker still
+    /// must not retry it itself.
+    fn shed_frame(&mut self, push: impl FnOnce(SearchNode)) -> Option<Assignment> {
+        for i in 0..self.frames.len() {
+            let f = self.frames[i];
+            if f.next != FrameNext::TryTrue {
+                continue; // untouched (nothing committed yet) or already exhausted/shed
+            }
+
+            let mut snap_assignment = assignment::new(self.x.len() - 1);
+            for &v in &self.trail[..f.mark] {
+                snap_assignment[v] = self.x[v];
+            }
+            snap_assignment[f.variable] = Value::True;
+            let mut snap_watch = self.ws.clone();
+
+            self.frames[i].next = FrameNext::Exhausted;
+            match bcp(
+                self.clauses,
+                self.lists,
+                &mut snap_watch,
+                &mut snap_assignment,
+                f.variable,
+                None,
+            ) {
+                Status::Done => return Some(snap_assignment),
+                Status::Ok => push(SearchNode {
+                    assignment: snap_assignment,
+                    watch: snap_watch,
+                }),
+                Status::Contra => {}
+            }
+            return None;
+        }
+        None
+    }
+}
+
+/// Builds a [`SearchState`] for `root` (via [`SearchState::new`]) and
+/// selects and pushes its first frame, ready for `step` to run --
+/// every caller must already know `root.assignment` is not yet
+/// complete (see [`all_assigned`]), exactly as every caller did before
+/// STAGE32.md too. Both [`run`] and `parallel::dfs_worker` use this,
+/// the latter both for its initial seed and for every subsequent node
+/// it pops or steals after exhausting one search.
+fn start_search<'a, R: Rng>(
+    clauses: &'a [Clause],
+    lists: &'a Lists,
+    working_problem: &Problem,
+    root: SearchNode,
+    variant: SelectVarVariant,
+    rng: &mut R,
+) -> SearchState<'a> {
+    let mut state = SearchState::new(clauses, lists, root);
+    let v = match variant {
+        SelectVarVariant::Fast => select_var_fast_pick(working_problem, &state.x),
+        SelectVarVariant::Weighted => select_var(working_problem, &state.x, rng),
+    };
+    state.frames.push(Frame {
+        variable: v,
+        mark: state.trail.len(),
+        next: FrameNext::TryFalse,
+    });
+    state
 }
 
 /// Builds the root [`SearchNode`] for `problem`: a defensive round of
@@ -304,71 +591,64 @@ pub fn run<R: Rng>(
     };
 
     let start_time = Instant::now();
-    let mut stack: Vec<SearchNode> = vec![root];
-    let mut num_nodes: usize = 0;
+    let mut state = start_search(
+        &working_problem.clauses,
+        lists,
+        &working_problem,
+        root,
+        variant,
+        rng,
+    );
 
-    while let Some(node) = stack.pop() {
-        num_nodes += 1;
-        if let Some(limit) = time_limit
-            && num_nodes & TIME_CHECK_INTERVAL == 0
-            && start_time.elapsed() >= limit
-        {
+    let mut check_pause = |num_nodes_this_call: usize| -> bool {
+        // The root frame counts as node 1 (see below), so it's folded
+        // into this call's own count for the periodic-check bitmask to
+        // stay meaningful from the very first call.
+        match time_limit {
+            Some(limit) => {
+                (num_nodes_this_call + 1) & TIME_CHECK_INTERVAL == 0
+                    && start_time.elapsed() >= limit
+            }
+            None => false,
+        }
+    };
+    let (outcome, stepped) = state.step(&working_problem, variant, rng, Some(&mut check_pause));
+    let num_nodes = 1 + stepped; // the root frame itself, matching step's "one push = one node" convention
+
+    match outcome {
+        StepOutcome::Sat => {
+            if verbose >= 1 {
+                println!("SAT");
+            }
+            SolveResult {
+                satisfiable: true,
+                assignment: state.x,
+                num_nodes,
+                timed_out: false,
+            }
+        }
+        StepOutcome::Unsat => {
+            if verbose >= 1 {
+                println!("UNSAT");
+            }
+            SolveResult {
+                satisfiable: false,
+                assignment: assignment::new(problem.num_vars),
+                num_nodes,
+                timed_out: false,
+            }
+        }
+        StepOutcome::Paused => {
             if verbose >= 1 {
                 println!("UNKNOWN");
             }
-            return SolveResult {
+            SolveResult {
                 satisfiable: false,
                 assignment: assignment::new(problem.num_vars),
                 num_nodes,
                 timed_out: true,
-            };
-        }
-
-        let i = match variant {
-            SelectVarVariant::Fast => select_var_fast_pick(&working_problem, &node.assignment),
-            SelectVarVariant::Weighted => select_var(&working_problem, &node.assignment, rng),
-        };
-
-        for &v in &[Value::False, Value::True] {
-            let mut branch_assignment = node.assignment.clone();
-            branch_assignment[i] = v;
-            let mut branch_watch = node.watch.clone();
-
-            match bcp(
-                &working_problem.clauses,
-                lists,
-                &mut branch_watch,
-                &mut branch_assignment,
-                i,
-            ) {
-                Status::Contra => continue,
-                Status::Done => {
-                    if verbose >= 1 {
-                        println!("SAT");
-                    }
-                    return SolveResult {
-                        satisfiable: true,
-                        assignment: branch_assignment,
-                        num_nodes,
-                        timed_out: false,
-                    };
-                }
-                Status::Ok => stack.push(SearchNode {
-                    assignment: branch_assignment,
-                    watch: branch_watch,
-                }),
             }
         }
-    }
-
-    if verbose >= 1 {
-        println!("UNSAT");
-    }
-    SolveResult {
-        satisfiable: false,
-        assignment: assignment::new(problem.num_vars),
-        num_nodes,
-        timed_out: false,
     }
 }
 
@@ -382,12 +662,22 @@ pub fn run<R: Rng>(
 /// most of them are dismissed in O(1) because they are not currently
 /// watching that literal; only the ones that are get the deeper look
 /// a plain occurrence-list scan would have given every candidate.
+///
+/// STAGE32.md/REPORT32.md: `trail`, if `Some`, has every variable
+/// `bcp` itself assigns (by forced propagation, not counting `i`,
+/// which the caller is responsible for recording -- `bcp` only ever
+/// *reads* `i`, it never pushes it) appended in the order they were
+/// assigned. This is what lets a caller undo exactly this call's
+/// effects later (see `SearchState::undo_to`) without needing its own
+/// clone of `x` to restore from, the way every branch used to before
+/// this stage.
 fn bcp(
     clauses: &[Clause],
     lists: &Lists,
     ws: &mut WatchState,
     x: &mut Assignment,
     i: usize,
+    mut trail: Option<&mut Vec<usize>>,
 ) -> Status {
     let mut queue = vec![i];
     let mut head = 0;
@@ -436,6 +726,9 @@ fn bcp(
                 } else {
                     Value::True
                 };
+                if let Some(trail) = trail.as_deref_mut() {
+                    trail.push(forced_var);
+                }
                 queue.push(forced_var);
             }
             // Otherwise other_watch is already true: the clause is
@@ -623,7 +916,7 @@ mod tests {
         ws.watch[0] = [1, 2];
         x[1] = Value::False;
 
-        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1), Status::Ok);
+        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1, None), Status::Ok);
         assert!(ws.watch[0].contains(&3));
         assert_eq!(x[2], Value::Unassigned);
         assert_eq!(x[3], Value::Unassigned);
@@ -643,10 +936,16 @@ mod tests {
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::True;
 
-        let status = bcp(&clauses, &lists, &mut ws, &mut x, 1);
+        let mut trail = Vec::new();
+        let status = bcp(&clauses, &lists, &mut ws, &mut x, 1, Some(&mut trail));
         assert_eq!(status, Status::Done);
         assert_eq!(x[2], Value::False);
         assert_eq!(x[3], Value::True);
+        // STAGE32.md: bcp must record every variable *it* forces (2
+        // and 3 here, via the chain 1 -> 2 -> 3), but never the
+        // branch variable (1) the caller is responsible for
+        // recording itself.
+        assert!(trail.contains(&2) && trail.contains(&3) && !trail.contains(&1));
     }
 
     #[test]
@@ -668,7 +967,10 @@ mod tests {
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::True;
 
-        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1), Status::Contra);
+        assert_eq!(
+            bcp(&clauses, &lists, &mut ws, &mut x, 1, None),
+            Status::Contra
+        );
     }
 
     #[test]
@@ -683,7 +985,7 @@ mod tests {
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::False;
 
-        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1), Status::Ok);
+        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1, None), Status::Ok);
         assert_eq!(x[2], Value::Unassigned);
         assert_eq!(x[3], Value::Unassigned);
     }

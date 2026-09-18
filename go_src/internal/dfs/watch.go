@@ -15,13 +15,23 @@ import (
 // literal onto some other not-yet-false literal whenever it can,
 // which is what makes propagation cheap in the steady state.
 //
-// A watchState belongs to exactly one node of the search: each branch
-// gets its own clone (see cloneWatchState), since sibling branches
-// make different assignments and so may need different literals
-// watched. This keeps the search's existing "explicit stack of
-// self-contained nodes" structure from STAGE5.md intact, rather than
-// requiring the single shared, incrementally backtracked trail a
-// from-scratch CDCL implementation would normally use.
+// STAGE32.md/REPORT32.md: before this stage, every branch got its own
+// clone of watchState (see cloneWatchState), matching STAGE5.md's
+// "explicit stack of self-contained nodes" design rather than the
+// single shared, incrementally backtracked trail cdcl uses. That was
+// found unsafe at scale (REPORT29.md: a single clone runs 100+ MB on
+// a 17.7-million-clause file). searchState (dfs.go) now shares one
+// watchState for an entire sequential exploration, mutated in place
+// and never cloned on backtrack -- a watch remains valid as long as
+// it isn't watching a literal that's currently false, and
+// backtracking only ever turns assigned literals back into unassigned
+// ones, so every watch already in place is still legal afterward,
+// with nothing to undo (see cdcl's backtrackTo doc comment for the
+// identical argument). cloneWatchState still exists, but is now used
+// only where a genuinely independent snapshot is needed: bfsSeed's
+// initial per-worker seeds and searchState.shedFrame's occasional,
+// deliberate materialization of one snapshot for another worker to
+// steal -- both rare compared to the total number of nodes explored.
 //
 // watch[c] is always exactly 2 distinct literals, which requires
 // every clause to have at least 2 literals; callers must guarantee
@@ -101,7 +111,15 @@ func isFalse(lit cnf.Literal, assignment assign.Assignment) bool {
 // dismissed in O(1) because they are not currently watching that
 // literal; only the ones that are get the deeper look a plain
 // occurrence-list scan would have given every candidate.
-func BCP(clauses []cnf.Clause, lists *occurrence.Lists, ws *watchState, x assign.Assignment, i int) Status {
+//
+// STAGE32.md/REPORT32.md: trail, if non-nil, has every variable BCP
+// itself assigns (by forced propagation, not counting i, which the
+// caller is responsible for recording -- BCP only ever *reads* i, it
+// never appends it) appended in the order they were assigned. This is
+// what lets a caller undo exactly this call's effects later (see
+// searchState.undoTo) without needing its own clone of x to restore
+// from, the way every branch used to before this stage.
+func BCP(clauses []cnf.Clause, lists *occurrence.Lists, ws *watchState, x assign.Assignment, i int, trail *[]int) Status {
 	queue := []int{i}
 	for len(queue) > 0 {
 		v := queue[0]
@@ -153,6 +171,9 @@ func BCP(clauses []cnf.Clause, lists *occurrence.Lists, ws *watchState, x assign
 					x[forcedVar] = assign.False
 				} else {
 					x[forcedVar] = assign.True
+				}
+				if trail != nil {
+					*trail = append(*trail, forcedVar)
 				}
 				queue = append(queue, forcedVar)
 			}

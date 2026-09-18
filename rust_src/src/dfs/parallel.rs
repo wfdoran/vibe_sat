@@ -52,8 +52,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
 use super::{
-    SearchNode, SelectVarVariant, SolveResult, Status, TIME_CHECK_INTERVAL, all_assigned, bcp,
-    bootstrap, describe_params, select_var, select_var_fast_pick,
+    SearchNode, SelectVarVariant, SolveResult, Status, StepOutcome, TIME_CHECK_INTERVAL,
+    all_assigned, bcp, bootstrap, describe_params, select_var, select_var_fast_pick, start_search,
 };
 use crate::assignment::{self, Value};
 use crate::cnf::{Clause, Problem};
@@ -136,7 +136,14 @@ fn bfs_seed<R: Rng>(
             branch_assignment[i] = v;
             let mut branch_watch = node.watch.clone();
 
-            match bcp(clauses, lists, &mut branch_watch, &mut branch_assignment, i) {
+            match bcp(
+                clauses,
+                lists,
+                &mut branch_watch,
+                &mut branch_assignment,
+                i,
+                None,
+            ) {
                 Status::Contra => continue,
                 Status::Done => {
                     return BfsResult::Sat(Box::new(SolveResult {
@@ -419,99 +426,214 @@ struct DfsWorkerConfig<'a> {
     start_time: Instant,
 }
 
-/// One worker's main loop: repeatedly take a node (its own deque
-/// first, then stealing from a peer), branch it exactly like `run`'s
-/// own loop does, and push any surviving children onto its own
-/// deque -- until it either completes a satisfying assignment, the
-/// shared deadline passes, another worker signals stop (found a
-/// solution, or the search timed out), or every worker's deque is
-/// confirmed empty (see [`Terminator`]), which proves the whole
-/// problem unsatisfiable.
+/// How often (in nodes explored) a worker considers shedding a spare
+/// branch onto its own deque for another worker to steal (see
+/// `SearchState::shed_frame`), whenever that deque currently looks
+/// empty.
+///
+/// STAGE32.md/REPORT32.md: this was originally 0xff (checking often
+/// costs almost nothing -- `Worker::is_empty` is cheap, not a syscall
+/// -- and checking often was meant to keep an idle peer from waiting
+/// long for something stealable). Direct measurement on a real
+/// benchmark file (`benchmark/uuf175-753/uuf175-083.cnf`) found that
+/// value catastrophic instead: 2+ threads hit a 15-second timeout
+/// without finishing, versus 0.75 seconds for 1 thread on the same
+/// file. The cause is not a correctness bug -- every shed subtree is
+/// still explored exactly once -- but a real cost specific to this
+/// stage's design: each shed hands a subtree to a *freshly started*
+/// search, which calls `select_var`'s weighted heuristic (and its
+/// rng-driven tie-breaking) starting over from that point, rather than
+/// inheriting whatever sequence of choices the original, continuous
+/// exploration would have made. For a heuristic this sensitive to
+/// tie-break luck, restarting it often enough can turn a well-behaved
+/// search into a much larger one, and this project has no evidence
+/// (only this one measurement) about which instances are vulnerable
+/// to it or by how much.
+///
+/// A much larger interval -- shedding only after many hundreds of
+/// thousands of nodes -- keeps this from ever triggering at all on
+/// typical benchmark-sized searches (thousands to low millions of
+/// nodes total), which is exactly what eliminated the regression
+/// above, while still providing occasional, if infrequent,
+/// rebalancing on the genuinely huge searches (REPORT29.md's
+/// 17.7-million-clause files) this stage's memory fix was actually
+/// written for -- and, crucially, memory safety does not depend on
+/// this constant at all: an unshed frame costs a few bytes on this
+/// worker's own stack, not a clause-sized clone, regardless of how
+/// rarely (or never) shedding fires. See REPORT32.md for the full
+/// investigation and the case for erring this conservative rather
+/// than searching further for a safer middle ground under this
+/// stage's time budget.
+const SHED_CHECK_INTERVAL: usize = 0xfffff;
+
+/// One worker's main loop (STAGE32.md/REPORT32.md): unlike Stage 18
+/// through Stage 31, a worker no longer clones a new `SearchNode` for
+/// every branch it explores -- it runs a single local `SearchState`
+/// (exactly like `run`'s own, see `mod.rs`), mutating one shared
+/// assignment and watch state in place via an explicit,
+/// incrementally-backtracked trail, for as long as it has its own
+/// local work. Only when that local search pauses (`check_pause`
+/// below) does it consider the relatively rare, still O(clauses)-costly
+/// operations: shedding one spare branch onto its own deque so an idle
+/// peer has something to steal (`SearchState::shed_frame`), and
+/// checking the shared stop/deadline signals. Once its own local
+/// search is fully exhausted (`StepOutcome::Unsat`), it falls back to
+/// exactly the same steal-then-terminate-detect protocol every
+/// previous stage's version used (`steal_from_peers`, `Terminator`) --
+/// that part of the design needed no change, since it already only
+/// ever handles self-contained `SearchNode` snapshots, regardless of
+/// how rarely they are now created.
 fn dfs_worker(cfg: DfsWorkerConfig) -> SolveResult {
-    let mut state = WorkerState::new(cfg.term);
-    let peers = shuffled_peers(cfg.stealers.len(), cfg.self_idx, cfg.rng);
+    let DfsWorkerConfig {
+        self_idx,
+        worker,
+        stealers,
+        clauses,
+        lists,
+        working_problem,
+        variant,
+        rng,
+        term,
+        stop,
+        timed_out,
+        time_limit,
+        start_time,
+    } = cfg;
+
+    let mut worker_state = WorkerState::new(term);
+    let peers = shuffled_peers(stealers.len(), self_idx, rng);
     let mut num_nodes = 0usize;
-    let mut step = 0usize;
 
     let empty_result = |num_nodes: usize, timed_out: bool| SolveResult {
         satisfiable: false,
-        assignment: assignment::new(cfg.working_problem.num_vars),
+        assignment: assignment::new(working_problem.num_vars),
         num_nodes,
         timed_out,
     };
 
-    loop {
-        if cfg.stop.load(Ordering::SeqCst) {
-            return empty_result(num_nodes, false);
-        }
-        step += 1;
-        if let Some(limit) = cfg.time_limit
-            && step & TIME_CHECK_INTERVAL == 0
-            && cfg.start_time.elapsed() >= limit
-        {
-            cfg.timed_out.store(true, Ordering::SeqCst);
-            cfg.stop.store(true, Ordering::SeqCst);
-            return empty_result(num_nodes, true);
-        }
-
-        let node = match cfg.worker.pop() {
-            Some(node) => node,
-            None => match steal_from_peers(cfg.stealers, &peers) {
-                Some(node) => node,
-                None => {
-                    let terminated = state.mark_idle(|| {
-                        cfg.stealers
-                            .iter()
-                            .all(|s| matches!(s.steal(), Steal::Empty))
-                    });
-                    if terminated {
-                        cfg.stop.store(true, Ordering::SeqCst);
-                        return empty_result(num_nodes, false);
-                    }
-                    if cfg.stop.load(Ordering::SeqCst) {
-                        return empty_result(num_nodes, false);
-                    }
-                    thread::yield_now();
-                    continue;
-                }
-            },
-        };
-
-        state.mark_active();
-        num_nodes += 1;
-
-        let i = match cfg.variant {
-            SelectVarVariant::Fast => select_var_fast_pick(cfg.working_problem, &node.assignment),
-            SelectVarVariant::Weighted => {
-                select_var(cfg.working_problem, &node.assignment, cfg.rng)
+    // find_work tries this worker's own deque first, then peers, then
+    // (if both fail) participates in termination detection, retrying
+    // until either work turns up or global termination is confirmed.
+    // None means the whole search is over (UNSAT, or another worker
+    // already found SAT/timed out); `stop` is already set in that
+    // case.
+    //
+    // STAGE32.md/REPORT32.md: this is also used for a worker's very
+    // first node, not just for resuming after its own local search
+    // exhausts -- an earlier version treated "my own initial seed is
+    // missing from my own deque" as unreachable and returned
+    // immediately without telling the terminator, which is wrong: a
+    // peer can steal that seed before this worker's thread ever gets
+    // scheduled, since nothing orders "worker N's thread starts
+    // running" before "some other already-running worker's steal
+    // sweep reaches worker N's deque." When that race's loser silently
+    // returned, it permanently undercounted the terminator's active
+    // total by one, so the shared active count could never reach zero
+    // and global termination was never confirmed -- observed directly
+    // as one worker spinning forever on a fully torn-down,
+    // provably-empty set of deques. Routing the initial pop through
+    // the exact same path as every later exhaustion closes this:
+    // whichever worker loses that race for its own seed just finds
+    // (or fails to find) other work exactly like any other idle worker
+    // would.
+    let mut find_work = || -> Option<SearchNode> {
+        loop {
+            let found = worker.pop().or_else(|| steal_from_peers(stealers, &peers));
+            if let Some(node) = found {
+                worker_state.mark_active();
+                return Some(node);
             }
+
+            let terminated = worker_state
+                .mark_idle(|| stealers.iter().all(|s| matches!(s.steal(), Steal::Empty)));
+            if terminated {
+                stop.store(true, Ordering::SeqCst);
+                return None;
+            }
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            thread::yield_now();
+        }
+    };
+
+    let Some(node) = find_work() else {
+        return empty_result(num_nodes, false);
+    };
+    let mut search = start_search(clauses, lists, working_problem, node, variant, rng);
+    num_nodes += 1; // this node's own first frame, matching run's "root frame counts as node 1" convention
+
+    loop {
+        let total_before = num_nodes;
+        let mut check_pause = |num_nodes_this_call: usize| -> bool {
+            let total = total_before + num_nodes_this_call;
+            if stop.load(Ordering::SeqCst) {
+                return true;
+            }
+            if let Some(limit) = time_limit
+                && total & TIME_CHECK_INTERVAL == 0
+                && start_time.elapsed() >= limit
+            {
+                return true;
+            }
+            // num_nodes_this_call > 0 matters, not just
+            // total & SHED_CHECK_INTERVAL: without it, a shed-triggered
+            // pause that finds nothing to shed (shed_frame's None --
+            // e.g. before this call has committed to any frame's
+            // False branch yet) would return to step and immediately
+            // see the exact same total again, since nothing changed,
+            // pausing forever with zero progress made. Requiring real
+            // progress since this call started guarantees the next
+            // check is against a different total.
+            num_nodes_this_call > 0 && total & SHED_CHECK_INTERVAL == 0 && worker.is_empty()
         };
+        let (outcome, stepped) = search.step(working_problem, variant, rng, Some(&mut check_pause));
+        num_nodes += stepped;
 
-        for &v in &[Value::False, Value::True] {
-            let mut branch_assignment = node.assignment.clone();
-            branch_assignment[i] = v;
-            let mut branch_watch = node.watch.clone();
+        match outcome {
+            StepOutcome::Sat => {
+                return SolveResult {
+                    satisfiable: true,
+                    assignment: search.x,
+                    num_nodes,
+                    timed_out: false,
+                };
+            }
 
-            match bcp(
-                cfg.clauses,
-                cfg.lists,
-                &mut branch_watch,
-                &mut branch_assignment,
-                i,
-            ) {
-                Status::Contra => continue,
-                Status::Done => {
+            StepOutcome::Paused => {
+                if stop.load(Ordering::SeqCst) {
+                    return empty_result(num_nodes, false);
+                }
+                if let Some(limit) = time_limit
+                    && start_time.elapsed() >= limit
+                {
+                    timed_out.store(true, Ordering::SeqCst);
+                    stop.store(true, Ordering::SeqCst);
+                    return empty_result(num_nodes, true);
+                }
+                // Otherwise this was a shed checkpoint: our own deque
+                // looked empty, so offer a peer our shallowest spare
+                // branch, if we have one, then resume our own local
+                // search unchanged.
+                if let Some(sat_assignment) = search.shed_frame(|node| worker.push(node)) {
                     return SolveResult {
                         satisfiable: true,
-                        assignment: branch_assignment,
+                        assignment: sat_assignment,
                         num_nodes,
                         timed_out: false,
                     };
                 }
-                Status::Ok => cfg.worker.push(SearchNode {
-                    assignment: branch_assignment,
-                    watch: branch_watch,
-                }),
+            }
+
+            StepOutcome::Unsat => {
+                // Our own local search is fully exhausted; look for
+                // more work exactly like this worker's very first
+                // node did.
+                let Some(node) = find_work() else {
+                    return empty_result(num_nodes, false);
+                };
+                search = start_search(clauses, lists, working_problem, node, variant, rng);
+                num_nodes += 1; // this node's own first frame
             }
         }
     }
@@ -685,6 +807,7 @@ impl<'a> WorkerState<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::FrameNext;
     use super::*;
     use crate::assignment;
     use rand::SeedableRng;
@@ -856,6 +979,99 @@ mod tests {
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
         assert!(result.num_nodes > 0);
+    }
+
+    /// Directly exercises `SearchState::shed_frame`
+    /// (STAGE32.md/REPORT32.md), rather than relying on
+    /// `SHED_CHECK_INTERVAL` being reached organically -- with that
+    /// constant now deliberately very large (see its own doc comment),
+    /// no small test problem will ever trigger a shed through the
+    /// normal `check_pause` path, so this is the only test that ever
+    /// runs this code at all.
+    ///
+    /// Uses `SelectVarVariant::Fast` (deterministic, always the
+    /// lowest-numbered unassigned variable) so the exact search shape
+    /// is predictable without needing to reason about the weighted
+    /// heuristic or rng: on a single-clause, 3-variable problem, the
+    /// very first decision is variable 1. A `check_pause` that returns
+    /// true only starting from its second call lets `step` run exactly
+    /// one node (var 1 = False, which succeeds since the clause isn't
+    /// yet violated) and then pause with var 1's frame at
+    /// `FrameNext::TryTrue` (committed to False, True untried) and var
+    /// 2's freshly-pushed frame still at `FrameNext::TryFalse` (never
+    /// attempted) -- exactly the state `shed_frame` is meant to find
+    /// useful work in.
+    #[test]
+    fn test_shed_frame_materializes_untried_sibling_for_stealing() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2, 3]],
+        };
+        let lists = crate::occurrence::build(&problem);
+        let (clauses, root) = bootstrap(&problem).expect("bootstrap reported UNSAT unexpectedly");
+        let working_problem = Problem {
+            num_vars: problem.num_vars,
+            clauses: clauses.clone(),
+        };
+        let mut rng = StdRng::seed_from_u64(0); // unused by SelectVarVariant::Fast
+        let mut state = start_search(
+            &clauses,
+            &lists,
+            &working_problem,
+            root,
+            SelectVarVariant::Fast,
+            &mut rng,
+        );
+
+        let mut calls = 0;
+        let mut check_pause = |_: usize| -> bool {
+            calls += 1;
+            calls > 1
+        };
+        let (outcome, stepped) = state.step(
+            &working_problem,
+            SelectVarVariant::Fast,
+            &mut rng,
+            Some(&mut check_pause),
+        );
+        assert_eq!(outcome, StepOutcome::Paused);
+        assert_eq!(stepped, 1);
+        assert_eq!(state.frames.len(), 2);
+        assert_eq!(state.frames[0].next, FrameNext::TryTrue);
+        assert_eq!(state.frames[1].next, FrameNext::TryFalse);
+
+        let worker: Worker<SearchNode> = Worker::new_lifo();
+        let sat_assignment = state.shed_frame(|node| worker.push(node));
+        assert!(sat_assignment.is_none());
+        assert_eq!(state.frames[0].next, FrameNext::Exhausted);
+
+        let shed = worker
+            .pop()
+            .expect("expected shed_frame to have pushed a node");
+        assert_eq!(shed.assignment[1], Value::True);
+        for v in 2..=problem.num_vars {
+            assert_eq!(shed.assignment[v], Value::Unassigned);
+        }
+
+        // The shed snapshot must be independently explorable to a
+        // correct verdict, exactly like any other SearchNode.
+        let mut shed_state = start_search(
+            &clauses,
+            &lists,
+            &working_problem,
+            shed,
+            SelectVarVariant::Fast,
+            &mut rng,
+        );
+        let (shed_outcome, _) =
+            shed_state.step(&working_problem, SelectVarVariant::Fast, &mut rng, None);
+        assert_eq!(shed_outcome, StepOutcome::Sat);
+        for (ci, clause) in problem.clauses.iter().enumerate() {
+            let satisfied = clause
+                .iter()
+                .any(|&lit| assignment::literal_is_true(&shed_state.x, lit));
+            assert!(satisfied, "clause {ci} ({clause:?}) not satisfied");
+        }
     }
 
     /// Verifies STAGE18.md's "BFS solves the problem" SAT case: a

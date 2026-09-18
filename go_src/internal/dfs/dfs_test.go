@@ -2,6 +2,7 @@ package dfs
 
 import (
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 
@@ -113,7 +114,8 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 	}
 	x[1] = assign.True
 
-	status := BCP(problem.Clauses, lists, ws, x, 1)
+	var trail []int
+	status := BCP(problem.Clauses, lists, ws, x, 1, &trail)
 	if status != Done {
 		t.Fatalf("status = %v, want Done", status)
 	}
@@ -122,6 +124,12 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 	}
 	if x[3] != assign.True {
 		t.Errorf("x[3] = %v, want True", x[3])
+	}
+	// STAGE32.md: BCP must record every variable *it* forces (2 and 3
+	// here, via the chain 1 -> 2 -> 3), but never the branch variable
+	// (1) the caller is responsible for recording itself.
+	if !slices.Contains(trail, 2) || !slices.Contains(trail, 3) || slices.Contains(trail, 1) {
+		t.Errorf("trail = %v, want it to contain 2 and 3 but not 1", trail)
 	}
 }
 
@@ -152,7 +160,7 @@ func TestBCPDetectsContradiction(t *testing.T) {
 	}
 	x[1] = assign.True
 
-	if status := BCP(problem.Clauses, lists, ws, x, 1); status != Contra {
+	if status := BCP(problem.Clauses, lists, ws, x, 1, nil); status != Contra {
 		t.Errorf("status = %v, want Contra", status)
 	}
 }
@@ -175,7 +183,7 @@ func TestBCPLeavesPartialAssignmentOK(t *testing.T) {
 	}
 	x[1] = assign.False
 
-	if status := BCP(problem.Clauses, lists, ws, x, 1); status != OK {
+	if status := BCP(problem.Clauses, lists, ws, x, 1, nil); status != OK {
 		t.Errorf("status = %v, want OK", status)
 	}
 	if x[2] != assign.Unassigned || x[3] != assign.Unassigned {
@@ -203,7 +211,7 @@ func TestBCPMovesWatchAwayFromFalsifiedLiteral(t *testing.T) {
 	initialWatch := ws.watch[0]
 
 	x[1] = assign.False
-	if status := BCP(problem.Clauses, lists, ws, x, 1); status != OK {
+	if status := BCP(problem.Clauses, lists, ws, x, 1, nil); status != OK {
 		t.Fatalf("status = %v, want OK", status)
 	}
 
