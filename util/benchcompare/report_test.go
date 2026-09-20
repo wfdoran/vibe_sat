@@ -27,7 +27,7 @@ func TestMeanAndMedian(t *testing.T) {
 
 // TestSummarizeCountsAndMismatches builds a small synthetic sweep
 // covering every case summarize/languageStatsOf must handle: agreement,
-// a verdict mismatch, a verification failure, and a crash.
+// a verdict mismatch, a verification failure, an UNKNOWN, and a crash.
 func TestSummarizeCountsAndMismatches(t *testing.T) {
 	results := []fileResult{
 		{File: "agree-sat.cnf", Go: runOutcome{Verdict: verdictSAT, Solved: true}, Rust: runOutcome{Verdict: verdictSAT, Solved: true}},
@@ -54,6 +54,9 @@ func TestSummarizeCountsAndMismatches(t *testing.T) {
 	if s.Go.VerificationFails != 1 {
 		t.Errorf("Go.VerificationFails = %d, want 1", s.Go.VerificationFails)
 	}
+	if s.Go.Unknown != 1 {
+		t.Errorf("Go.Unknown = %d, want 1", s.Go.Unknown)
+	}
 	if s.Go.NoVerdict != 1 {
 		t.Errorf("Go.NoVerdict = %d, want 1", s.Go.NoVerdict)
 	}
@@ -62,6 +65,9 @@ func TestSummarizeCountsAndMismatches(t *testing.T) {
 	// with no crash/UNKNOWN/verification-failure cases of its own.
 	if s.Rust.Solved != 6 {
 		t.Errorf("Rust.Solved = %d, want 6", s.Rust.Solved)
+	}
+	if s.Rust.Unknown != 0 {
+		t.Errorf("Rust.Unknown = %d, want 0", s.Rust.Unknown)
 	}
 }
 

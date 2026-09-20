@@ -16,6 +16,14 @@ from `reports/REPORT8.md` through `reports/REPORT23.md` wrote, used
 once, and discarded. See `reports/REPORT22.md` item 18 and
 `reports/REPORT24.md` for the history and design rationale.
 
+STAGE37.md also uses this tool as CI's smoke test (see
+`.github/workflows/ci.yml`'s `smoke` job and `reports/REPORT37.md`):
+a small, curated set of `--algorithm`/`--num-threads`/
+`--no-preprocessing`/`--alg-params` combinations against a couple of
+tiny `benchmark/` files, with `--fail-on-issues` (below) so the build
+actually fails on a crash, a wrong verdict, or a cross-language
+disagreement.
+
 It lives here, under `util/`, rather than in `go_src`/`rust_src`,
 per `prompts/PROMPT.md`'s Stage 18 carve-out for permanent side tooling
 that the two solver implementations must not depend on.
@@ -58,6 +66,7 @@ verification, or a crash).
 | `--hard-timeout-secs` | Kills a single run after this long regardless of `--time-limit-secs` (default: time-limit+30s, or 120s with no time limit) -- a safety net so a hung or unexpectedly hard instance can never hang this harness itself |
 | `--json` | Write full per-file results (including complete stdout/stderr) to this path |
 | `--quiet` | Suppress the one-line-per-file progress output |
+| `--fail-on-issues` | Exit with a non-zero status if anything was flagged: a cross-language mismatch, a verification failure, or a run that never reached a definite SAT/UNSAT verdict at all (a crash, a process error, a harness hard-timeout, or a well-formed UNKNOWN). Off by default -- a typical interactive sweep of a hard benchmark set *expects* some UNKNOWNs and isn't a "failure" for that; STAGE37.md's CI smoke test (small `benchmark/` files everything should finish on) sets this so the workflow actually fails when something's wrong, not just prints a report nobody reads |
 
 Every run is sequential (Go, then Rust, one file at a time) rather than
 concurrent, deliberately: running both binaries at once on the same

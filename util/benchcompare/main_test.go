@@ -179,3 +179,51 @@ func TestSelectPathsUnknownDirectory(t *testing.T) {
 		t.Fatal("selectPaths on a missing directory succeeded, want an error")
 	}
 }
+
+// TestHasIssues covers STAGE37.md's --fail-on-issues flag directly:
+// every individual condition it must catch (a mismatch, a
+// verification failure, a crash/no-verdict, and a well-formed but
+// still unwanted UNKNOWN), each in isolation, plus the clean case.
+func TestHasIssues(t *testing.T) {
+	clean := summarize([]fileResult{
+		{File: "ok.cnf", Go: runOutcome{Verdict: verdictSAT, Solved: true}, Rust: runOutcome{Verdict: verdictSAT, Solved: true}},
+	})
+	if hasIssues(clean) {
+		t.Error("hasIssues(clean sweep) = true, want false")
+	}
+
+	mismatch := summarize([]fileResult{
+		{File: "mismatch.cnf", Go: runOutcome{Verdict: verdictSAT, Solved: true}, Rust: runOutcome{Verdict: verdictUNSAT}},
+	})
+	if !hasIssues(mismatch) {
+		t.Error("hasIssues(cross-language mismatch) = false, want true")
+	}
+
+	verifyFail := summarize([]fileResult{
+		{File: "bad.cnf", Go: runOutcome{Verdict: verdictSAT, Solved: false, SolutionErr: "clause 0 not satisfied"}, Rust: runOutcome{Verdict: verdictSAT, Solved: true}},
+	})
+	if !hasIssues(verifyFail) {
+		t.Error("hasIssues(verification failure) = false, want true")
+	}
+
+	crash := summarize([]fileResult{
+		{File: "crash.cnf", Go: runOutcome{Verdict: verdictNone, ExitErr: "exit status 2"}, Rust: runOutcome{Verdict: verdictSAT, Solved: true}},
+	})
+	if !hasIssues(crash) {
+		t.Error("hasIssues(crash/no verdict) = false, want true")
+	}
+
+	// STAGE37.md's own motivating case: a smoke test's files are small
+	// enough that an incomplete algorithm (hc/ws) giving up (UNKNOWN)
+	// is exactly as much a failure as a crash would be, even though
+	// benchcompare's other, non-fail-on-issues reporting treats UNKNOWN
+	// as an unremarkable outcome (see printFlagged, which never lists
+	// it) on the theory that it's normal for a genuinely hard instance
+	// under a time limit.
+	unknown := summarize([]fileResult{
+		{File: "gave-up.cnf", Go: runOutcome{Verdict: verdictUNKNOWN}, Rust: runOutcome{Verdict: verdictSAT, Solved: true}},
+	})
+	if !hasIssues(unknown) {
+		t.Error("hasIssues(UNKNOWN verdict) = false, want true")
+	}
+}

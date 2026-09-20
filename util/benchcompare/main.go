@@ -70,6 +70,7 @@ func runMain() error {
 		hardTimeoutFlag = flag.Int("hard-timeout-secs", 0, "kill a single run after this many seconds regardless of --time-limit-secs (0 = auto: time-limit+30s, or 120s if no time limit was given)")
 		jsonFlag        = flag.String("json", "", "write full per-file results as JSON to this path, in addition to the summary printed to stdout")
 		quietFlag       = flag.Bool("quiet", false, "suppress the one-line-per-file progress output")
+		failOnIssues    = flag.Bool("fail-on-issues", false, "STAGE37.md: exit with a non-zero status if any file was flagged (a verification failure, a crash, a cross-language mismatch, or a definite verdict either binary failed to reach at all) -- off by default, since an interactive run's whole point is often to look at borderline results, not just pass/fail; a CI smoke test should set this")
 	)
 	flag.Parse()
 
@@ -193,7 +194,29 @@ func runMain() error {
 		}
 	}
 
+	if *failOnIssues && hasIssues(s) {
+		return fmt.Errorf("one or more files were flagged; see the report above")
+	}
+
 	return nil
+}
+
+// hasIssues reports whether s contains anything --fail-on-issues
+// should treat as a failure: a cross-language mismatch, an
+// independent-verification failure, or a run that never reached a
+// definite (SAT/UNSAT) verdict at all -- whether that's an outright
+// crash/process error/harness timeout (NoVerdict; every one of these
+// cases printReport's own "flagged runs" section already surfaces to
+// a human) or a well-formed "gave up" UNKNOWN (Unknown; not otherwise
+// flagged, since it's a normal, unremarkable outcome for
+// benchcompare's usual big-sweep-of-genuinely-hard-instances use --
+// but a smoke test's whole point is files small enough that nothing
+// should ever need to give up).
+func hasIssues(s summary) bool {
+	return len(s.Mismatches) > 0 ||
+		s.Go.VerificationFails > 0 || s.Rust.VerificationFails > 0 ||
+		s.Go.NoVerdict > 0 || s.Rust.NoVerdict > 0 ||
+		s.Go.Unknown > 0 || s.Rust.Unknown > 0
 }
 
 // findProjectRoot walks upward from start looking for a directory that

@@ -103,3 +103,88 @@ jobs:
 
       - name: Test (release)
         run: cargo test --release
+
+  smoke:
+    # STAGE37.md / reports/REPORT37.md: real end-to-end confirmation
+    # that a change hasn't silently broken something the unit tests
+    # above never actually exercise -- neither job above ever invokes
+    # the built binary itself, so an argument-parsing regression or a
+    # build that compiles but panics on real input would sail through
+    # both. This runs a small, curated set of --algorithm/--num-threads/
+    # --no-preprocessing/--alg-params combinations (STAGE37.md's own
+    # coverage table: every individual value at least once, not a full
+    # cross product) against a couple of tiny benchmark/ files, through
+    # util/benchcompare -- which was already built for exactly this
+    # (both languages, real CLI invocations, and independent solution
+    # verification; see its own README.md) -- with --fail-on-issues so
+    # this job actually fails the build on a crash, a wrong verdict, or
+    # a cross-language disagreement, not just print a report nobody
+    # reads.
+    name: Smoke test (both binaries, curated CLI combinations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Waits on the two jobs above rather than running in parallel with
+    # them: if the basic build/vet/test already fails, there is no
+    # point spending more Actions minutes building both binaries again
+    # just to smoke-test something already known to be broken.
+    needs: [go, rust]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: util/benchcompare/go.mod
+          cache: false
+
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+
+      - name: Cache the cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust_src/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust_src/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build the Go binary
+        working-directory: go_src
+        run: go build -o /tmp/vibe_sat_go ./cmd/vibe_sat
+
+      - name: Build the Rust binary (release)
+        working-directory: rust_src
+        run: cargo build --release
+
+      - name: Run curated smoke-test combinations
+        working-directory: util/benchcompare
+        run: |
+          GO_BIN=/tmp/vibe_sat_go
+          RUST_BIN="$GITHUB_WORKSPACE/rust_src/target/release/vibe_sat"
+          COMMON="--go-bin=$GO_BIN --rust-bin=$RUST_BIN --fail-on-issues --sample=1 --seed=1"
+
+          # uf20-91 is SATLIB's own guaranteed-satisfiable set (20
+          # variables); uuf50-218 is its guaranteed-unsatisfiable
+          # counterpart (50 variables) -- both tiny enough that every
+          # row below is expected to finish in well under a second per
+          # binary, regardless of which --sample=1/--seed=1 file gets
+          # picked. hc/ws get a generously large restart/try count
+          # (STAGE37.md: "large number of starts to virtually guarantee
+          # success") rather than a --time-limit-secs, since a fixed
+          # count is deterministic and hardware-independent; dfs/cdcl
+          # need neither (they're complete, and these files are trivial
+          # for them either way).
+          go run . $COMMON --dirs=uf20-91   --algorithm=hc   --alg-params="5000"
+          go run . $COMMON --dirs=uf20-91   --algorithm=ws   --alg-params="1000" --num-threads=2
+          go run . $COMMON --dirs=uf20-91   --algorithm=dfs  --alg-params="0"
+          go run . $COMMON --dirs=uuf50-218 --algorithm=dfs  --alg-params="1" --no-preprocessing --num-threads=3
+          go run . $COMMON --dirs=uf20-91   --algorithm=cdcl --alg-params="0 0"
+          go run . $COMMON --dirs=uuf50-218 --algorithm=cdcl --alg-params="1 1" --no-preprocessing --num-threads=4
+          go run . $COMMON --dirs=uf20-91   --algorithm=cdcl --alg-params="2 2"
+          go run . $COMMON --dirs=uuf50-218 --algorithm=cdcl --alg-params="3 3" --num-threads=2
+          go run . $COMMON --dirs=uf20-91   --algorithm=cdcl --alg-params="2 4" --num-threads=3
+          go run . $COMMON --dirs=uuf50-218 --algorithm=cdcl --alg-params="2 5"

@@ -32,6 +32,7 @@ type languageStats struct {
 	SATCount          int
 	UNSATCount        int
 	VerificationFails int // verdict == SAT but the solution did not check out
+	Unknown           int // verdict == UNKNOWN: a recognized "gave up" answer (a real, well-formed outcome on a genuinely hard instance under a time limit -- not flagged by printFlagged, but STAGE37.md's --fail-on-issues does treat it as a failure, since a smoke test's whole files are meant to finish)
 	NoVerdict         int // verdict == NONE: either a real crash, or killed by --hard-timeout-secs (see printFlagged for which)
 	MeanSolvedSeconds float64
 	MedianSolvedSecs  float64
@@ -83,6 +84,8 @@ func languageStatsOf(results []fileResult, pick func(fileResult) runOutcome) lan
 			stats.UNSATCount++
 			stats.Solved++
 			solvedTimes = append(solvedTimes, o.ElapsedSeconds)
+		case verdictUNKNOWN:
+			stats.Unknown++
 		case verdictNone:
 			stats.NoVerdict++
 		}
@@ -127,7 +130,7 @@ func median(xs []float64) float64 {
 func printReport(w io.Writer, algorithm string, elapsedWall time.Duration, results []fileResult, s summary) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "benchcompare: --algorithm=%s, %d files, %s wall clock\n\n", algorithm, s.TotalFiles, elapsedWall.Round(time.Millisecond))
-	fmt.Fprintln(tw, "language\tsolved\t(SAT/UNSAT)\tverify fails\tno verdict\tmean (solved)\tmedian (solved)")
+	fmt.Fprintln(tw, "language\tsolved\t(SAT/UNSAT)\tverify fails\tunknown\tno verdict\tmean (solved)\tmedian (solved)")
 	printLanguageRow(tw, "go", s.Go)
 	printLanguageRow(tw, "rust", s.Rust)
 	tw.Flush()
@@ -147,8 +150,8 @@ func printReport(w io.Writer, algorithm string, elapsedWall time.Duration, resul
 
 // printLanguageRow writes one summary-table row for a language.
 func printLanguageRow(tw *tabwriter.Writer, name string, ls languageStats) {
-	fmt.Fprintf(tw, "%s\t%d\t(%d/%d)\t%d\t%d\t%.3fs\t%.3fs\n",
-		name, ls.Solved, ls.SATCount, ls.UNSATCount, ls.VerificationFails, ls.NoVerdict,
+	fmt.Fprintf(tw, "%s\t%d\t(%d/%d)\t%d\t%d\t%d\t%.3fs\t%.3fs\n",
+		name, ls.Solved, ls.SATCount, ls.UNSATCount, ls.VerificationFails, ls.Unknown, ls.NoVerdict,
 		ls.MeanSolvedSeconds, ls.MedianSolvedSecs)
 }
 

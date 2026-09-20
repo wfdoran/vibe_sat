@@ -371,6 +371,19 @@ pattern, escalating with how risky the change was:
   "obvious" performance guesses in this project turned out to be
   wrong when actually measured (see below) — profiling first is what
   caught that.
+- **A CI smoke test that actually runs the built binaries**
+  (`reports/REPORT37.md`). Everything above — unit tests, `cargo
+  test`/`go test`, even `util/benchcompare`'s own test suite — checks
+  code paths, never the compiled CLI itself; none of it would catch an
+  argument-parsing regression or a build that compiles cleanly but
+  panics the moment real input reaches it. CI now also runs a small,
+  curated set of `--algorithm`/`--num-threads`/`--no-preprocessing`/
+  `--alg-params` combinations (every individual value covered at least
+  once, not a full cross product) against a couple of tiny
+  `benchmark/` files, through `util/benchcompare --fail-on-issues` —
+  genuinely cheap (each combination finishes in single-digit
+  milliseconds), but it closes a real gap none of the rest of this
+  list does.
 
 ## Go versus Rust: what this project actually found
 
