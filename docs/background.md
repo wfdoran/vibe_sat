@@ -442,9 +442,19 @@ identical work. A few concrete things fell out of that comparison:
   MiniSat-style "blocking literal" optimization that looked obviously
   correct on paper but measured as a 25-28% *regression* on this
   project's mostly-short-clause benchmark set, and was reverted rather
-  than kept). Treat any specific number in this documentation as a
-  snapshot from this project's own particular benchmark set and
-  hardware, not a universal claim about the technique in general.
+  than kept; a high heap-allocation *share* attributed to `cdcl`'s
+  `analyze`/`addLearnedClause` — ~91% of all allocation in an 8-thread
+  run, per `reports/REPORT23.md` — that looked like an obvious GC-
+  pressure problem worth fixing, until `reports/REPORT38.md` actually
+  measured it: those two functions cost under 3% of total CPU time
+  even at 32 threads (the watched-literals scan dominates at 95%+,
+  unchanged since Stage 23), and disabling Go's garbage collector
+  entirely made the search *slower*, not faster, while more than
+  doubling peak memory — allocation share and allocation *cost* turned
+  out to be two different questions with two different answers).
+  Treat any specific number in this documentation as a snapshot from
+  this project's own particular benchmark set and hardware, not a
+  universal claim about the technique in general.
 - **Preprocessing, restarts, phase saving, and clause-database
   reduction are all fully deterministic** given the same input and
   thread count — the only genuinely non-deterministic part of
