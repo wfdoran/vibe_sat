@@ -105,7 +105,9 @@ func bfsSeed(clauses []cnf.Clause, lists *occurrence.Lists, workingProblem *cnf.
 
 	for len(queue) > 0 && len(queue) < numThreads {
 		numNodes++
-		if timeLimit != nil && numNodes&timeCheckInterval == 0 && time.Since(startTime) >= *timeLimit {
+		// STAGE35.md: checked every node, not periodically -- see
+		// dfs.go's Run/checkPause doc comment for why.
+		if timeLimit != nil && time.Since(startTime) >= *timeLimit {
 			return bfsResult{timedOut: true, numNodes: numNodes}
 		}
 
@@ -168,6 +170,10 @@ func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.
 		fmt.Println("dfs:", describeParallelParams(timeLimit, variant, numThreads))
 	}
 
+	// STAGE35.md: captured before bootstrap, not after -- see Run's
+	// identical comment (reports/REPORT35.md) for why.
+	startTime := time.Now()
+
 	if problem.NumVars == 0 {
 		satisfiable := len(problem.Clauses) == 0
 		if verbose >= 1 {
@@ -185,7 +191,6 @@ func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.
 	}
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
-	startTime := time.Now()
 	seeding := bfsSeed(clauses, lists, workingProblem, root, numThreads, variant, rng, timeLimit, startTime)
 
 	if seeding.timedOut {
@@ -365,7 +370,9 @@ func dfsWorker(cfg dfsWorkerConfig) Result {
 		if cfg.stop.Load() {
 			return true
 		}
-		if cfg.timeLimit != nil && total&timeCheckInterval == 0 && time.Since(cfg.startTime) >= *cfg.timeLimit {
+		// STAGE35.md: checked every node, not periodically -- see
+		// dfs.go's Run/checkPause doc comment for why.
+		if cfg.timeLimit != nil && time.Since(cfg.startTime) >= *cfg.timeLimit {
 			return true
 		}
 		// numNodesThisCall > 0 matters, not just total&shedCheckInterval:

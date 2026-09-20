@@ -53,13 +53,16 @@ pub(crate) const EXPORT_MAX_CLAUSE_LEN: usize = 8;
 pub(crate) const EXPORT_BUFFER_CAPACITY: usize = 256;
 
 /// Gates [`maybe_import`] to once every 32 conflicts
-/// (`num_conflicts & IMPORT_CHECK_MASK == 0`, the same cheap bitmask
-/// trick `TIME_CHECK_INTERVAL` already uses in `mod.rs`): frequent
-/// enough, relative to how often a search's own local database
-/// changes shape at all, to deserve the name "continuous" rather than
-/// "restart-batched," while keeping the O(num_peers) cost of a check
-/// bounded to a small fraction of conflicts even at large thread
-/// counts (STAGE18.md's "should scale to 128 threads, maybe more"
+/// (`num_conflicts & IMPORT_CHECK_MASK == 0`, a cheap bitmask check --
+/// unlike the wall-clock time limit fixed by STAGE35.md, checking
+/// imports less often than every conflict is a pure amortization
+/// choice with no reliability implication, so a fixed conflict-count
+/// gate is still the right tool here): frequent enough, relative to
+/// how often a search's own local database changes shape at all, to
+/// deserve the name "continuous" rather than "restart-batched," while
+/// keeping the O(num_peers) cost of a check bounded to a small
+/// fraction of conflicts even at large thread counts (STAGE18.md's
+/// "should scale to 128 threads, maybe more"
 /// applies here too).
 pub(crate) const IMPORT_CHECK_MASK: usize = 0x1f;
 

@@ -343,30 +343,84 @@ fn clause_satisfied(clause: &Clause, assignment: &Assignment) -> bool {
 /// clause has its false literals (if any) removed, leaving only
 /// unassigned literals. Returns whether a contradiction was found (a
 /// clause with no unassigned literals and none true).
+///
+/// STAGE35.md: `reduced` is allocated lazily, only once some literal
+/// in `clause` actually needs dropping (is false under `assignment`)
+/// -- not on every clause regardless. `unit_propagate` calls this once
+/// per propagation round over the *entire* remaining clause set, and
+/// by the second round onward the overwhelming majority of clauses
+/// contain nothing assigned since the previous round at all, so they
+/// need no new allocation at all: `clause` (already owned, moved out
+/// of `old` by the loop below) is still exactly the reduced form and
+/// can be kept as-is. When a literal does need dropping, `reduced` is
+/// allocated once at `clause.len()` capacity -- its maximum possible
+/// size, since every literal is either kept, drops the clause entirely
+/// (satisfied), or discarded (false), never growing past the original
+/// literal count -- and backfilled with every unassigned literal seen
+/// so far (`clause[..i]`), so no further reallocation happens for the
+/// rest of this clause either.
+///
+/// A CPU profile taken while investigating REPORT29.md's 14x
+/// time-limit overrun found the original code (a fresh,
+/// unpreallocated `Clause::new()` on literally every clause, every
+/// round, regardless of whether anything changed) responsible for the
+/// overwhelming majority of bootstrap's total time on a 6.3M-clause
+/// file -- not the search loop's time-check granularity STAGE35.md was
+/// originally scoped to fix, but the real dominant cost behind that
+/// specific 42.65-second measurement. See reports/REPORT35.md for the
+/// full before/after numbers.
 fn simplify_with_assignment(clauses: &mut Vec<Clause>, assignment: &Assignment) -> bool {
     let old = std::mem::take(clauses);
     let mut kept = Vec::with_capacity(old.len());
     for clause in old {
         let mut satisfied = false;
-        let mut reduced = Clause::new();
-        for &lit in &clause {
+        let mut reduced: Option<Clause> = None; // lazily allocated; None means "clause unchanged so far"
+        for i in 0..clause.len() {
+            let lit = clause[i];
             let value = assignment[cnf::literal_var(lit)];
             if value == Value::Unassigned {
-                reduced.push(lit);
+                if let Some(r) = reduced.as_mut() {
+                    r.push(lit);
+                }
                 continue;
             }
             if assignment::literal_is_true(assignment, lit) {
                 satisfied = true;
                 break;
             }
+            // lit is false and must be dropped: the first time this
+            // happens for this clause, allocate reduced and backfill
+            // every unassigned literal already seen (clause[..i],
+            // which excludes this false one); every literal after this
+            // point goes through the reduced.as_mut() branch above.
+            if reduced.is_none() {
+                let mut r = Vec::with_capacity(clause.len());
+                r.extend_from_slice(&clause[..i]);
+                reduced = Some(r);
+            }
         }
         if satisfied {
             continue;
         }
-        if reduced.is_empty() {
-            return true;
+        match reduced {
+            None => {
+                // No literal was ever false: clause is either empty
+                // (unsat, matching the reduced.is_empty() check below)
+                // or entirely unassigned literals, unchanged -- keep
+                // the original (already owned) clause, no allocation
+                // needed.
+                if clause.is_empty() {
+                    return true;
+                }
+                kept.push(clause);
+            }
+            Some(reduced) => {
+                if reduced.is_empty() {
+                    return true;
+                }
+                kept.push(reduced);
+            }
         }
-        kept.push(reduced);
     }
     *clauses = kept;
     false
@@ -1111,6 +1165,62 @@ mod tests {
 
         let (unsat, _) = unit_propagate(&mut clauses, &mut assignment);
         assert!(unsat);
+    }
+
+    /// STAGE35.md: verifies simplify_with_assignment's lazy-allocation
+    /// optimization directly -- a clause containing no assigned
+    /// literal at all must come back as the exact same underlying
+    /// allocation (no reallocation), while a clause with a false
+    /// literal to drop must come back as a genuinely new, correctly
+    /// reduced Vec.
+    #[test]
+    fn test_simplify_with_assignment_reuses_unchanged_clauses() {
+        let unchanged = vec![1, 2];
+        let unchanged_ptr = unchanged.as_ptr();
+        let to_reduce = vec![-3, 4, 5];
+        let mut clauses = vec![unchanged, to_reduce];
+
+        let mut assignment = assignment::new(5);
+        assignment[3] = Value::True; // makes literal -3 false, dropping it from to_reduce
+
+        let unsat = simplify_with_assignment(&mut clauses, &assignment);
+        assert!(!unsat, "expected no contradiction");
+        assert_eq!(clauses.len(), 2, "clauses = {clauses:?}, want 2 kept");
+        assert_eq!(
+            clauses[0].as_ptr(),
+            unchanged_ptr,
+            "the untouched clause should be the exact same underlying allocation, not a copy"
+        );
+        assert_eq!(clauses[1], vec![4, 5]);
+    }
+
+    /// STAGE35.md: covers the two other outcomes simplify_with_assignment
+    /// can produce for a clause: dropped entirely (some literal is
+    /// true), and unsat (every literal is false, or the clause started
+    /// out empty).
+    #[test]
+    fn test_simplify_with_assignment_drops_satisfied_and_detects_empty_clause() {
+        let mut assignment = assignment::new(2);
+        assignment[1] = Value::True;
+
+        let mut satisfied = vec![vec![1, -2]];
+        assert!(!simplify_with_assignment(&mut satisfied, &assignment));
+        assert!(
+            satisfied.is_empty(),
+            "satisfied clause should have been dropped entirely, got {satisfied:?}"
+        );
+
+        let mut all_false = vec![vec![-1]];
+        assert!(
+            simplify_with_assignment(&mut all_false, &assignment),
+            "expected unsat when every literal in a clause is false"
+        );
+
+        let mut empty: Vec<Clause> = vec![vec![]];
+        assert!(
+            simplify_with_assignment(&mut empty, &assignment),
+            "expected unsat for an originally empty clause"
+        );
     }
 
     #[test]

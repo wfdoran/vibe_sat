@@ -62,14 +62,6 @@ const (
 	SelectVarFast SelectVarVariant = 1
 )
 
-// timeCheckInterval controls how often the time limit is checked
-// against the number of search nodes explored, per STAGE5.md's
-// suggestion ("Maybe only when num_nodes & 0xfff == 0"): checking the
-// clock on every single node would add needless overhead, since nodes
-// are cheap and the clock only needs to be checked often enough to
-// respond to a time limit reasonably promptly.
-const timeCheckInterval = 0xfff
-
 // Result describes the outcome of a depth-first search.
 type Result struct {
 	Satisfiable bool              // whether a satisfying assignment was found
@@ -379,8 +371,8 @@ func allAssigned(x assign.Assignment) bool {
 //
 // If timeLimit is non-nil, the search gives up and reports an
 // inconclusive result (Satisfiable == false, TimedOut == true) once
-// it is exceeded, checked only periodically (see timeCheckInterval)
-// rather than after every node. rng supplies the randomness the
+// it is exceeded, checked after every node (STAGE35.md; see
+// checkPause below). rng supplies the randomness the
 // selected heuristic uses to break ties, and verbose controls
 // progress output: at verbose >= 1, "dfs" and the configured time
 // limit (if any) are printed before searching, and "SAT", "UNSAT", or
@@ -395,6 +387,15 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 	// is unsatisfiable by construction; guard this degenerate case
 	// explicitly so SelectVar is never asked to choose a variable that
 	// does not exist.
+	// STAGE35.md: captured before bootstrap, not after, so a slow
+	// bootstrap (unit propagation + initial watch selection; see
+	// reports/REPORT35.md) counts against timeLimit too -- previously
+	// startTime was captured only once the search loop itself began,
+	// silently giving every run a full, uncounted timeLimit's worth of
+	// bootstrap time on top of the requested budget, regardless of how
+	// long bootstrap itself took.
+	startTime := time.Now()
+
 	if problem.NumVars == 0 {
 		satisfiable := len(problem.Clauses) == 0
 		if verbose >= 1 {
@@ -426,14 +427,31 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 	// clauses and variable count, not the original Problem value.
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
-	startTime := time.Now()
 	state := startSearch(clauses, lists, workingProblem, root, variant, rng)
 
+	// STAGE35.md: the time limit is checked on every single node, not
+	// periodically (previously gated by a now-removed timeCheckInterval
+	// bitmask, "check every 4096 nodes"). That periodic check held up
+	// fine until REPORT29.md measured it failing badly on real, large
+	// instances: a --time-limit-secs=3 run blew its budget to 42.65
+	// seconds (a 14x overrun) because a single node's own cost had
+	// grown large enough (large watch/occurrence lists) that waiting
+	// for 4096 of them before the next clock check was no longer a
+	// cheap amortization, just an unbounded-in-practice delay. A fixed
+	// node-count interval can't fix this in general -- no interval is
+	// both small enough to bound overrun on expensive nodes and large
+	// enough to stay "periodic" on cheap ones, since both cases can
+	// occur in the same run.
+	//
+	// Measured directly (this stage) rather than assumed: time.Since
+	// costs ~14ns/call on this hardware, against ~2360ns for even dfs's
+	// cheapest realistic per-node cost (SelectVarFast on a large real
+	// instance, still including the per-branch watch-state work) and
+	// ~318,000ns for a typical cdcl conflict -- roughly 0.6% overhead
+	// in the cheapest case measured, and unmeasurable in the case
+	// REPORT29.md actually found broken. See reports/REPORT35.md.
 	checkPause := func(numNodesThisCall int) bool {
-		// The root frame counts as node 1 (see below), so it's folded
-		// into this call's own count for the periodic-check bitmask to
-		// stay meaningful from the very first call.
-		return timeLimit != nil && (numNodesThisCall+1)&timeCheckInterval == 0 && time.Since(startTime) >= *timeLimit
+		return timeLimit != nil && time.Since(startTime) >= *timeLimit
 	}
 	outcome, stepped := state.step(workingProblem, variant, rng, checkPause)
 	numNodes := 1 + stepped // the root frame itself, matching step's "one push = one node" convention

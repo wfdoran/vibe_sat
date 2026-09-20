@@ -64,14 +64,6 @@ pub enum SelectVarVariant {
     Fast,
 }
 
-/// How often the time limit is checked, in number of search nodes,
-/// per STAGE5.md's suggestion ("Maybe only when num_nodes & 0xfff ==
-/// 0"): checking the clock on every single node would add needless
-/// overhead, since nodes are cheap and the clock only needs to be
-/// checked often enough to respond to a time limit reasonably
-/// promptly.
-const TIME_CHECK_INTERVAL: usize = 0xfff;
-
 /// Holds, for every clause, the two literals it is currently watching
 /// (see Chaff: Moskewicz, Madigan, Zhao, Zhang & Malik, "Chaff:
 /// Engineering an Efficient SAT Solver," DAC 2001). [`bcp`] only ever
@@ -517,12 +509,12 @@ pub struct SolveResult {
 ///
 /// If `time_limit` is `Some`, the search gives up and reports an
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
-/// once it is exceeded, checked only periodically (see
-/// [`TIME_CHECK_INTERVAL`]) rather than after every node. `rng`
-/// supplies the randomness the selected heuristic uses to break ties,
-/// and `verbose` controls progress output: at verbose >= 1, "dfs" and
-/// the configured time limit (if any) are printed before searching,
-/// and "SAT", "UNSAT", or "UNKNOWN" (on timeout) are printed after.
+/// once it is exceeded, checked after every node (STAGE35.md; see
+/// `check_pause` below). `rng` supplies the randomness the selected
+/// heuristic uses to break ties, and `verbose` controls progress
+/// output: at verbose >= 1, "dfs" and the configured time limit (if
+/// any) are printed before searching, and "SAT", "UNSAT", or
+/// "UNKNOWN" (on timeout) are printed after.
 pub fn run<R: Rng>(
     problem: &Problem,
     lists: &Lists,
@@ -534,6 +526,15 @@ pub fn run<R: Rng>(
     if verbose >= 1 {
         println!("dfs: {}", describe_params(time_limit, variant));
     }
+
+    // STAGE35.md: captured before bootstrap, not after, so a slow
+    // bootstrap (unit propagation + initial watch selection; see
+    // reports/REPORT35.md) counts against time_limit too -- previously
+    // start_time was captured only once the search loop itself began,
+    // silently giving every run a full, uncounted time_limit's worth
+    // of bootstrap time on top of the requested budget, regardless of
+    // how long bootstrap itself took.
+    let start_time = Instant::now();
 
     // A problem with no variables can only contain empty clauses (no
     // literal can reference a variable beyond num_vars), each of
@@ -590,7 +591,6 @@ pub fn run<R: Rng>(
         clauses,
     };
 
-    let start_time = Instant::now();
     let mut state = start_search(
         &working_problem.clauses,
         lists,
@@ -600,15 +600,31 @@ pub fn run<R: Rng>(
         rng,
     );
 
-    let mut check_pause = |num_nodes_this_call: usize| -> bool {
-        // The root frame counts as node 1 (see below), so it's folded
-        // into this call's own count for the periodic-check bitmask to
-        // stay meaningful from the very first call.
+    // STAGE35.md: the time limit is checked on every single node, not
+    // periodically (previously gated by a now-removed
+    // TIME_CHECK_INTERVAL bitmask, "check every 4096 nodes"). That
+    // periodic check held up fine until REPORT29.md measured it
+    // failing badly on real, large instances: a --time-limit-secs=3
+    // run blew its budget to 42.65 seconds (a 14x overrun) because a
+    // single node's own cost had grown large enough (large
+    // watch/occurrence lists) that waiting for 4096 of them before the
+    // next clock check was no longer a cheap amortization, just an
+    // unbounded-in-practice delay. A fixed node-count interval can't
+    // fix this in general -- no interval is both small enough to bound
+    // overrun on expensive nodes and large enough to stay "periodic"
+    // on cheap ones, since both cases can occur in the same run.
+    //
+    // Measured directly (this stage) rather than assumed:
+    // Instant::now() costs ~14ns/call on this hardware, against
+    // ~2360ns for even dfs's cheapest realistic per-node cost
+    // (SelectVarFast on a large real instance, still including the
+    // per-branch watch-state work) and ~318,000ns for a typical cdcl
+    // conflict -- roughly 0.6% overhead in the cheapest case measured,
+    // and unmeasurable in the case REPORT29.md actually found broken.
+    // See reports/REPORT35.md.
+    let mut check_pause = |_num_nodes_this_call: usize| -> bool {
         match time_limit {
-            Some(limit) => {
-                (num_nodes_this_call + 1) & TIME_CHECK_INTERVAL == 0
-                    && start_time.elapsed() >= limit
-            }
+            Some(limit) => start_time.elapsed() >= limit,
             None => false,
         }
     };

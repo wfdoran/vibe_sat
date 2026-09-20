@@ -61,6 +61,61 @@ func TestUnitPropagateDetectsContradiction(t *testing.T) {
 	}
 }
 
+// TestSimplifyWithAssignmentReusesUnchangedClauses verifies STAGE35.md's
+// lazy-allocation optimization directly: a clause containing no
+// assigned literal at all must be kept as the exact same underlying
+// slice (no allocation), while a clause with a false literal to drop
+// must come back as a genuinely new, correctly-reduced slice.
+func TestSimplifyWithAssignmentReusesUnchangedClauses(t *testing.T) {
+	unchanged := cnf.Clause{cnf.Literal(1), cnf.Literal(2)}
+	toReduce := cnf.Clause{cnf.Literal(-3), cnf.Literal(4), cnf.Literal(5)}
+	clauses := []cnf.Clause{unchanged, toReduce}
+
+	assignment := assign.New(5)
+	assignment[3] = assign.True // makes literal -3 false, dropping it from toReduce
+
+	if unsat := simplifyWithAssignment(&clauses, assignment); unsat {
+		t.Fatal("expected no contradiction")
+	}
+	if len(clauses) != 2 {
+		t.Fatalf("clauses = %v, want 2 clauses kept", clauses)
+	}
+	if &clauses[0][0] != &unchanged[0] {
+		t.Error("the untouched clause should be the exact same underlying slice, not a copy")
+	}
+	want := cnf.Clause{cnf.Literal(4), cnf.Literal(5)}
+	if !slices.Equal(clauses[1], want) {
+		t.Errorf("reduced clause = %v, want %v", clauses[1], want)
+	}
+}
+
+// TestSimplifyWithAssignmentDropsSatisfiedAndDetectsEmptyClause covers
+// the two other outcomes simplifyWithAssignment can produce for a
+// clause: dropped entirely (some literal is true), and unsat (every
+// literal is false, or the clause started out empty).
+func TestSimplifyWithAssignmentDropsSatisfiedAndDetectsEmptyClause(t *testing.T) {
+	assignment := assign.New(2)
+	assignment[1] = assign.True
+
+	satisfied := []cnf.Clause{{cnf.Literal(1), cnf.Literal(-2)}}
+	if unsat := simplifyWithAssignment(&satisfied, assignment); unsat {
+		t.Fatal("expected no contradiction")
+	}
+	if len(satisfied) != 0 {
+		t.Errorf("satisfied clause should have been dropped entirely, got %v", satisfied)
+	}
+
+	allFalse := []cnf.Clause{{cnf.Literal(-1)}}
+	if unsat := simplifyWithAssignment(&allFalse, assignment); !unsat {
+		t.Error("expected unsat = true when every literal in a clause is false")
+	}
+
+	empty := []cnf.Clause{{}}
+	if unsat := simplifyWithAssignment(&empty, assignment); !unsat {
+		t.Error("expected unsat = true for an originally empty clause")
+	}
+}
+
 // TestEliminatePureLiterals verifies that a variable appearing with
 // only one polarity is fixed to satisfy all its clauses, which are
 // then removed. (Variable 2 appears with both polarities here, so it

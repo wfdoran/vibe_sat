@@ -144,11 +144,52 @@
 //     benchmark-driven-default convention means RestartGlucose earns
 //     that status only if a future stage's measurement shows it
 //     deserves to, not by literature reputation alone.
+//
+// STAGE36.md adds learned-clause minimization (Sörensson & Biere,
+// "Minimizing Learned Clauses," SAT 2009 -- formalizing a heuristic
+// MiniSat itself has used since 2005): once analyze derives a learned
+// clause via first-UIP resolution, minimizeClause removes any literal
+// that is redundant -- already implied by the clause's other literals
+// together with the implication graph -- via a recursive
+// (self-subsumption) check over each candidate literal's reason
+// clause, and its reasons' reasons, and so on (see literalRedundant).
+// A shorter learned clause is strictly better on every axis this
+// project already tracks: cheaper to store, cheaper to re-examine in
+// future conflicts, and it can only lower (never raise) both
+// backtrackLevel and LBD, since both are computed from the clause
+// literalRedundant leaves behind, not the one analyze first derives.
+//
+// Two concerns STAGE36.md raised directly, both addressed by design
+// rather than left as open risks:
+//
+//   - Cost: literalRedundant memoizes every variable it visits
+//     (minState, cleared incrementally via minTouched rather than a
+//     full numVars-sized reset per call) so no variable's reason
+//     clause is ever re-scanned twice within one minimizeClause call,
+//     and minimizeClause itself enforces a hard, O(n log n)-shaped
+//     work budget (minimizeWorkBudget) on the *total* number of
+//     reason-clause literals examined across the whole call -- once
+//     exceeded, every remaining literal in the clause is kept as-is
+//     (always sound; a skipped minimization opportunity, never an
+//     incorrect one) rather than letting a single pathological
+//     implication chain run unbounded. See reports/REPORT36.md for
+//     the measured cost on this project's own benchmark set.
+//   - Threading: minimizeClause reads and writes only this solver's
+//     own private state (s.clauses, s.reason, s.level, s.minState,
+//     ...) -- exactly the same state analyze itself already owns
+//     exclusively per STAGE20.md/STAGE21.md's Option B (each thread
+//     runs a wholly independent search over its own solver instance;
+//     the only cross-thread interaction is the lock-free clause
+//     export/import buffer, which minimization neither reads nor
+//     writes). There is no shared clause database for minimization to
+//     contend with, no "stop the world" pause, and no multithreaded-
+//     safety design needed beyond what analyze already has.
 package cdcl
 
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -168,12 +209,6 @@ import (
 // (permanently, at level 0) or it is a decision. -1 is never a valid
 // clause index.
 const noReason = -1
-
-// timeCheckInterval controls how often the time limit is checked
-// against the number of decisions+conflicts processed, matching
-// dfs's timeCheckInterval and for the same reason: checking the clock
-// on every single step would add needless overhead.
-const timeCheckInterval = 0xfff
 
 // bytesPerLiteral and perClauseOverheadBytes approximate the memory
 // footprint of one clause, for comparing against a user-supplied
@@ -230,14 +265,72 @@ const lrbAlpha = 0.4
 // glucoseWindowSize and glucoseK are RestartGlucose's own parameters
 // (see glucoseShouldRestart): glucoseWindowSize is how many of the
 // most recently learned clauses' LBDs make up the "recent" moving
-// average (Glucose's own published window), and glucoseK is the
-// factor the recent average is compared against the all-time global
-// average by. Both are Glucose's own originally published values.
+// average, and glucoseK is the factor the recent average is compared
+// against the all-time global average by.
+//
+// glucoseWindowSize keeps Glucose's own originally published value
+// (50): a benchmark sweep (STAGE35.md; see reports/REPORT35.md)
+// tried 30 and 100 against it and found neither a clear win --
+// 30 solved fewer instances outright, 100 was a statistical wash --
+// so there was no real evidence to move off the literature default.
+//
+// glucoseK does NOT keep Glucose's own value (0.8): the same sweep
+// found 0.6 solving as many or more instances as 0.8 while roughly
+// halving mean solve time among those solved (2.44s/2.18s vs.
+// 3.27s/2.93s Go/Rust on the report's 52-file sample), a real,
+// measured win rather than a rounding-error difference -- restarting
+// less often than Glucose's own default suggests turned out to matter
+// on this project's own benchmark mix, matching the pattern already
+// found for VSIDS-over-LRB (REPORT13.md) and polynomial-over-Luby
+// (REPORT15.md): trust this project's own measurement over a
+// technique's published default once they disagree.
 const (
 	glueClauseLBDThreshold = 2
 	glucoseWindowSize      = 50
-	glucoseK               = 0.8
+	glucoseK               = 0.6
 )
+
+// minUndef/minRemovable/minFailed are literalRedundant's three-state
+// memoization marks for s.minState (parallel to a variable, sized
+// numVars+1, like s.seen), letting a whole minimizeClause call reuse
+// one variable's redundancy verdict without re-scanning its reason
+// clause: minRemovable means this variable was already proven
+// redundant (safe to treat as such wherever else it's encountered);
+// minFailed means it was already proven NOT redundant (a decision
+// variable, or itself blocked by one, found while checking some
+// earlier literal). minUndef (the zero value) means neither yet
+// applies. s.minTouched lists every variable whose minState is
+// currently non-zero, so minimizeClause can reset exactly those
+// entries at the start of its next call rather than the whole
+// numVars-sized array.
+const (
+	minUndef byte = iota
+	minRemovable
+	minFailed
+)
+
+// minimizeWorkBudgetFactor scales minimizeClause's hard cap on total
+// reason-clause literals examined across one call (see
+// minimizeWorkBudget): STAGE36.md explicitly asked for a bound close
+// to O(n log n) in the size of the learned clause, and for an
+// absolute limit "just in case," matching the same concern that drove
+// Stage 30/31's subsumption/BVE work budgets. 20 was chosen the same
+// way those were: generous enough that it is never observed to
+// trigger on this project's own benchmark set (see
+// reports/REPORT36.md), while still being a real, finite cap rather
+// than no cap at all.
+const minimizeWorkBudgetFactor = 20
+
+// minimizeWorkBudget returns the total number of reason-clause
+// literals minimizeClause may examine (summed across every candidate
+// literal's literalRedundant call) while minimizing a clause of
+// length n, before giving up and keeping every remaining literal
+// unminimized. bits.Len approximates log2(n)+1 -- cheap, integer-only,
+// and already this project's convention for "a log-shaped bound"
+// (see e.g. lubyTerm's own iterative doubling).
+func minimizeWorkBudget(n int) int {
+	return minimizeWorkBudgetFactor * n * (bits.Len(uint(n)) + 1)
+}
 
 // lubyBaseConflicts and polynomialBaseConflicts are STAGE15.md's "b"
 // and "a": the scale constants for the Luby and polynomial restart
@@ -553,6 +646,18 @@ type solver struct {
 
 	seen []bool // scratch space for analyze, sized numVars+1
 
+	// minState/minTouched/minStack/minWork are minimizeClause's own
+	// scratch space (STAGE36.md; see minUndef/minRemovable/minFailed
+	// and minimizeClause's doc comment): minState is sized numVars+1,
+	// like seen; minTouched and minStack grow via append and are reset
+	// with a [:0] slice, like lbdScratch, rather than reallocated.
+	// minWork counts reason-clause literals examined so far in the
+	// current minimizeClause call, checked against minimizeWorkBudget.
+	minState   []byte
+	minTouched []int
+	minStack   []minimizeFrame
+	minWork    int
+
 	numDecisions int
 	numConflicts int
 }
@@ -624,6 +729,7 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		reason:                  reason,
 		trailLim:                []int{0},
 		seen:                    make([]bool, problem.NumVars+1),
+		minState:                make([]byte, problem.NumVars+1),
 	}, true
 }
 
@@ -677,8 +783,9 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 //
 // If timeLimit is non-nil, the search gives up and reports an
 // inconclusive result (Satisfiable == false, TimedOut == true) once
-// it is exceeded, checked only periodically (see timeCheckInterval).
-// rng supplies the randomness SelectVarWeighted uses to break ties,
+// it is exceeded, checked after every step (STAGE35.md; see
+// runLoop's own comment). rng supplies the randomness
+// SelectVarWeighted uses to break ties,
 // and verbose controls progress output, matching dfs.Run.
 func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
@@ -798,6 +905,14 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 // pattern. stop/export/peers are nil for Run's own single-threaded
 // call; see the solver struct's doc comment for what each does.
 func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, stop *atomic.Bool, export *exportBuffer, peers []*exportBuffer) Result {
+	// STAGE35.md: captured before newSolver's bootstrap, not after --
+	// see the package doc comment's time-check paragraph
+	// (reports/REPORT35.md) for why: a slow bootstrap (unit propagation
+	// + initial watch selection) used to count for nothing against
+	// timeLimit, silently giving every run a full, uncounted timeLimit's
+	// worth of bootstrap time on top of the requested budget.
+	startTime := time.Now()
+
 	if problem.NumVars == 0 {
 		satisfiable := len(problem.Clauses) == 0
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
@@ -814,15 +929,32 @@ func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVa
 		s.peerCursors = make([]uint64, len(peers))
 	}
 
-	startTime := time.Now()
-	step := 0
-
 	for {
-		step++
 		if s.stop != nil && s.stop.Load() {
 			return Result{NumDecisions: s.numDecisions, NumConflicts: s.numConflicts, TimedOut: true}
 		}
-		if timeLimit != nil && step&timeCheckInterval == 0 && time.Since(startTime) >= *timeLimit {
+		// STAGE35.md: the time limit is checked on every single step
+		// (decision or conflict), not periodically (previously gated by
+		// a now-removed timeCheckInterval bitmask, "check every 4096
+		// steps"). That periodic check held up fine until REPORT29.md
+		// measured it failing badly on real, large instances: a
+		// --time-limit-secs=3 run blew its budget to 42.65 seconds (a
+		// 14x overrun) because a single conflict's own cost had grown
+		// large enough (large watch/occurrence lists) that waiting for
+		// 4096 of them before the next clock check was no longer a
+		// cheap amortization, just an unbounded-in-practice delay. A
+		// fixed count-based interval can't fix this in general -- no
+		// interval is both small enough to bound overrun on expensive
+		// steps and large enough to stay "periodic" on cheap ones,
+		// since both cases can occur in the same run.
+		//
+		// Measured directly (this stage) rather than assumed: time.Since
+		// costs ~14ns/call on this hardware, against ~318,000ns for a
+		// typical conflict on this project's own hard benchmark instance
+		// -- unmeasurable overhead, and dfs.go's Run/checkPause comment
+		// found the same holds even for dfs's much cheaper nodes. See
+		// reports/REPORT35.md.
+		if timeLimit != nil && time.Since(startTime) >= *timeLimit {
 			return Result{NumDecisions: s.numDecisions, NumConflicts: s.numConflicts, TimedOut: true}
 		}
 
@@ -1280,17 +1412,28 @@ func lubyTerm(i int) int {
 // variable has contributed to since it was last assigned (see
 // backtrackTo for where that turns into an updated Q-value).
 //
-// STAGE34.md: lbd is the learned clause's Literal Block Distance --
-// the number of distinct decision levels represented among its
-// literals, computed in the same pass that already finds
-// backtrackLevel (both need exactly the same per-literal level
-// lookups, so this costs nothing extra beyond a small scratch-set
-// membership check per literal; see s.lbdScratch's doc comment for why
-// that's a plain slice, not a map). The asserting literal itself
-// (learned[0], at s.currentLevel by construction -- the first-UIP is
-// always a current-level variable) counts toward the distinct-level
-// set too, matching Audemard & Simon's own definition of LBD as being
-// over the *whole* clause, not just its non-asserting literals.
+// STAGE36.md: before backtrackLevel/lbd are computed, minimizeClause
+// gets a chance to drop any literal from the just-derived learned
+// clause that turns out to be redundant (see its own doc comment).
+// This must happen here, before learnAndBackjump's backtrackTo runs --
+// once the search backjumps, some of the now-unassigned variables'
+// reason/level bookkeeping minimizeClause depends on is gone -- and
+// before backtrackLevel/lbd are derived, since removing a literal can
+// only lower both (they are computed from whichever literals survive
+// minimization, not the ones analyze first derived).
+//
+// STAGE34.md: lbd is the learned (and now possibly minimized) clause's
+// Literal Block Distance -- the number of distinct decision levels
+// represented among its literals, computed in the same pass that
+// already finds backtrackLevel (both need exactly the same per-literal
+// level lookups, so this costs nothing extra beyond a small
+// scratch-set membership check per literal; see s.lbdScratch's doc
+// comment for why that's a plain slice, not a map). The asserting
+// literal itself (learned[0], at s.currentLevel by construction -- the
+// first-UIP is always a current-level variable) counts toward the
+// distinct-level set too, matching Audemard & Simon's own definition
+// of LBD as being over the *whole* clause, not just its non-asserting
+// literals.
 func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd int) {
 	for i := range s.seen {
 		s.seen[i] = false
@@ -1351,6 +1494,7 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd
 	}
 
 	learned = append(cnf.Clause{-p}, learned...)
+	learned = s.minimizeClause(learned)
 
 	backtrackLevel = 0
 	s.lbdScratch = append(s.lbdScratch[:0], s.currentLevel)
@@ -1364,6 +1508,126 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd
 		}
 	}
 	return learned, backtrackLevel, len(s.lbdScratch)
+}
+
+// minimizeFrame is one entry in literalRedundant's explicit,
+// iterative-DFS stack: lit is the literal whose reason clause is
+// being scanned, and idx is the next index into that clause to
+// examine. An explicit stack (rather than a recursive function call
+// per implication-graph edge) keeps a long chain of reasons from
+// costing real call-stack depth, matching MiniSat's own iterative
+// implementation of this exact algorithm.
+type minimizeFrame struct {
+	lit cnf.Literal
+	idx int
+}
+
+// minimizeClause implements STAGE36.md's learned-clause minimization
+// (Sörensson & Biere, "Minimizing Learned Clauses," SAT 2009): a
+// literal in learned is redundant -- safe to drop without weakening
+// the clause -- if it is already implied by the clause's other
+// literals together with the implication graph, checked recursively
+// via literalRedundant. The asserting literal (learned[0]) is never a
+// candidate: it is the first-UIP itself, not a resolution byproduct,
+// and a literal whose variable was a decision (no reason) can never be
+// redundant either, so literalRedundant is only ever called for the
+// rest.
+//
+// s.minWork (reset here) counts total reason-clause literals examined
+// across every literalRedundant call this pass makes; once it exceeds
+// budget (see minimizeWorkBudget), every remaining literal is kept
+// unminimized rather than examined at all -- a hard, whole-call cap,
+// not a per-literal one, so one pathological clause can never cost
+// more than a bounded amount of work regardless of how many literals
+// it has left to check.
+//
+// learned is filtered in place (kept shares learned's own backing
+// array, safe since kept's write position never runs ahead of the
+// read position), matching this project's established in-place-filter
+// convention (see e.g. preprocess.simplifyWithAssignment).
+func (s *solver) minimizeClause(learned cnf.Clause) cnf.Clause {
+	for _, v := range s.minTouched {
+		s.minState[v] = minUndef
+	}
+	s.minTouched = s.minTouched[:0]
+	s.minWork = 0
+
+	budget := minimizeWorkBudget(len(learned))
+	kept := learned[:1]
+	for _, lit := range learned[1:] {
+		if s.minWork > budget || s.reason[lit.Var()] == noReason || !s.literalRedundant(lit, budget) {
+			kept = append(kept, lit)
+		}
+	}
+	return kept
+}
+
+// literalRedundant reports whether lit -- which must have a reason
+// clause (checked by minimizeClause before calling) -- is redundant:
+// every literal that lit's reason clause depends on (other than lit
+// itself) is either a permanent level-0 fact, already accounted for
+// by analyze's own resolution (s.seen), already known redundant, or
+// itself (recursively) redundant by the same rule. If any dependency
+// is a decision variable not already covered by one of those (no
+// reason, not seen), lit is not redundant.
+//
+// Implemented iteratively (an explicit stack of minimizeFrame, not a
+// recursive function per edge) to bound native call-stack depth
+// regardless of implication-chain length, and memoized via s.minState
+// so no variable's reason clause is scanned more than once per
+// minimizeClause call: once a variable's redundancy is settled
+// (removable or failed), every later reference to it anywhere in this
+// pass is an O(1) lookup, not a re-scan. budget bounds s.minWork the
+// same way across every call within one minimizeClause pass, checked
+// here too (not just between calls) so a single literal's own
+// redundancy chain can never itself blow past it.
+func (s *solver) literalRedundant(lit cnf.Literal, budget int) bool {
+	s.minStack = append(s.minStack[:0], minimizeFrame{lit: lit, idx: 0})
+
+	for len(s.minStack) > 0 {
+		if s.minWork > budget {
+			return false
+		}
+
+		i := len(s.minStack) - 1
+		frameLit := s.minStack[i].lit
+		frameIdx := s.minStack[i].idx
+		reasonClause := s.clauses[s.reason[frameLit.Var()]]
+
+		if frameIdx >= len(reasonClause) {
+			// Finished scanning this frame's reason clause without
+			// finding anything that blocks redundancy: frameLit itself
+			// is removable.
+			v := frameLit.Var()
+			if s.minState[v] == minUndef {
+				s.minState[v] = minRemovable
+				s.minTouched = append(s.minTouched, v)
+			}
+			s.minStack = s.minStack[:i]
+			continue
+		}
+
+		l := reasonClause[frameIdx]
+		s.minStack[i].idx++
+		if l.Var() == frameLit.Var() {
+			continue // skip the literal whose reason this is
+		}
+
+		s.minWork++
+		v := l.Var()
+		if s.level[v] == 0 || s.seen[v] || s.minState[v] == minRemovable {
+			continue
+		}
+		if s.reason[v] == noReason || s.minState[v] == minFailed {
+			// v is a decision (or already known unremovable) and isn't
+			// otherwise accounted for: everything on the stack right
+			// now -- lit and every literal recursion reached to get
+			// here -- depends on v, so none of them is redundant.
+			return false
+		}
+		s.minStack = append(s.minStack, minimizeFrame{lit: l, idx: 0})
+	}
+	return true
 }
 
 // literalAssignedTrue returns the literal on variable v that

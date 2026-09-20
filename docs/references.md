@@ -43,6 +43,11 @@ flagged explicitly where that happened).
   LBD-primary sort in its clause-deletion policy (`--alg-params
   val2=5`'s restart policy is also this paper's; see "Restarts"
   below). (`reports/REPORT33.md`, `reports/REPORT34.md`)
+- Sörensson & Biere, "Minimizing Learned Clauses," SAT 2009 (formalizing
+  a heuristic MiniSat itself has used since 2005). Recursive
+  self-subsumption minimization of a freshly learned clause, removing
+  literals already implied by the clause's other literals via the
+  implication graph. (`reports/REPORT36.md`)
 - Nadel & Ryvchin, "Chronological Backtracking," SAT 2018, and Möhle &
   Biere, "Backing Backtracking?," SAT 2019. Surveyed as a possible
   refinement to `cdcl`'s backjumping; not implemented.

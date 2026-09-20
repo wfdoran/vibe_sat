@@ -50,8 +50,11 @@ const exportMaxClauseLen = 8
 const exportBufferCapacity = 256
 
 // importCheckMask gates maybeImport to once every 32 conflicts
-// (s.numConflicts & importCheckMask == 0, the same cheap bitmask
-// trick timeCheckInterval already uses): frequent enough, relative to
+// (s.numConflicts & importCheckMask == 0, a cheap bitmask check --
+// unlike the wall-clock time limit fixed by STAGE35.md, checking
+// imports less often than every conflict is a pure amortization
+// choice with no reliability implication, so a fixed conflict-count
+// gate is still the right tool here): frequent enough, relative to
 // how often a search's own local database changes shape at all, to
 // deserve the name "continuous" rather than "restart-batched," while
 // keeping the O(numPeers) cost of a check bounded to a small fraction

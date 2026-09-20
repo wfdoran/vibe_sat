@@ -145,6 +145,151 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 	}
 }
 
+// TestLiteralRedundantDirectCase verifies literalRedundant's simplest
+// case: candidate literal -2's reason clause {1,2} has one other
+// literal (var 1), and var 1 is already "seen" (accounted for by
+// analyze's own resolution, simulated here by setting s.seen[1]
+// directly) -- so -2 must be redundant.
+func TestLiteralRedundantDirectCase(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.level[1], s.level[2] = 1, 1
+	s.reason[1] = noReason
+	s.reason[2] = 0
+	s.seen[1] = true
+
+	if !s.literalRedundant(cnf.Literal(-2), 1000) {
+		t.Error("expected -2 to be redundant: its reason {1,2}'s only other literal (var 1) is already seen")
+	}
+}
+
+// TestLiteralRedundantRecursiveCase verifies the "recursive" half of
+// STAGE36.md's request: candidate -2's reason {1,2} references var 1,
+// which is NOT itself seen, but var 1's own reason {3,1} references
+// var 3, which is seen -- this only succeeds if literalRedundant
+// recurses into var 1's reason rather than stopping at the first
+// level (a plain one-hop check would wrongly report -2 as not
+// redundant here).
+func TestLiteralRedundantRecursiveCase(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 3,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1), cnf.Literal(2)},
+			{cnf.Literal(3), cnf.Literal(1)},
+		},
+	}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.level[1], s.level[2], s.level[3] = 1, 1, 1
+	s.reason[1] = 1 // clause {3,1}
+	s.reason[2] = 0 // clause {1,2}
+	s.reason[3] = noReason
+	s.seen[3] = true
+
+	if !s.literalRedundant(cnf.Literal(-2), 1000) {
+		t.Error("expected -2 to be redundant via recursion through var 1's own reason clause")
+	}
+}
+
+// TestLiteralRedundantBlockedByUncoveredDecision verifies that a
+// candidate literal is NOT redundant when its reason clause depends on
+// a decision variable (no reason) that isn't otherwise accounted for.
+func TestLiteralRedundantBlockedByUncoveredDecision(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.level[1], s.level[2] = 1, 1
+	s.reason[1] = noReason // an uncovered decision: not seen, no reason
+	s.reason[2] = 0
+
+	if s.literalRedundant(cnf.Literal(-2), 1000) {
+		t.Error("expected -2 NOT to be redundant: var 1 is an uncovered decision")
+	}
+}
+
+// TestLiteralRedundantRespectsZeroWorkBudget is STAGE36.md's own
+// explicit "absolute time limit, just in case" concern, tested
+// directly and deterministically (matching
+// TestTrySubsumeFromGenericRespectsZeroWorkBudget's precedent) rather
+// than trying to construct a clause large enough to exhaust the real
+// default budget: even a genuinely redundant literal (the exact same
+// setup as TestLiteralRedundantDirectCase) must come back as NOT
+// redundant -- the safe, conservative fallback -- once the budget is
+// exhausted, rather than panicking or ignoring the budget entirely.
+func TestLiteralRedundantRespectsZeroWorkBudget(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.level[1], s.level[2] = 1, 1
+	s.reason[1] = noReason
+	s.reason[2] = 0
+	s.seen[1] = true
+
+	if s.literalRedundant(cnf.Literal(-2), 0) {
+		t.Error("expected a zero work budget to force a conservative false, even though -2 is genuinely redundant")
+	}
+}
+
+// TestAnalyzeMinimizesLearnedClause is a full analyze()-level
+// integration test (solver state set directly rather than derived via
+// real propagate() calls, for full control over the implication
+// graph's shape): a conflict clause {-2,-3,-4} whose first-UIP
+// resolution naturally derives learned = [-2,-1,-5] (asserting literal
+// -2, from resolving var4 then var3 down to var2 as the UIP), where
+// literal -1's reason is a decision (kept) and literal -5's reason
+// {-1,5} references var 1 -- already seen, from resolving -1 into the
+// clause along the way -- so -5 must be minimized away, leaving
+// [-2,-1]. backtrackLevel and lbd must reflect the clause literalRedundant
+// leaves behind, not the one first-UIP first derives.
+func TestAnalyzeMinimizesLearnedClause(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 5,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(-2), cnf.Literal(-3), cnf.Literal(-4)}, // 0: conflict
+			{cnf.Literal(-1), cnf.Literal(4)},                   // 1: reason for var 4
+			{cnf.Literal(-5), cnf.Literal(3)},                   // 2: reason for var 3
+			{cnf.Literal(-1), cnf.Literal(5)},                   // 3: reason for var 5
+		},
+	}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s.currentLevel = 2
+	s.level[1], s.level[5] = 1, 1
+	s.level[2], s.level[3], s.level[4] = 2, 2, 2
+	s.reason[1] = noReason
+	s.reason[5] = 3
+	s.reason[3] = 2
+	s.reason[4] = 1
+	for _, v := range []int{1, 2, 3, 4, 5} {
+		s.x[v] = assign.True
+	}
+	s.trail = []int{1, 5, 2, 3, 4}
+
+	learned, backtrackLevel, lbd := s.analyze(0)
+
+	want := cnf.Clause{cnf.Literal(-2), cnf.Literal(-1)}
+	if fmt.Sprint(learned) != fmt.Sprint(want) {
+		t.Errorf("learned = %v, want %v (literal -5 should have been minimized away)", learned, want)
+	}
+	if backtrackLevel != 1 {
+		t.Errorf("backtrackLevel = %d, want 1 (level of the only surviving non-asserting literal, -1)", backtrackLevel)
+	}
+	if lbd != 2 {
+		t.Errorf("lbd = %d, want 2 (currentLevel 2 and level 1, after minimization)", lbd)
+	}
+}
+
 // TestAddLearnedClauseSkipsWatchesForUnitClause verifies that a
 // length-1 learned clause is not added to the watched clause
 // database (it has nowhere to shed a second watch onto, and needs

@@ -182,8 +182,14 @@ learned clauses' "Literal Block Distance" (LBD — the number of
 distinct decision levels among a clause's literals, also used by
 clause-database management below) alongside the all-time average
 since the search began, and restarts whenever the recent average
-looks close to or worse than the global one. Not (yet) this project's
-default; see `reports/REPORT34.md` for why.
+looks close to `K` times the global one. `K` was tuned by benchmark
+sweep (`reports/REPORT35.md`) to 0.6, not Glucose's own published 0.8
+— restarting less often than the literature default turned out to
+matter on this project's own benchmark mix (roughly halving mean
+solve time at an equal or better solved count), the same pattern
+already found for VSIDS-over-LRB and polynomial-over-Luby above. Not
+(yet) this project's default regardless; see `reports/REPORT34.md`/
+`reports/REPORT35.md` for why.
 
 ## Clause-database management
 
@@ -198,6 +204,42 @@ terminology) is never deleted regardless of activity, and among the
 rest, the least "compact" (highest-LBD) clauses go first. Before
 `reports/REPORT34.md` this was pure activity decay, with no notion of
 LBD anywhere in `cdcl`.
+
+## Learned-clause minimization
+
+Once `analyze` derives a learned clause via first-UIP resolution
+(above), a literal in it can still be redundant: already implied by
+the clause's other literals together with the implication graph, and
+so safe to drop without weakening the clause at all. `cdcl` checks
+every non-asserting literal for this recursively — a literal's own
+reason clause might not obviously qualify, but if *its* dependencies
+trace back to something already accounted for, it qualifies too — the
+same self-subsumption minimization MiniSat has used since 2005
+(Sörensson & Biere, "Minimizing Learned Clauses," SAT 2009, formalized
+it). A shorter learned clause is strictly better on every axis
+`cdcl` already tracks: cheaper to store and re-examine later, and it
+can only lower (never raise) both the backtrack level and the LBD.
+
+Measured on this project's own hard benchmark instance
+(`benchmark/uuf250-1065/uuf250-01.cnf`, single-threaded, VSIDS):
+minimization cut both the number of conflicts needed (111,453 →
+95,494) and wall-clock time (35.4s → 18.0s) — a real, substantial win,
+not just a "cheaper clauses, same search" effect. See
+`reports/REPORT36.md` for the full numbers, including a broader
+benchmark sweep where it raised solved-instance counts noticeably
+within a fixed time budget.
+
+The recursive check is bounded, not open-ended: it memoizes every
+variable it visits within one minimization pass (so no reason clause
+is ever re-scanned twice for the same learned clause) and enforces a
+hard, `O(n log n)`-shaped work budget on the total number of
+reason-clause literals examined — once exceeded, whatever's left of
+the clause is kept as-is rather than risking unbounded work on a
+pathological implication chain. And because minimization only ever
+reads and writes one thread's own private search state (exactly like
+`analyze` itself), it needs no special handling in multi-threaded
+`cdcl` runs — no shared state to contend with, no pause for other
+threads to wait out.
 
 ## Non-chronological backtracking
 

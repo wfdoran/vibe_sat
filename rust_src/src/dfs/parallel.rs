@@ -52,8 +52,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
 use super::{
-    SearchNode, SelectVarVariant, SolveResult, Status, StepOutcome, TIME_CHECK_INTERVAL,
-    all_assigned, bcp, bootstrap, describe_params, select_var, select_var_fast_pick, start_search,
+    SearchNode, SelectVarVariant, SolveResult, Status, StepOutcome, all_assigned, bcp, bootstrap,
+    describe_params, select_var, select_var_fast_pick, start_search,
 };
 use crate::assignment::{self, Value};
 use crate::cnf::{Clause, Problem};
@@ -117,8 +117,9 @@ fn bfs_seed<R: Rng>(
 
     while !queue.is_empty() && queue.len() < num_threads {
         num_nodes += 1;
+        // STAGE35.md: checked every node, not periodically -- see
+        // mod.rs's run/check_pause doc comment for why.
         if let Some(limit) = time_limit
-            && num_nodes & TIME_CHECK_INTERVAL == 0
             && start_time.elapsed() >= limit
         {
             return BfsResult::TimedOut(num_nodes);
@@ -207,6 +208,10 @@ pub fn run_parallel<R: Rng>(
         );
     }
 
+    // STAGE35.md: captured before bootstrap, not after -- see
+    // super::run's identical comment (reports/REPORT35.md) for why.
+    let start_time = Instant::now();
+
     if problem.num_vars == 0 {
         let satisfiable = problem.clauses.is_empty();
         if verbose >= 1 {
@@ -236,7 +241,6 @@ pub fn run_parallel<R: Rng>(
         clauses,
     };
 
-    let start_time = Instant::now();
     let seeding = bfs_seed(
         &working_problem.clauses,
         lists,
@@ -570,8 +574,9 @@ fn dfs_worker(cfg: DfsWorkerConfig) -> SolveResult {
             if stop.load(Ordering::SeqCst) {
                 return true;
             }
+            // STAGE35.md: checked every node, not periodically -- see
+            // mod.rs's run/check_pause doc comment for why.
             if let Some(limit) = time_limit
-                && total & TIME_CHECK_INTERVAL == 0
                 && start_time.elapsed() >= limit
             {
                 return true;

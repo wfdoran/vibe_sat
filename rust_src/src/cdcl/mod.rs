@@ -397,16 +397,30 @@ fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) ->
 /// STAGE34.md: `GLUE_CLAUSE_LBD_THRESHOLD` is the LBD at or below
 /// which a learned clause is a "glue clause" -- protected from
 /// [`reduce_clause_database`] regardless of activity. `GLUCOSE_K` and
-/// `GLUCOSE_WINDOW_SIZE` are Glucose's own restart policy's
-/// parameters (see [`glucose_should_restart`]): the literature's usual
-/// choices (a 50-conflict recent window, K=0.8) are used unchanged
-/// here, matching this project's general preference for literature
-/// defaults absent its own benchmark evidence favoring something else
-/// (see `LUBY_BASE_CONFLICTS`'s neighboring precedent for why that
-/// preference sometimes gets overridden, and why it isn't here yet).
+/// `GLUCOSE_WINDOW_SIZE` are Glucose's own restart policy's parameters
+/// (see [`glucose_should_restart`]).
+///
+/// `GLUCOSE_WINDOW_SIZE` keeps Glucose's own originally published
+/// value (50): a benchmark sweep (STAGE35.md; see
+/// `reports/REPORT35.md`) tried 30 and 100 against it and found
+/// neither a clear win -- 30 solved fewer instances outright, 100 was
+/// a statistical wash -- so there was no real evidence to move off the
+/// literature default.
+///
+/// `GLUCOSE_K` does NOT keep Glucose's own value (0.8): the same
+/// sweep found 0.6 solving as many or more instances as 0.8 while
+/// roughly halving mean solve time among those solved (2.44s/2.18s
+/// vs. 3.27s/2.93s Go/Rust on the report's 52-file sample), a real,
+/// measured win rather than a rounding-error difference -- restarting
+/// less often than Glucose's own default suggests turned out to
+/// matter on this project's own benchmark mix, matching the pattern
+/// already found for VSIDS-over-LRB (`reports/REPORT13.md`) and
+/// polynomial-over-Luby (`reports/REPORT15.md`): trust this project's
+/// own measurement over a technique's published default once they
+/// disagree.
 const GLUE_CLAUSE_LBD_THRESHOLD: usize = 2;
 const GLUCOSE_WINDOW_SIZE: usize = 50;
-const GLUCOSE_K: f64 = 0.8;
+const GLUCOSE_K: f64 = 0.6;
 
 /// STAGE34.md's Glucose-restart bookkeeping: a fixed-size ring buffer
 /// of the last `GLUCOSE_WINDOW_SIZE` learned clauses' LBDs (kept as an
@@ -639,12 +653,6 @@ fn select_var_by_activity(scores: &[f64], x: &Assignment, num_vars: usize) -> us
     }
     best.expect("at least one unassigned variable must exist when select_var_by_activity is called")
 }
-
-/// How often the time limit is checked, in number of decisions plus
-/// conflicts processed, matching [`crate::dfs::TIME_CHECK_INTERVAL`]
-/// and for the same reason: checking the clock on every single step
-/// would add needless overhead.
-const TIME_CHECK_INTERVAL: usize = 0xfff;
 
 /// `BYTES_PER_LITERAL` and `PER_CLAUSE_OVERHEAD_BYTES` approximate the
 /// memory footprint of one clause, for comparing against a
@@ -966,9 +974,9 @@ pub fn run_parallel<R: Rng>(
 ///
 /// If `time_limit` is `Some`, the search gives up and reports an
 /// inconclusive result (`satisfiable == false`, `timed_out == true`)
-/// once it is exceeded, checked only periodically (see
-/// [`TIME_CHECK_INTERVAL`]). `rng` supplies the randomness
-/// `SelectVarVariant::Weighted` uses to break ties.
+/// once it is exceeded, checked after every step (STAGE35.md; see
+/// this function's own time-check comment below). `rng` supplies the
+/// randomness `SelectVarVariant::Weighted` uses to break ties.
 #[allow(clippy::too_many_arguments)]
 fn run_loop<R: Rng>(
     problem: &Problem,
@@ -981,6 +989,14 @@ fn run_loop<R: Rng>(
     export: Option<&ExportBuffer>,
     peers: &[&ExportBuffer],
 ) -> SolveResult {
+    // STAGE35.md: captured before bootstrap's, not after -- see the
+    // module doc comment's time-check paragraph (reports/REPORT35.md)
+    // for why: a slow bootstrap (unit propagation + initial watch
+    // selection) used to count for nothing against time_limit, silently
+    // giving every run a full, uncounted time_limit's worth of
+    // bootstrap time on top of the requested budget.
+    let start_time = Instant::now();
+
     // A problem with no variables can only contain empty clauses (no
     // literal can reference a variable beyond num_vars), each of
     // which is unsatisfiable by construction; guard this degenerate
@@ -1042,6 +1058,18 @@ fn run_loop<R: Rng>(
     let mut lbd_scratch: Vec<usize> = Vec::new();
     let mut glucose = GlucoseState::new();
 
+    // STAGE36.md: minimize_clause's own scratch space (see
+    // literal_redundant and MIN_UNDEF/MIN_REMOVABLE/MIN_FAILED).
+    // min_state is sized num_vars+1, like seen; min_touched and
+    // min_stack grow via push and are reset with .clear(), like
+    // lbd_scratch, rather than reallocated. min_work counts
+    // reason-clause literals examined so far in the current
+    // minimize_clause call, checked against its work budget.
+    let mut min_state = vec![MIN_UNDEF; problem.num_vars + 1];
+    let mut min_touched: Vec<usize> = Vec::new();
+    let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+    let mut min_work: usize = 0;
+
     // STAGE13.md's VSIDS/LRB bookkeeping; always allocated (cheap,
     // O(num_vars)) but only ever read or written when variant
     // actually calls for it.
@@ -1062,11 +1090,7 @@ fn run_loop<R: Rng>(
     let mut conflicts_since_restart = 0usize;
     let mut restart_count = 0usize;
 
-    let start_time = Instant::now();
-    let mut step: usize = 0;
-
     loop {
-        step += 1;
         if let Some(s) = stop
             && s.load(Ordering::SeqCst)
         {
@@ -1078,8 +1102,27 @@ fn run_loop<R: Rng>(
                 timed_out: true,
             };
         }
+        // STAGE35.md: the time limit is checked on every single step
+        // (decision or conflict), not periodically (previously gated by
+        // a now-removed TIME_CHECK_INTERVAL bitmask, "check every 4096
+        // steps"). That periodic check held up fine until REPORT29.md
+        // measured it failing badly on real, large instances: a
+        // --time-limit-secs=3 run blew its budget to 42.65 seconds (a
+        // 14x overrun) because a single conflict's own cost had grown
+        // large enough (large watch/occurrence lists) that waiting for
+        // 4096 of them before the next clock check was no longer a
+        // cheap amortization, just an unbounded-in-practice delay. A
+        // fixed count-based interval can't fix this in general -- no
+        // interval is both small enough to bound overrun on expensive
+        // steps and large enough to stay "periodic" on cheap ones,
+        // since both cases can occur in the same run.
+        //
+        // Measured directly (this stage) rather than assumed:
+        // Instant::now() costs ~14ns/call on this hardware, against
+        // ~318,000ns for a typical conflict on this project's own hard
+        // benchmark instance -- unmeasurable overhead. See
+        // reports/REPORT35.md.
         if let Some(limit) = time_limit
-            && step & TIME_CHECK_INTERVAL == 0
             && start_time.elapsed() >= limit
         {
             return SolveResult {
@@ -1134,6 +1177,10 @@ fn run_loop<R: Rng>(
                 &mut vsids,
                 &mut lrb,
                 &mut lbd_scratch,
+                &mut min_state,
+                &mut min_touched,
+                &mut min_stack,
+                &mut min_work,
             );
             record_lbd(&mut glucose, lbd);
             backtrack_to(
@@ -1476,6 +1523,207 @@ fn propagate(
     None
 }
 
+/// `MIN_UNDEF`/`MIN_REMOVABLE`/`MIN_FAILED` are [`literal_redundant`]'s
+/// three-state memoization marks for `min_state` (parallel to a
+/// variable, sized `num_vars+1`, like `seen`), letting one
+/// `minimize_clause` call reuse one variable's redundancy verdict
+/// without re-scanning its reason clause: `MIN_REMOVABLE` means this
+/// variable was already proven redundant (safe to treat as such
+/// wherever else it's encountered); `MIN_FAILED` means it was already
+/// proven NOT redundant (a decision variable, or itself blocked by
+/// one, found while checking some earlier literal). `MIN_UNDEF` (the
+/// default) means neither yet applies. `min_touched` lists every
+/// variable whose `min_state` is currently non-default, so
+/// `minimize_clause` can reset exactly those entries at the start of
+/// its next call rather than the whole `num_vars`-sized array.
+const MIN_UNDEF: u8 = 0;
+const MIN_REMOVABLE: u8 = 1;
+const MIN_FAILED: u8 = 2;
+
+/// `MINIMIZE_WORK_BUDGET_FACTOR` scales [`minimize_clause`]'s hard cap
+/// on total reason-clause literals examined across one call (see
+/// [`minimize_work_budget`]): STAGE36.md explicitly asked for a bound
+/// close to O(n log n) in the size of the learned clause, and for an
+/// absolute limit "just in case," matching the same concern that drove
+/// Stage 30/31's subsumption/BVE work budgets. 20 was chosen the same
+/// way those were: generous enough that it is never observed to
+/// trigger on this project's own benchmark set (see
+/// `reports/REPORT36.md`), while still being a real, finite cap rather
+/// than no cap at all.
+const MINIMIZE_WORK_BUDGET_FACTOR: usize = 20;
+
+/// Returns the total number of reason-clause literals
+/// [`minimize_clause`] may examine (summed across every candidate
+/// literal's [`literal_redundant`] call) while minimizing a clause of
+/// length `n`, before giving up and keeping every remaining literal
+/// unminimized. `n.leading_zeros()` gives a cheap, integer-only
+/// approximation of `log2(n)+1` -- already this project's convention
+/// for "a log-shaped bound" (see e.g. `luby_term`'s own iterative
+/// doubling).
+fn minimize_work_budget(n: usize) -> usize {
+    let bits_len = (usize::BITS - n.leading_zeros()) as usize;
+    MINIMIZE_WORK_BUDGET_FACTOR * n * (bits_len + 1)
+}
+
+/// One entry in [`literal_redundant`]'s explicit, iterative-DFS stack:
+/// `lit` is the literal whose reason clause is being scanned, and
+/// `idx` is the next index into that clause to examine. An explicit
+/// stack (rather than a recursive function call per implication-graph
+/// edge) keeps a long chain of reasons from costing real call-stack
+/// depth, matching MiniSat's own iterative implementation of this
+/// exact algorithm.
+struct MinimizeFrame {
+    lit: Literal,
+    idx: usize,
+}
+
+/// Implements STAGE36.md's learned-clause minimization (Sörensson &
+/// Biere, "Minimizing Learned Clauses," SAT 2009 -- formalizing a
+/// heuristic MiniSat itself has used since 2005): a literal in
+/// `learned` is redundant -- safe to drop without weakening the
+/// clause -- if it is already implied by the clause's other literals
+/// together with the implication graph, checked recursively via
+/// [`literal_redundant`]. The asserting literal (`learned[0]`) is
+/// never a candidate: it is the first-UIP itself, not a resolution
+/// byproduct, and a literal whose variable was a decision (no reason)
+/// can never be redundant either, so `literal_redundant` is only ever
+/// called for the rest.
+///
+/// `min_work` (reset here) counts total reason-clause literals
+/// examined across every `literal_redundant` call this pass makes;
+/// once it exceeds `budget` (see [`minimize_work_budget`]), every
+/// remaining literal is kept unminimized rather than examined at all
+/// -- a hard, whole-call cap, not a per-literal one, so one
+/// pathological clause can never cost more than a bounded amount of
+/// work regardless of how many literals it has left to check.
+#[allow(clippy::too_many_arguments)]
+fn minimize_clause(
+    learned: Clause,
+    clauses: &[Clause],
+    level: &[usize],
+    reason: &[Option<usize>],
+    seen: &[bool],
+    min_state: &mut [u8],
+    min_touched: &mut Vec<usize>,
+    min_stack: &mut Vec<MinimizeFrame>,
+    min_work: &mut usize,
+) -> Clause {
+    for &v in min_touched.iter() {
+        min_state[v] = MIN_UNDEF;
+    }
+    min_touched.clear();
+    *min_work = 0;
+
+    let budget = minimize_work_budget(learned.len());
+    let mut kept = Vec::with_capacity(learned.len());
+    kept.push(learned[0]);
+    for &lit in &learned[1..] {
+        let v = cnf::literal_var(lit);
+        if *min_work > budget
+            || reason[v].is_none()
+            || !literal_redundant(
+                lit,
+                clauses,
+                level,
+                reason,
+                seen,
+                min_state,
+                min_touched,
+                min_stack,
+                min_work,
+                budget,
+            )
+        {
+            kept.push(lit);
+        }
+    }
+    kept
+}
+
+/// Reports whether `lit` -- which must have a reason clause (checked
+/// by [`minimize_clause`] before calling) -- is redundant: every
+/// literal that `lit`'s reason clause depends on (other than `lit`
+/// itself) is either a permanent level-0 fact, already accounted for
+/// by `analyze`'s own resolution (`seen`), already known redundant, or
+/// itself (recursively) redundant by the same rule. If any dependency
+/// is a decision variable not already covered by one of those (no
+/// reason, not seen), `lit` is not redundant.
+///
+/// Implemented iteratively (an explicit stack of [`MinimizeFrame`],
+/// not a recursive function per edge) to bound native call-stack depth
+/// regardless of implication-chain length, and memoized via
+/// `min_state` so no variable's reason clause is scanned more than
+/// once per `minimize_clause` call: once a variable's redundancy is
+/// settled (removable or failed), every later reference to it anywhere
+/// in this pass is an O(1) lookup, not a re-scan. `budget` bounds
+/// `*min_work` the same way across every call within one
+/// `minimize_clause` pass, checked here too (not just between calls)
+/// so a single literal's own redundancy chain can never itself blow
+/// past it.
+#[allow(clippy::too_many_arguments)]
+fn literal_redundant(
+    lit: Literal,
+    clauses: &[Clause],
+    level: &[usize],
+    reason: &[Option<usize>],
+    seen: &[bool],
+    min_state: &mut [u8],
+    min_touched: &mut Vec<usize>,
+    min_stack: &mut Vec<MinimizeFrame>,
+    min_work: &mut usize,
+    budget: usize,
+) -> bool {
+    min_stack.clear();
+    min_stack.push(MinimizeFrame { lit, idx: 0 });
+
+    while !min_stack.is_empty() {
+        if *min_work > budget {
+            return false;
+        }
+
+        let i = min_stack.len() - 1;
+        let frame_lit = min_stack[i].lit;
+        let frame_idx = min_stack[i].idx;
+        let reason_idx = reason[cnf::literal_var(frame_lit)]
+            .expect("literal_redundant only ever pushes literals with a reason");
+        let reason_clause = &clauses[reason_idx];
+
+        if frame_idx >= reason_clause.len() {
+            // Finished scanning this frame's reason clause without
+            // finding anything that blocks redundancy: frame_lit
+            // itself is removable.
+            let v = cnf::literal_var(frame_lit);
+            if min_state[v] == MIN_UNDEF {
+                min_state[v] = MIN_REMOVABLE;
+                min_touched.push(v);
+            }
+            min_stack.truncate(i);
+            continue;
+        }
+
+        let l = reason_clause[frame_idx];
+        min_stack[i].idx += 1;
+        if cnf::literal_var(l) == cnf::literal_var(frame_lit) {
+            continue; // skip the literal whose reason this is
+        }
+
+        *min_work += 1;
+        let v = cnf::literal_var(l);
+        if level[v] == 0 || seen[v] || min_state[v] == MIN_REMOVABLE {
+            continue;
+        }
+        if reason[v].is_none() || min_state[v] == MIN_FAILED {
+            // v is a decision (or already known unremovable) and isn't
+            // otherwise accounted for: everything on the stack right
+            // now -- lit and every literal recursion reached to get
+            // here -- depends on v, so none of them is redundant.
+            return false;
+        }
+        min_stack.push(MinimizeFrame { lit: l, idx: 0 });
+    }
+    true
+}
+
 /// Walks the implication graph backward from the clause at index
 /// `confl` (which [`propagate`] just found to be fully false) to
 /// derive a learned clause via first-UIP resolution: repeatedly
@@ -1514,13 +1762,24 @@ fn propagate(
 /// assigned (see [`backtrack_to`] for where that turns into an
 /// updated Q-value).
 ///
-/// STAGE34.md's third return value is the learned clause's LBD --
-/// the number of distinct decision levels represented among its
-/// literals (see the module doc comment) -- computed in this same
-/// pass via `lbd_scratch` (reused scratch space, like `seen`, cleared
-/// at the start of this function rather than reallocated) since every
-/// literal that will end up in the learned clause is already being
-/// visited here regardless.
+/// STAGE36.md: before `backtrack_level`/the LBD are computed,
+/// [`minimize_clause`] gets a chance to drop any literal from the
+/// just-derived learned clause that turns out to be redundant (see its
+/// own doc comment). This must happen here, before the conflict-
+/// handling code's own `backtrack_to` runs -- once the search
+/// backjumps, some of the now-unassigned variables' reason/level
+/// bookkeeping `minimize_clause` depends on is gone -- and before
+/// `backtrack_level`/the LBD are derived, since removing a literal can
+/// only lower both (they are computed from whichever literals survive
+/// minimization, not the ones `analyze` first derives).
+///
+/// STAGE34.md's third return value is the learned (and now possibly
+/// minimized) clause's LBD -- the number of distinct decision levels
+/// represented among its literals (see the module doc comment) --
+/// computed in this same pass via `lbd_scratch` (reused scratch space,
+/// like `seen`, cleared at the start of this function rather than
+/// reallocated) since every literal that will end up in the learned
+/// clause is already being visited here regardless.
 #[allow(clippy::too_many_arguments)]
 fn analyze(
     confl: usize,
@@ -1538,6 +1797,10 @@ fn analyze(
     vsids: &mut VsidsState,
     lrb: &mut LrbState,
     lbd_scratch: &mut Vec<usize>,
+    min_state: &mut [u8],
+    min_touched: &mut Vec<usize>,
+    min_stack: &mut Vec<MinimizeFrame>,
+    min_work: &mut usize,
 ) -> (Clause, usize, usize) {
     for s in seen.iter_mut() {
         *s = false;
@@ -1597,6 +1860,17 @@ fn analyze(
     let asserting = -p.expect("p is always set by the time the loop above breaks");
     let mut result = vec![asserting];
     result.extend(learned);
+    let result = minimize_clause(
+        result,
+        clauses,
+        level,
+        reason,
+        seen,
+        min_state,
+        min_touched,
+        min_stack,
+        min_work,
+    );
 
     let mut backtrack_level = 0;
     lbd_scratch.clear();
@@ -2123,6 +2397,10 @@ mod tests {
 
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut lbd_scratch: Vec<usize> = Vec::new();
+        let mut min_state = vec![MIN_UNDEF; 5];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
 
         let (learned, backtrack_level, lbd) = analyze(
             confl,
@@ -2140,6 +2418,10 @@ mod tests {
             &mut vsids,
             &mut lrb,
             &mut lbd_scratch,
+            &mut min_state,
+            &mut min_touched,
+            &mut min_stack,
+            &mut min_work,
         );
 
         assert_eq!(backtrack_level, 0);
@@ -2149,6 +2431,272 @@ mod tests {
         // also 1) coincides with them, so the distinct-level count is
         // exactly 1.
         assert_eq!(lbd, 1);
+    }
+
+    /// Verifies literal_redundant's simplest case: candidate literal
+    /// -2's reason clause {1,2} has one other literal (var 1), and
+    /// var 1 is already "seen" (accounted for by analyze's own
+    /// resolution, simulated here by setting seen[1] directly) -- so
+    /// -2 must be redundant.
+    #[test]
+    fn test_literal_redundant_direct_case() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (working_problem, _watch, _x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 3];
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let mut seen = vec![false; 3];
+        let mut min_state = vec![MIN_UNDEF; 3];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
+
+        level[1] = 1;
+        level[2] = 1;
+        reason[1] = None;
+        reason[2] = Some(0);
+        seen[1] = true;
+
+        assert!(
+            literal_redundant(
+                -2,
+                &working_problem.clauses,
+                &level,
+                &reason,
+                &seen,
+                &mut min_state,
+                &mut min_touched,
+                &mut min_stack,
+                &mut min_work,
+                1000,
+            ),
+            "expected -2 to be redundant: its reason {{1,2}}'s only other literal (var 1) is already seen"
+        );
+    }
+
+    /// Verifies the "recursive" half of STAGE36.md's request: candidate
+    /// -2's reason {1,2} references var 1, which is NOT itself seen,
+    /// but var 1's own reason {3,1} references var 3, which is seen --
+    /// this only succeeds if literal_redundant recurses into var 1's
+    /// reason rather than stopping at the first level.
+    #[test]
+    fn test_literal_redundant_recursive_case() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![3, 1]],
+        };
+        let (working_problem, _watch, _x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 4];
+        let mut reason: Vec<Option<usize>> = vec![None; 4];
+        let mut seen = vec![false; 4];
+        let mut min_state = vec![MIN_UNDEF; 4];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
+
+        level[1] = 1;
+        level[2] = 1;
+        level[3] = 1;
+        reason[1] = Some(1); // clause {3,1}
+        reason[2] = Some(0); // clause {1,2}
+        reason[3] = None;
+        seen[3] = true;
+
+        assert!(
+            literal_redundant(
+                -2,
+                &working_problem.clauses,
+                &level,
+                &reason,
+                &seen,
+                &mut min_state,
+                &mut min_touched,
+                &mut min_stack,
+                &mut min_work,
+                1000,
+            ),
+            "expected -2 to be redundant via recursion through var 1's own reason clause"
+        );
+    }
+
+    /// Verifies that a candidate literal is NOT redundant when its
+    /// reason clause depends on a decision variable (no reason) that
+    /// isn't otherwise accounted for.
+    #[test]
+    fn test_literal_redundant_blocked_by_uncovered_decision() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (working_problem, _watch, _x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 3];
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let seen = vec![false; 3];
+        let mut min_state = vec![MIN_UNDEF; 3];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
+
+        level[1] = 1;
+        level[2] = 1;
+        reason[1] = None; // an uncovered decision: not seen, no reason
+        reason[2] = Some(0);
+
+        assert!(
+            !literal_redundant(
+                -2,
+                &working_problem.clauses,
+                &level,
+                &reason,
+                &seen,
+                &mut min_state,
+                &mut min_touched,
+                &mut min_stack,
+                &mut min_work,
+                1000,
+            ),
+            "expected -2 NOT to be redundant: var 1 is an uncovered decision"
+        );
+    }
+
+    /// STAGE36.md's own explicit "absolute time limit, just in case"
+    /// concern, tested directly and deterministically: even a
+    /// genuinely redundant literal (the exact same setup as
+    /// test_literal_redundant_direct_case) must come back as NOT
+    /// redundant -- the safe, conservative fallback -- once the budget
+    /// is exhausted, rather than panicking or ignoring the budget
+    /// entirely.
+    #[test]
+    fn test_literal_redundant_respects_zero_work_budget() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (working_problem, _watch, _x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 3];
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let mut seen = vec![false; 3];
+        let mut min_state = vec![MIN_UNDEF; 3];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
+
+        level[1] = 1;
+        level[2] = 1;
+        reason[1] = None;
+        reason[2] = Some(0);
+        seen[1] = true;
+
+        assert!(
+            !literal_redundant(
+                -2,
+                &working_problem.clauses,
+                &level,
+                &reason,
+                &seen,
+                &mut min_state,
+                &mut min_touched,
+                &mut min_stack,
+                &mut min_work,
+                0,
+            ),
+            "expected a zero work budget to force a conservative false, even though -2 is genuinely redundant"
+        );
+    }
+
+    /// A full analyze()-level integration test (solver state set
+    /// directly rather than derived via real propagate() calls, for
+    /// full control over the implication graph's shape): a conflict
+    /// clause {-2,-3,-4} whose first-UIP resolution naturally derives
+    /// learned = [-2,-1,-5] (asserting literal -2, from resolving var
+    /// 4 then var 3 down to var 2 as the UIP), where literal -1's
+    /// reason is a decision (kept) and literal -5's reason {-1,5}
+    /// references var 1 -- already seen, from resolving -1 into the
+    /// clause along the way -- so -5 must be minimized away, leaving
+    /// [-2,-1]. backtrack_level and lbd must reflect the clause
+    /// literal_redundant leaves behind, not the one first-UIP first
+    /// derives.
+    #[test]
+    fn test_analyze_minimizes_learned_clause() {
+        let problem = Problem {
+            num_vars: 5,
+            clauses: vec![
+                vec![-2, -3, -4], // 0: conflict
+                vec![-1, 4],      // 1: reason for var 4
+                vec![-5, 3],      // 2: reason for var 3
+                vec![-1, 5],      // 3: reason for var 5
+            ],
+        };
+        let (working_problem, _watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let current_level = 2;
+        let mut level = vec![0usize; 6];
+        let mut reason: Vec<Option<usize>> = vec![None; 6];
+        let mut seen = vec![false; 6];
+        let mut vsids = VsidsState::new(5);
+        let mut lrb = LrbState::new(5);
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut lbd_scratch: Vec<usize> = Vec::new();
+        let mut min_state = vec![MIN_UNDEF; 6];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
+
+        level[1] = 1;
+        level[5] = 1;
+        level[2] = 2;
+        level[3] = 2;
+        level[4] = 2;
+        reason[1] = None;
+        reason[5] = Some(3);
+        reason[3] = Some(2);
+        reason[4] = Some(1);
+        for xv in x.iter_mut().skip(1) {
+            *xv = Value::True;
+        }
+        let trail = vec![1, 5, 2, 3, 4];
+
+        let (learned, backtrack_level, lbd) = analyze(
+            0,
+            &working_problem.clauses,
+            &trail,
+            &level,
+            &reason,
+            &x,
+            &mut seen,
+            current_level,
+            &mut clause_activity,
+            1.0,
+            working_problem.clauses.len(),
+            SelectVarVariant::Weighted,
+            &mut vsids,
+            &mut lrb,
+            &mut lbd_scratch,
+            &mut min_state,
+            &mut min_touched,
+            &mut min_stack,
+            &mut min_work,
+        );
+
+        assert_eq!(
+            learned,
+            vec![-2, -1],
+            "literal -5 should have been minimized away"
+        );
+        assert_eq!(
+            backtrack_level, 1,
+            "want the level of the only surviving non-asserting literal, -1"
+        );
+        assert_eq!(
+            lbd, 2,
+            "want current_level 2 and level 1, after minimization"
+        );
     }
 
     #[test]
@@ -2876,6 +3424,10 @@ mod tests {
 
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut lbd_scratch: Vec<usize> = Vec::new();
+        let mut min_state = vec![MIN_UNDEF; 5];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
         analyze(
             confl,
             &working_problem.clauses,
@@ -2892,6 +3444,10 @@ mod tests {
             &mut vsids,
             &mut lrb,
             &mut lbd_scratch,
+            &mut min_state,
+            &mut min_touched,
+            &mut min_stack,
+            &mut min_work,
         );
 
         assert!(

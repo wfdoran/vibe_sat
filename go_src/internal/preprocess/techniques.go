@@ -14,23 +14,73 @@ import (
 // every other clause has its false literals (if any) removed,
 // leaving only unassigned literals. It reports whether a contradiction
 // was found (a clause with no unassigned literals and none true).
+//
+// STAGE35.md: reduced is allocated lazily, only once some literal in
+// clause actually needs dropping (is false under assignment) -- not
+// on every clause regardless. UnitPropagate calls this once per
+// propagation round over the *entire* remaining clause set, and by
+// the second round onward the overwhelming majority of clauses
+// contain nothing assigned since the previous round at all, so they
+// need no new slice at all: clause itself is still exactly the
+// reduced form, and can be kept as-is (kept = append(kept, clause),
+// a cheap slice-header copy, not a literal copy). When a literal
+// does need dropping, reduced is allocated once at len(clause)
+// capacity -- its maximum possible size, since every literal is
+// either kept, drops the clause entirely (satisfied), or discarded
+// (false), never growing past the original literal count -- and
+// backfilled with every unassigned literal seen so far
+// (clause[:i]), so no further reallocation happens for the rest of
+// this clause either.
+//
+// A CPU profile taken while investigating REPORT29.md's 14x
+// time-limit overrun found the original code (a fresh, unpreallocated
+// `var reduced cnf.Clause` on literally every clause, every round,
+// regardless of whether anything changed) responsible for the
+// overwhelming majority of newSolver's total time on a 6.3M-clause
+// file via runtime.growslice/mallocgc -- not the search loop's
+// time-check granularity STAGE35.md was originally scoped to fix, but
+// the real dominant cost behind that specific 42.65-second
+// measurement. See reports/REPORT35.md for the full before/after
+// numbers.
 func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment) (unsat bool) {
 	kept := (*clauses)[:0]
 	for _, clause := range *clauses {
+		var reduced cnf.Clause // lazily allocated; nil means "clause unchanged so far"
 		satisfied := false
-		var reduced cnf.Clause
-		for _, lit := range clause {
+		for i, lit := range clause {
 			value := assignment[lit.Var()]
 			if value == assign.Unassigned {
-				reduced = append(reduced, lit)
+				if reduced != nil {
+					reduced = append(reduced, lit)
+				}
 				continue
 			}
 			if assignment.LiteralIsTrue(lit) {
 				satisfied = true
 				break
 			}
+			// lit is false and must be dropped: the first time this
+			// happens for this clause, allocate reduced and backfill
+			// every unassigned literal already seen (clause[:i], which
+			// excludes this false one); every literal after this point
+			// goes through the reduced != nil branch above.
+			if reduced == nil {
+				reduced = make(cnf.Clause, 0, len(clause))
+				reduced = append(reduced, clause[:i]...)
+			}
 		}
 		if satisfied {
+			continue
+		}
+		if reduced == nil {
+			// No literal was ever false: clause is either empty (unsat,
+			// matching the len(reduced) == 0 check below) or entirely
+			// unassigned literals, unchanged -- keep the original slice,
+			// no allocation needed.
+			if len(clause) == 0 {
+				return true
+			}
+			kept = append(kept, clause)
 			continue
 		}
 		if len(reduced) == 0 {
