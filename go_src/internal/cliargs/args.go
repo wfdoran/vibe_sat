@@ -20,13 +20,31 @@ import (
 // Args holds the parsed command line arguments for vibe_sat.
 type Args struct {
 	Help            bool    // --help / -h : print usage information and exit
-	InputFile       string  // --input / -i : path to the DIMACS CNF file to read (required)
+	InputFile       string  // --input / -i : path to the DIMACS CNF file to read (required, unless ResetInternalParams)
 	Verbose         int     // --verbose / -v : verbosity level, default 0
-	Algorithm       string  // --algorithm / -a : solving algorithm to use (required; "hc", "ws", "dfs", or "cdcl")
+	Algorithm       string  // --algorithm / -a : solving algorithm to use (required, unless ResetInternalParams; "hc", "ws", "dfs", or "cdcl")
 	OutputFile      string  // --output / -o : where to write the solution, if any ("" means unset)
 	TimeLimitSecs   *int    // --time-limit-secs / -t : optional search time limit, in seconds
 	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
 	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
+
+	// InternalParamsPath is --internal-params/-c (STAGE39.md): an
+	// explicit path to a JSON file of runtime-configurable internal
+	// tuning constants (see internal/params), overriding the implicit
+	// lookup for params.DefaultConfigFileName in the current directory.
+	// "" means unset -- not "use no config file at all," since the
+	// implicit lookup still applies; see params.Resolve.
+	InternalParamsPath string
+
+	// ResetInternalParams is --reset-internal-params/-q (STAGE39.md):
+	// write the resolved config path (InternalParamsPath if given,
+	// else params.DefaultConfigFileName) with every internal
+	// parameter's built-in default value, then exit without reading
+	// --input or running anything -- a starting point for a user who
+	// wants to override a handful of values without needing to know
+	// every field name and its current default ahead of time. Like
+	// Help, this makes --input/--algorithm optional (see validate).
+	ResetInternalParams bool
 
 	// NumThreads is --num-threads/-z (STAGE17.md): the number of
 	// concurrent worker threads to use, currently honored only by
@@ -75,6 +93,8 @@ var flagSpecs = []flagSpec{
 	{long: "alg-params", short: "p", maxValues: 3},
 	{long: "no-preprocessing", short: "x", maxValues: 0},
 	{long: "num-threads", short: "z", maxValues: 1},
+	{long: "internal-params", short: "c", maxValues: 1},
+	{long: "reset-internal-params", short: "q", maxValues: 0},
 }
 
 // findSpec returns the flagSpec whose long or short spelling matches
@@ -338,6 +358,12 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		}
 		args.NumThreads = n
 	}
+	if values, ok := rawValues["internal-params"]; ok {
+		args.InternalParamsPath = values[0]
+	}
+	if _, ok := rawValues["reset-internal-params"]; ok {
+		args.ResetInternalParams = true
+	}
 
 	return args, nil
 }
@@ -347,6 +373,15 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 // combination of algorithm-specific arguments makes sense for the
 // chosen algorithm.
 func validate(args *Args, rawValues map[string][]string) error {
+	// --reset-internal-params writes a config file and exits without
+	// ever reading --input or running an algorithm (see main.go), so
+	// neither is required in that case -- the same carve-out --help
+	// already gets, just via validate rather than Parse's early-return
+	// loop, since --reset-internal-params still needs the normal
+	// tokenizer to run first (to pick up --internal-params, if given).
+	if args.ResetInternalParams {
+		return nil
+	}
 	if args.InputFile == "" {
 		return fmt.Errorf("missing required argument: --input=<filename> (or -i <filename>)")
 	}

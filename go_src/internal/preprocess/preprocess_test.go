@@ -8,6 +8,7 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
+	"vibe_sat/internal/params"
 )
 
 // clauseSatisfiedByFull is a small test helper checking a full
@@ -172,7 +173,7 @@ func TestEliminateSubsumedClausesRemovesSuperset(t *testing.T) {
 		{cnf.Literal(1), cnf.Literal(2)},
 		{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)},
 	}
-	numRemoved := eliminateSubsumedClauses(&clauses, 3)
+	numRemoved := eliminateSubsumedClauses(&clauses, 3, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 	if numRemoved != 1 {
 		t.Fatalf("numRemoved = %d, want 1", numRemoved)
 	}
@@ -188,7 +189,7 @@ func TestEliminateSubsumedClausesRemovesDuplicates(t *testing.T) {
 		{cnf.Literal(1), cnf.Literal(-2)},
 		{cnf.Literal(1), cnf.Literal(-2)},
 	}
-	numRemoved := eliminateSubsumedClauses(&clauses, 2)
+	numRemoved := eliminateSubsumedClauses(&clauses, 2, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 	if numRemoved != 1 {
 		t.Fatalf("numRemoved = %d, want 1", numRemoved)
 	}
@@ -226,11 +227,11 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialChained(t *testing.T) 
 	}
 
 	want := cloneClauses(original)
-	wantRemoved := eliminateSubsumedClauses(&want, 4)
+	wantRemoved := eliminateSubsumedClauses(&want, 4, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 
 	for _, numThreads := range []int{1, 2, 3, 4, 8} {
 		got := cloneClauses(original)
-		gotRemoved := eliminateSubsumedClausesParallel(&got, 4, numThreads)
+		gotRemoved := eliminateSubsumedClausesParallel(&got, 4, numThreads, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 		if gotRemoved != wantRemoved {
 			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
 		}
@@ -257,14 +258,14 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialOnRealFile(t *testing.
 	}
 
 	want := cloneClauses(problem.Clauses)
-	wantRemoved := eliminateSubsumedClauses(&want, problem.NumVars)
+	wantRemoved := eliminateSubsumedClauses(&want, problem.NumVars, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 	if wantRemoved == 0 {
 		t.Fatal("test file has nothing to subsume; pick a different file")
 	}
 
 	for _, numThreads := range []int{1, 2, 3, 4, 8, 16} {
 		got := cloneClauses(problem.Clauses)
-		gotRemoved := eliminateSubsumedClausesParallel(&got, problem.NumVars, numThreads)
+		gotRemoved := eliminateSubsumedClausesParallel(&got, problem.NumVars, numThreads, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 		if gotRemoved != wantRemoved {
 			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
 		}
@@ -368,7 +369,7 @@ func TestEliminateSubsumedClausesMatchesBruteForceOnRandomFormulas(t *testing.T)
 		want := bruteForceSubsumedClauses(original)
 
 		got := cloneClauses(original)
-		eliminateSubsumedClauses(&got, numVars)
+		eliminateSubsumedClauses(&got, numVars, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
 
 		if len(got) != len(want) {
 			t.Fatalf("trial %d (numVars=%d, clauses=%v): got %d surviving clauses %v, want %d %v",
@@ -396,9 +397,9 @@ func TestRunProducesIdenticalResultsRegardlessOfNumThreads(t *testing.T) {
 		t.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
 	}
 
-	want := Run(problem, 0, 1)
+	want := Run(problem, 0, 1, params.Default().Preprocess)
 	for _, numThreads := range []int{1, 2, 4, 8, 16} {
-		got := Run(problem, 0, numThreads)
+		got := Run(problem, 0, numThreads, params.Default().Preprocess)
 		if got.Stats != want.Stats {
 			t.Errorf("numThreads=%d: Stats = %+v, want %+v", numThreads, got.Stats, want.Stats)
 		}
@@ -720,7 +721,7 @@ func TestRunSimplifiesAndPreservesSatisfiability(t *testing.T) {
 		},
 	}
 
-	result := Run(problem, 0, 1)
+	result := Run(problem, 0, 1, params.Default().Preprocess)
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}
@@ -749,7 +750,7 @@ func TestRunDetectsUnsat(t *testing.T) {
 			{cnf.Literal(-1)},
 		},
 	}
-	result := Run(problem, 0, 1)
+	result := Run(problem, 0, 1, params.Default().Preprocess)
 	if !result.Unsat {
 		t.Fatalf("expected Unsat = true")
 	}
@@ -779,7 +780,7 @@ func TestRunWithVariableEliminationReconstructsCorrectly(t *testing.T) {
 		},
 	}
 
-	result := Run(problem, 0, 1)
+	result := Run(problem, 0, 1, params.Default().Preprocess)
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}
@@ -831,7 +832,7 @@ func TestRunLeavesUnconstrainedVariablesArbitrarilyFalse(t *testing.T) {
 			{cnf.Literal(1)},
 		},
 	}
-	result := Run(problem, 0, 1)
+	result := Run(problem, 0, 1, params.Default().Preprocess)
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}

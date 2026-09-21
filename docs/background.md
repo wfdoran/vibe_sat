@@ -462,3 +462,10 @@ identical work. A few concrete things fell out of that comparison:
   result once `--num-threads` is more than 1 (the verdict itself is
   always deterministic; only wall-clock timing and which worker
   reports it are not).
+- **The restart-schedule bases, decay rates, LBD threshold, and
+  work-budget factors described above are runtime-configurable**, not
+  hardcoded, via `--internal-params`/`.vibe_sat.json` — see
+  [internal-parameters.md](internal-parameters.md) for the full list
+  and every value's default. The numbers quoted throughout this page
+  (e.g. `glucoseK`'s `0.6`, LRB's `alpha = 0.4`) are these parameters'
+  built-in defaults, not fixed constants.

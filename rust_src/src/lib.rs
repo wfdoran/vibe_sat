@@ -20,5 +20,6 @@ pub mod cnf;
 pub mod dfs;
 pub mod hillclimb;
 pub mod occurrence;
+pub mod params;
 pub mod preprocess;
 pub mod solution;

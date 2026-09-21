@@ -9,6 +9,7 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
+	"vibe_sat/internal/params"
 )
 
 // TestChooseWatchSkipsFalseLiterals verifies that chooseWatch never
@@ -53,7 +54,7 @@ func TestNewSolverDetectsBootstrapContradiction(t *testing.T) {
 		NumVars: 1,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
 	}
-	_, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	_, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if ok {
 		t.Errorf("newSolver() reported ok = true for a contradictory unit-clause pair")
 	}
@@ -67,7 +68,7 @@ func TestPropagatePropagatesUnitChain(t *testing.T) {
 		NumVars: 3,
 		Clauses: []cnf.Clause{{cnf.Literal(-1), cnf.Literal(-2)}, {cnf.Literal(2), cnf.Literal(3)}},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -116,7 +117,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-4)},
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -152,7 +153,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 // directly) -- so -2 must be redundant.
 func TestLiteralRedundantDirectCase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -181,7 +182,7 @@ func TestLiteralRedundantRecursiveCase(t *testing.T) {
 			{cnf.Literal(3), cnf.Literal(1)},
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -201,7 +202,7 @@ func TestLiteralRedundantRecursiveCase(t *testing.T) {
 // a decision variable (no reason) that isn't otherwise accounted for.
 func TestLiteralRedundantBlockedByUncoveredDecision(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -225,7 +226,7 @@ func TestLiteralRedundantBlockedByUncoveredDecision(t *testing.T) {
 // exhausted, rather than panicking or ignoring the budget entirely.
 func TestLiteralRedundantRespectsZeroWorkBudget(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -260,7 +261,7 @@ func TestAnalyzeMinimizesLearnedClause(t *testing.T) {
 			{cnf.Literal(-1), cnf.Literal(5)},                   // 3: reason for var 5
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -296,7 +297,7 @@ func TestAnalyzeMinimizesLearnedClause(t *testing.T) {
 // none: it becomes a permanent level-0 fact instead).
 func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -317,7 +318,7 @@ func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 // highest decision level.
 func TestAddLearnedClauseWatchesAssertingLiteralAndHighestLevel(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -345,7 +346,7 @@ func TestRunFindsSatisfiableFormula(t *testing.T) {
 
 	for _, variant := range []SelectVarVariant{SelectVarWeighted, SelectVarFast, SelectVarVsids, SelectVarLrb} {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, variant, RestartNone, nil, rng, 0)
+		result := Run(problem, nil, variant, RestartNone, nil, rng, 0, params.Default().CDCL)
 		if !result.Satisfiable {
 			t.Fatalf("variant %v: Run() reported unsatisfiable for a satisfiable formula", variant)
 		}
@@ -385,7 +386,7 @@ func TestRunProvesUnsatisfiableSmallFormula(t *testing.T) {
 
 	for _, variant := range []SelectVarVariant{SelectVarWeighted, SelectVarFast, SelectVarVsids, SelectVarLrb} {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, variant, RestartNone, nil, rng, 0)
+		result := Run(problem, nil, variant, RestartNone, nil, rng, 0, params.Default().CDCL)
 		if result.Satisfiable {
 			t.Fatalf("variant %v: Run() reported satisfiable for an unsatisfiable formula", variant)
 		}
@@ -404,7 +405,7 @@ func TestRunProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(4, 3)
 	rng := rand.New(rand.NewPCG(9, 9))
 
-	result := Run(problem, nil, SelectVarFast, RestartNone, nil, rng, 0)
+	result := Run(problem, nil, SelectVarFast, RestartNone, nil, rng, 0, params.Default().CDCL)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -419,13 +420,13 @@ func TestRunHandlesZeroVariableProblems(t *testing.T) {
 	rng := rand.New(rand.NewPCG(6, 6))
 
 	satProblem := &cnf.Problem{NumVars: 0, Clauses: nil}
-	result := Run(satProblem, nil, SelectVarWeighted, RestartNone, nil, rng, 0)
+	result := Run(satProblem, nil, SelectVarWeighted, RestartNone, nil, rng, 0, params.Default().CDCL)
 	if !result.Satisfiable {
 		t.Error("Run() reported unsatisfiable for an empty problem")
 	}
 
 	unsatProblem := &cnf.Problem{NumVars: 0, Clauses: []cnf.Clause{{}}}
-	result = Run(unsatProblem, nil, SelectVarWeighted, RestartNone, nil, rng, 0)
+	result = Run(unsatProblem, nil, SelectVarWeighted, RestartNone, nil, rng, 0, params.Default().CDCL)
 	if result.Satisfiable {
 		t.Error("Run() reported satisfiable for a problem with an empty clause")
 	}
@@ -439,7 +440,7 @@ func TestRunRespectsTimeLimit(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
 	tiny := time.Duration(1)
 
-	result := Run(problem, &tiny, SelectVarWeighted, RestartNone, nil, rng, 0)
+	result := Run(problem, &tiny, SelectVarWeighted, RestartNone, nil, rng, 0, params.Default().CDCL)
 
 	if !result.TimedOut {
 		t.Error("expected TimedOut = true with a 1ns time limit")
@@ -467,7 +468,7 @@ func TestClauseByteCost(t *testing.T) {
 // lists) must still be correct afterward.
 func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 5, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -518,7 +519,7 @@ func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 // panic) when every learned clause is currently locked.
 func TestReduceClauseDatabaseNoOpWhenNothingEligible(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -547,7 +548,7 @@ func TestRunWithTinyMemoryLimitStillProvesUnsatisfiablePigeonhole(t *testing.T) 
 	rng := rand.New(rand.NewPCG(9, 9))
 	limit := int64(200)
 
-	result := Run(problem, nil, SelectVarFast, RestartNone, &limit, rng, 0)
+	result := Run(problem, nil, SelectVarFast, RestartNone, &limit, rng, 0, params.Default().CDCL)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -568,7 +569,7 @@ func TestRunWithMemoryLimitStillFindsSatisfiableFormula(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	limit := int64(64)
 
-	result := Run(problem, nil, SelectVarWeighted, RestartNone, &limit, rng, 0)
+	result := Run(problem, nil, SelectVarWeighted, RestartNone, &limit, rng, 0, params.Default().CDCL)
 
 	if !result.Satisfiable {
 		t.Fatal("Run() reported unsatisfiable for a satisfiable formula")
@@ -593,7 +594,7 @@ func TestRunWithMemoryLimitStillFindsSatisfiableFormula(t *testing.T) {
 // the rest, ignoring ties in favor of whichever it finds first.
 func TestSelectVarByActivityPicksHighestScoringUnassignedVariable(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarVsids, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarVsids, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -621,7 +622,7 @@ func TestAnalyzeBumpsVsidsActivity(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-4)},
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarVsids, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarVsids, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -651,7 +652,7 @@ func TestAnalyzeBumpsVsidsActivity(t *testing.T) {
 // out), and its participated counter should reset to 0.
 func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -665,7 +666,7 @@ func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 
 	s.backtrackTo(0)
 
-	wantQ := lrbAlpha * (3.0 / 5.0)
+	wantQ := s.params.LRBAlpha * (3.0 / 5.0)
 	if math.Abs(s.lrbQ[1]-wantQ) > 1e-9 {
 		t.Errorf("lrbQ[1] = %v, want %v", s.lrbQ[1], wantQ)
 	}
@@ -680,7 +681,7 @@ func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 // variant.
 func TestBacktrackToSavesPhase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -704,7 +705,7 @@ func TestBacktrackToSavesPhase(t *testing.T) {
 // variable) must assign it True, not False.
 func TestDecideGuessesSavedPhase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarFast, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarFast, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -723,7 +724,7 @@ func TestDecideGuessesSavedPhase(t *testing.T) {
 // decision order.
 func TestDecideDefaultsToFalseWithNoSavedPhase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarFast, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarFast, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -745,7 +746,7 @@ func TestRunWithVsidsProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(4, 3)
 	rng := rand.New(rand.NewPCG(9, 9))
 
-	result := Run(problem, nil, SelectVarVsids, RestartNone, nil, rng, 0)
+	result := Run(problem, nil, SelectVarVsids, RestartNone, nil, rng, 0, params.Default().CDCL)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -759,7 +760,7 @@ func TestRunWithLrbProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(4, 3)
 	rng := rand.New(rand.NewPCG(9, 9))
 
-	result := Run(problem, nil, SelectVarLrb, RestartNone, nil, rng, 0)
+	result := Run(problem, nil, SelectVarLrb, RestartNone, nil, rng, 0, params.Default().CDCL)
 
 	if result.Satisfiable {
 		t.Fatal("Run() reported satisfiable for the 4-pigeon/3-hole problem")
@@ -799,10 +800,10 @@ func TestLubyTermContinuesPastFirstBlock(t *testing.T) {
 // TestRestartThresholdLuby verifies restartThreshold's Luby case
 // directly: threshold(k) = lubyBaseConflicts * lubyTerm(k).
 func TestRestartThresholdLuby(t *testing.T) {
-	s := &solver{restartStrategy: RestartLuby}
+	s := &solver{restartStrategy: RestartLuby, params: params.Default().CDCL}
 	for k, term := range []int{1, 1, 2, 1, 1, 2, 4} {
 		s.restartCount = k
-		want := lubyBaseConflicts * term
+		want := s.params.LubyBaseConflicts * term
 		if got := s.restartThreshold(); got != want {
 			t.Errorf("restartThreshold() at restartCount=%d = %d, want %d", k, got, want)
 		}
@@ -815,10 +816,10 @@ func TestRestartThresholdLuby(t *testing.T) {
 // restart index k (0-indexed) is polynomialBaseConflicts * (k+1)^2,
 // matching a*1^2, a*2^2, a*3^2, ....
 func TestRestartThresholdPolynomial(t *testing.T) {
-	s := &solver{restartStrategy: RestartPolynomial}
+	s := &solver{restartStrategy: RestartPolynomial, params: params.Default().CDCL}
 	for k := 0; k < 4; k++ {
 		s.restartCount = k
-		want := polynomialBaseConflicts * (k + 1) * (k + 1)
+		want := s.params.PolynomialBaseConflicts * (k + 1) * (k + 1)
 		if got := s.restartThreshold(); got != want {
 			t.Errorf("restartThreshold() at restartCount=%d = %d, want %d", k, got, want)
 		}
@@ -831,10 +832,10 @@ func TestRestartThresholdPolynomial(t *testing.T) {
 // with a constant ratio (geometricGrowthFactor) between consecutive
 // terms, unlike the polynomial case above.
 func TestRestartThresholdGeometric(t *testing.T) {
-	s := &solver{restartStrategy: RestartGeometric}
+	s := &solver{restartStrategy: RestartGeometric, params: params.Default().CDCL}
 	for k := 0; k < 4; k++ {
 		s.restartCount = k
-		want := int(geometricBaseConflicts * math.Pow(geometricGrowthFactor, float64(k)))
+		want := int(float64(s.params.GeometricBaseConflicts) * math.Pow(s.params.GeometricGrowthFactor, float64(k)))
 		if got := s.restartThreshold(); got != want {
 			t.Errorf("restartThreshold() at restartCount=%d = %d, want %d", k, got, want)
 		}
@@ -858,7 +859,7 @@ func TestRestartThresholdGeometric(t *testing.T) {
 // regardless of how many conflicts have accumulated.
 func TestMaybeRestartIsNoOpForRestartNone(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -882,7 +883,7 @@ func TestMaybeRestartIsNoOpForRestartNone(t *testing.T) {
 // restart untouched, per STAGE15.md's explicit requirement.
 func TestMaybeRestartTriggersAtThresholdAndResets(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartLuby)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartLuby, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -893,7 +894,7 @@ func TestMaybeRestartTriggersAtThresholdAndResets(t *testing.T) {
 	s.trailLim = append(s.trailLim, len(s.trail))
 	s.assignLiteral(cnf.Literal(1), s.currentLevel, noReason)
 
-	s.conflictsSinceRestart = lubyBaseConflicts*lubyTerm(0) - 1
+	s.conflictsSinceRestart = s.params.LubyBaseConflicts*lubyTerm(0) - 1
 	s.maybeRestart()
 	if s.restartCount != 0 {
 		t.Fatalf("restartCount = %d, want 0 (below threshold, must not restart yet)", s.restartCount)
@@ -935,7 +936,7 @@ func TestRunWithRestartsStillProvesUnsatisfiablePigeonhole(t *testing.T) {
 		problem := pigeonholeProblem(4, 3)
 		rng := rand.New(rand.NewPCG(9, 9))
 
-		result := Run(problem, nil, SelectVarFast, restartStrategy, nil, rng, 0)
+		result := Run(problem, nil, SelectVarFast, restartStrategy, nil, rng, 0, params.Default().CDCL)
 
 		if result.Satisfiable {
 			t.Errorf("restart strategy %v: Run() reported satisfiable for the 4-pigeon/3-hole problem", restartStrategy)
@@ -956,7 +957,7 @@ func TestRunWithRestartsStillFindsSatisfiableFormula(t *testing.T) {
 
 	for _, restartStrategy := range []RestartStrategy{RestartLuby, RestartPolynomial, RestartGeometric} {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, SelectVarVsids, restartStrategy, nil, rng, 0)
+		result := Run(problem, nil, SelectVarVsids, restartStrategy, nil, rng, 0, params.Default().CDCL)
 		if !result.Satisfiable {
 			t.Fatalf("restart strategy %v: Run() reported unsatisfiable for a satisfiable formula", restartStrategy)
 		}
@@ -983,14 +984,14 @@ func TestRunWithRestartsStillFindsSatisfiableFormula(t *testing.T) {
 // remaining, non-glue-eligible clauses -- is deleted instead.
 func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 6, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
 
-	idxGlue := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)}, glueClauseLBDThreshold)
-	idxNonGlueLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}, glueClauseLBDThreshold+1)
-	idxNonGlueHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-5), cnf.Literal(6)}, glueClauseLBDThreshold+1)
+	idxGlue := s.addLearnedClause(cnf.Clause{cnf.Literal(-1), cnf.Literal(3)}, s.params.GlueClauseLBDThreshold)
+	idxNonGlueLow := s.addLearnedClause(cnf.Clause{cnf.Literal(-2), cnf.Literal(4)}, s.params.GlueClauseLBDThreshold+1)
+	idxNonGlueHigh := s.addLearnedClause(cnf.Clause{cnf.Literal(-5), cnf.Literal(6)}, s.params.GlueClauseLBDThreshold+1)
 	s.clauseActivity[idxGlue] = 0.0
 	s.clauseActivity[idxNonGlueLow] = 0.5
 	s.clauseActivity[idxNonGlueHigh] = 100.0
@@ -1022,7 +1023,7 @@ func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
 // the primary sort key, activity only a tiebreak among equal LBDs.
 func TestReduceClauseDatabaseSortsByLBDBeforeActivity(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1056,7 +1057,7 @@ func TestReduceClauseDatabaseSortsByLBDBeforeActivity(t *testing.T) {
 // match a hand-computed recentAvg*glucoseK >= globalAvg comparison.
 func TestGlucoseShouldRestart(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 1, Clauses: nil}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1064,10 +1065,10 @@ func TestGlucoseShouldRestart(t *testing.T) {
 	// Fill all but one slot of the recent window with LBD 2 (low/good);
 	// the window isn't full yet, so this must never trigger regardless
 	// of how bad a single additional LBD looks.
-	for i := 0; i < glucoseWindowSize-1; i++ {
+	for i := 0; i < len(s.lbdRecentBuf)-1; i++ {
 		s.recordLBD(2)
 		if s.glucoseShouldRestart() {
-			t.Fatalf("glucoseShouldRestart() = true before the recent window (size %d) is full (i=%d)", glucoseWindowSize, i)
+			t.Fatalf("glucoseShouldRestart() = true before the recent window (size %d) is full (i=%d)", len(s.lbdRecentBuf), i)
 		}
 	}
 
@@ -1084,12 +1085,12 @@ func TestGlucoseShouldRestart(t *testing.T) {
 	// the recent window average is 20 (all glucoseWindowSize slots hold
 	// 20), while the global average is dragged only partway up, so
 	// recentAvg*glucoseK must exceed it and a restart must be signaled.
-	for i := 0; i < glucoseWindowSize; i++ {
+	for i := 0; i < len(s.lbdRecentBuf); i++ {
 		s.recordLBD(20)
 	}
-	recentAvg := float64(s.lbdRecentSum) / float64(glucoseWindowSize)
+	recentAvg := float64(s.lbdRecentSum) / float64(len(s.lbdRecentBuf))
 	globalAvg := float64(s.lbdGlobalSum) / float64(s.lbdGlobalCount)
-	want := recentAvg*glucoseK >= globalAvg
+	want := recentAvg*s.params.GlucoseK >= globalAvg
 	if got := s.glucoseShouldRestart(); got != want {
 		t.Errorf("glucoseShouldRestart() = %v, want %v (recentAvg=%v globalAvg=%v)", got, want, recentAvg, globalAvg)
 	}
@@ -1113,7 +1114,7 @@ func TestGlucoseShouldRestart(t *testing.T) {
 // root anyway.
 func TestMaybeRestartDoesNotPanicAtRootLevel(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1128,10 +1129,10 @@ func TestMaybeRestartDoesNotPanicAtRootLevel(t *testing.T) {
 	// unrelated reason: establish a low-LBD baseline global average,
 	// then drive the recent window to a much worse LBD (mirroring
 	// TestGlucoseShouldRestart's own setup).
-	for i := 0; i < glucoseWindowSize; i++ {
+	for i := 0; i < len(s.lbdRecentBuf); i++ {
 		s.recordLBD(2)
 	}
-	for i := 0; i < glucoseWindowSize; i++ {
+	for i := 0; i < len(s.lbdRecentBuf); i++ {
 		s.recordLBD(20)
 	}
 	if !s.glucoseShouldRestart() {

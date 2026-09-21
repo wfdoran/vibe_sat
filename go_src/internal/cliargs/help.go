@@ -199,6 +199,30 @@ Options:
         is printed at --verbose=1 or higher if --num-threads is at
         least twice the core count, in case that's unintentional.
 
+  --internal-params=<filename>, -c <filename>
+        STAGE39.md: path to a JSON file of runtime-configurable
+        internal tuning constants (restart-schedule bases/growth
+        factors, LRB's alpha, RestartGlucose's K/window size, learned-
+        clause minimization's and preprocessing's work-budget factors
+        -- see docs/internal-parameters.md for the complete list and
+        every value's default). If not given, a file named
+        .vibe_sat.json in the current directory is used if present;
+        otherwise every parameter keeps its built-in default. A
+        parameter the file doesn't mention also keeps its default --
+        only the values you actually want to override need to be
+        present. Loading a config file (whether from this flag or the
+        implicit .vibe_sat.json) is announced at --verbose=1 or
+        higher.
+
+  --reset-internal-params, -q
+        Write the file --internal-params would otherwise read from
+        (the given path, or .vibe_sat.json in the current directory if
+        --internal-params isn't given) populated with every internal
+        parameter's current built-in default, then exit -- without
+        requiring --input or --algorithm. Intended as a starting point
+        to hand-edit: run this once, then change only the values you
+        want different from the defaults it just wrote.
+
   --help, -h
         Print this help message and exit.
 `

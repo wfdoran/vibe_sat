@@ -194,18 +194,6 @@ func isSubsetOf(small, big cnf.Clause) bool {
 	return true
 }
 
-// subsumptionWorkBudgetFactor bounds the total number of
-// subsumer/candidate pairs eliminateSubsumedClauses/
-// eliminateSubsumedClausesParallel will ever examine, as a multiple of
-// the clause count -- see eliminateSubsumedClauses's own doc comment
-// for why this exists (STAGE30.md/REPORT30.md) and what it trades
-// away. Chosen generously (most real instances' occurrence lists are
-// far smaller than this) but small enough to guarantee the whole
-// function is O(clauses) in the worst case: even a literal appearing
-// in every single clause can only ever contribute this many candidate
-// checks in total before the budget runs out.
-const subsumptionWorkBudgetFactor = 64
-
 // eliminateSubsumedClauses removes every clause that is subsumed by
 // some other (shorter or equal-length) clause in clauses: if clause A
 // is a subset of clause B, then A already enforces at least as much
@@ -241,14 +229,16 @@ const subsumptionWorkBudgetFactor = 64
 // known algorithm that avoids that in the worst case; see
 // REPORT30.md's discussion of the Orthogonal Vectors problem for why
 // this project believes (without proving) that no such algorithm
-// exists. subsumptionWorkBudgetFactor is this function's answer to
-// that: a hard cap on total candidate-pair work, expressed as a
-// multiple of the clause count, so a pathological or merely very
-// dense formula degrades to "less subsumption found" rather than
-// "this function's running time is unbounded." Running out of budget
-// is always safe: skipping a possible subsumption never changes
-// whether the formula is satisfiable, only how compact it ends up.
-func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int) (numRemoved int) {
+// exists. workBudgetFactor (STAGE39.md: runtime-configurable, was
+// subsumptionWorkBudgetFactor; default 64, see
+// docs/internal-parameters.md) is this function's answer to that: a
+// hard cap on total candidate-pair work, expressed as a multiple of
+// the clause count, so a pathological or merely very dense formula
+// degrades to "less subsumption found" rather than "this function's
+// running time is unbounded." Running out of budget is always safe:
+// skipping a possible subsumption never changes whether the formula
+// is satisfiable, only how compact it ends up.
+func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int, workBudgetFactor int) (numRemoved int) {
 	cs := *clauses
 	occ := buildLiteralOccurrenceLists(cs, numVars)
 	keep := make([]bool, len(cs))
@@ -256,7 +246,7 @@ func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int) (numRemoved in
 		keep[i] = true
 	}
 
-	budget := subsumptionWorkBudgetFactor * len(cs)
+	budget := workBudgetFactor * len(cs)
 	trySubsumeFromGeneric(cs, occ, len(cs),
 		func(i int) bool { return keep[i] },
 		func(i int) { keep[i] = false },
@@ -422,9 +412,9 @@ func trySubsumeFromGeneric(cs []cnf.Clause, occ *literalOccurrence, n int, isKep
 // pooled, which only matters for exactly how much subsumption gets
 // found in the (rare, already-degraded) case where the budget actually
 // runs out.
-func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThreads int) (numRemoved int) {
+func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThreads int, workBudgetFactor int) (numRemoved int) {
 	if numThreads <= 1 {
-		return eliminateSubsumedClauses(clauses, numVars)
+		return eliminateSubsumedClauses(clauses, numVars, workBudgetFactor)
 	}
 
 	cs := *clauses
@@ -435,7 +425,7 @@ func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThr
 		keep[i].Store(true)
 	}
 
-	perThreadBudget := (subsumptionWorkBudgetFactor * n) / numThreads
+	perThreadBudget := (workBudgetFactor * n) / numThreads
 
 	chunk := (n + numThreads - 1) / numThreads
 	var wg sync.WaitGroup
@@ -641,10 +631,11 @@ func compactLiveOccurrences(list []int, live []bool) []int {
 // towards "less eliminated", never towards incorrectness) once
 // tripped.
 //
-// bveWorkBudgetFactor sizes the total number of resolveWithMarks
-// calls Run allows bounded variable elimination across a *whole*
-// preprocessing run (every round, not just one call to
-// eliminateVariables -- see budget's doc comment on the parameter
+// params.Preprocess.BVEWorkBudgetFactor (STAGE39.md: runtime-
+// configurable, was bveWorkBudgetFactor) sizes the total number of
+// resolveWithMarks calls Run allows bounded variable elimination
+// across a *whole* preprocessing run (every round, not just one call
+// to eliminateVariables -- see budget's doc comment on the parameter
 // below for why that distinction matters), as a multiple of the
 // original clause count. The same kind of safety net
 // STAGE30.md/REPORT30.md added for subsumption elimination, once that
@@ -657,19 +648,22 @@ func compactLiveOccurrences(list []int, live []bool) []int {
 // case) -- REPORT31.md's profiling measured real, legitimate files
 // needing up to ~994x their clause count in resolve calls to complete
 // BVE fully, and a genuinely pathological one exceeding 2845x (and
-// still climbing) without this cap. 2000 sits comfortably above every
-// legitimate value measured while cutting off runaway growth well
-// before it becomes a multi-second, let alone unbounded, cost.
-// Running out of budget is always safe, for the same reason it was
-// for subsumption: abandoning an in-progress or not-yet-attempted
-// elimination never changes whether the formula is satisfiable, only
-// how compact it ends up.
-const bveWorkBudgetFactor = 2000
+// still climbing) without this cap. Its default, 2000, sits
+// comfortably above every legitimate value measured while cutting off
+// runaway growth well before it becomes a multi-second, let alone
+// unbounded, cost -- see docs/internal-parameters.md and
+// reports/REPORT39.md for whether a benchmark sweep found a better
+// value for the one pathological file (REPORT31.md's
+// apn-sbox5-cut3-symmbreak.cnf) this was always meant to eventually
+// revisit for. Running out of budget is always safe, for the same
+// reason it was for subsumption: abandoning an in-progress or
+// not-yet-attempted elimination never changes whether the formula is
+// satisfiable, only how compact it ends up.
 
 // eliminateVariables applies bounded variable elimination once,
 // consuming from *budget as it goes. budget is a pointer, not a
 // value, because Run calls this once per preprocessing round: a
-// budget freshly reset to bveWorkBudgetFactor*len(clauses) on every
+// budget freshly reset to BVEWorkBudgetFactor*len(clauses) on every
 // call would let a single variable whose exploration alone exceeds
 // the whole budget get retried from scratch, with a brand new budget,
 // every single round -- up to maxRounds times -- since exhausting the

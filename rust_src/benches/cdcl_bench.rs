@@ -31,6 +31,7 @@ use rand::rngs::StdRng;
 
 use vibe_sat::cdcl::{RestartStrategy, SelectVarVariant, run, run_parallel};
 use vibe_sat::cnf::read_dimacs;
+use vibe_sat::params;
 
 fn main() {
     let path = "../benchmark/uuf250-1065/uuf250-01.cnf";
@@ -47,6 +48,7 @@ fn main() {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         ));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardSingleThreaded: {:?}", start.elapsed());
@@ -64,6 +66,7 @@ fn main() {
             8,
             &mut rng,
             0,
+            &params::default().cdcl,
         ));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardParallel8: {:?}", start.elapsed());
@@ -85,6 +88,7 @@ fn main() {
             32,
             &mut rng,
             0,
+            &params::default().cdcl,
         ));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardParallel32: {:?}", start.elapsed());

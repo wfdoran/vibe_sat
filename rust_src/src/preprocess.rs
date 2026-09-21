@@ -19,6 +19,7 @@ use std::thread;
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
+use crate::params;
 
 /// Bounds how many times the full technique pipeline (unit
 /// propagation, pure literals, subsumption, variable elimination) is
@@ -123,7 +124,12 @@ pub struct PreprocessResult {
 /// and bounded variable elimination) remains single-threaded
 /// regardless of `num_threads`; see REPORT25.md for why BVE in
 /// particular was not also threaded this stage.
-pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessResult {
+pub fn run(
+    problem: &Problem,
+    verbose: i32,
+    num_threads: usize,
+    p: params::Preprocess,
+) -> PreprocessResult {
     let mut clauses = problem.clauses.clone();
     let mut assignment = assignment::new(problem.num_vars);
     let mut eliminated = Vec::new();
@@ -137,7 +143,7 @@ pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessRes
     // round -- see eliminate_variables's doc comment on its own
     // budget parameter for why a fresh-every-call budget would fail
     // to bound this loop's total work.
-    let mut bve_budget = BVE_WORK_BUDGET_FACTOR * problem.clauses.len();
+    let mut bve_budget = p.bve_work_budget_factor * problem.clauses.len();
 
     for _ in 0..MAX_ROUNDS {
         let mut changed = false;
@@ -161,8 +167,12 @@ pub fn run(problem: &Problem, verbose: i32, num_threads: usize) -> PreprocessRes
         stats.pure_literals_fixed += pure_fixed;
         changed |= pure_fixed > 0;
 
-        let subsumed =
-            eliminate_subsumed_clauses_parallel(&mut clauses, problem.num_vars, num_threads);
+        let subsumed = eliminate_subsumed_clauses_parallel(
+            &mut clauses,
+            problem.num_vars,
+            num_threads,
+            p.subsumption_work_budget_factor,
+        );
         stats.clauses_subsumed += subsumed;
         changed |= subsumed > 0;
 
@@ -512,17 +522,21 @@ fn eliminate_pure_literals(clauses: &mut Vec<Clause>, assignment: &mut Assignmen
     }
 }
 
-/// Bounds the total number of subsumer/candidate pairs
-/// `eliminate_subsumed_clauses`/`eliminate_subsumed_clauses_parallel`
-/// will ever examine, as a multiple of the clause count -- see
-/// `eliminate_subsumed_clauses`'s own doc comment for why this exists
-/// (STAGE30.md/REPORT30.md) and what it trades away. Chosen generously
-/// (most real instances' occurrence lists are far smaller than this)
-/// but small enough to guarantee the whole function is `O(clauses)` in
-/// the worst case: even a literal appearing in every single clause can
-/// only ever contribute this many candidate checks in total before the
-/// budget runs out.
-const SUBSUMPTION_WORK_BUDGET_FACTOR: usize = 64;
+// Bounds the total number of subsumer/candidate pairs
+// `eliminate_subsumed_clauses`/`eliminate_subsumed_clauses_parallel`
+// will ever examine, as a multiple of the clause count -- see
+// `eliminate_subsumed_clauses`'s own doc comment for why this exists
+// (STAGE30.md/REPORT30.md) and what it trades away. Chosen generously
+// (most real instances' occurrence lists are far smaller than this)
+// but small enough to guarantee the whole function is `O(clauses)` in
+// the worst case: even a literal appearing in every single clause can
+// only ever contribute this many candidate checks in total before the
+// budget runs out.
+//
+// STAGE39.md: moved to
+// [`params::Preprocess::subsumption_work_budget_factor`]
+// (runtime-configurable); 64, named above, is [`params::default`]'s
+// value for it, unchanged.
 
 /// Maps each literal (by variable and sign, the same convention
 /// `eliminate_variables`'s `positive`/`negative` arrays use) to the
@@ -687,7 +701,11 @@ fn try_subsume_from(
 /// "this function's running time is unbounded." Running out of budget
 /// is always safe: skipping a possible subsumption never changes
 /// whether the formula is satisfiable, only how compact it ends up.
-fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>, num_vars: usize) -> usize {
+fn eliminate_subsumed_clauses(
+    clauses: &mut Vec<Clause>,
+    num_vars: usize,
+    work_budget_factor: usize,
+) -> usize {
     let occ = LiteralOccurrence::build(clauses, num_vars);
     // Cell, not a plain bool, purely so the read closure and the write
     // closure below can both capture `keep` (immutably, via Cell's
@@ -696,7 +714,7 @@ fn eliminate_subsumed_clauses(clauses: &mut Vec<Clause>, num_vars: usize) -> usi
     // `Fn` closures that would otherwise alias a `&mut`.
     let keep: Vec<Cell<bool>> = vec![Cell::new(true); clauses.len()];
 
-    let mut budget = SUBSUMPTION_WORK_BUDGET_FACTOR * clauses.len();
+    let mut budget = work_budget_factor * clauses.len();
     try_subsume_from(
         clauses,
         &occ,
@@ -767,9 +785,10 @@ fn eliminate_subsumed_clauses_parallel(
     clauses: &mut Vec<Clause>,
     num_vars: usize,
     num_threads: usize,
+    work_budget_factor: usize,
 ) -> usize {
     if num_threads <= 1 {
-        return eliminate_subsumed_clauses(clauses, num_vars);
+        return eliminate_subsumed_clauses(clauses, num_vars, work_budget_factor);
     }
 
     let n = clauses.len();
@@ -777,7 +796,7 @@ fn eliminate_subsumed_clauses_parallel(
     let keep: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(true)).collect();
     let cs: &Vec<Clause> = clauses;
     let chunk = n.div_ceil(num_threads).max(1);
-    let per_thread_budget = (SUBSUMPTION_WORK_BUDGET_FACTOR * n) / num_threads;
+    let per_thread_budget = (work_budget_factor * n) / num_threads;
 
     thread::scope(|scope| {
         let mut start = 0;
@@ -884,30 +903,35 @@ fn compact_live_occurrences(list: &mut Vec<usize>, live: &[bool]) {
     list.retain(|&idx| live[idx]);
 }
 
-/// Bounds the total number of `resolve_with_marks` calls `run` allows
-/// bounded variable elimination across a *whole* preprocessing run
-/// (every round, not just one call to `eliminate_variables` -- see
-/// `budget`'s doc comment on the parameter below for why that
-/// distinction matters), as a multiple of the original clause count.
-/// The same kind of safety net STAGE30.md/REPORT30.md added for
-/// subsumption elimination, once that technique's own occurrence-list
-/// rewrite stopped being the dominant cost and exposed BVE as the
-/// next one (REPORT31.md). Even with the algorithmic fixes above, a
-/// single variable that genuinely occurs in thousands of clauses on
-/// both polarities still costs `O(occurrences^2)` `resolve_with_marks`
-/// calls if its elimination is ultimately accepted (the early-exit
-/// above only helps the *rejected* case) -- REPORT31.md's profiling
-/// measured real, legitimate files needing up to ~994x their clause
-/// count in resolve calls to complete BVE fully, and a genuinely
-/// pathological one exceeding 2845x (and still climbing) without this
-/// cap. 2000 sits comfortably above every legitimate value measured
-/// while cutting off runaway growth well before it becomes a
-/// multi-second, let alone unbounded, cost. Running out of budget is
-/// always safe, for the same reason it was for subsumption:
-/// abandoning an in-progress or not-yet-attempted elimination never
-/// changes whether the formula is satisfiable, only how compact it
-/// ends up.
-const BVE_WORK_BUDGET_FACTOR: usize = 2000;
+// Bounds the total number of `resolve_with_marks` calls `run` allows
+// bounded variable elimination across a *whole* preprocessing run
+// (every round, not just one call to `eliminate_variables` -- see
+// `budget`'s doc comment on the parameter below for why that
+// distinction matters), as a multiple of the original clause count.
+// The same kind of safety net STAGE30.md/REPORT30.md added for
+// subsumption elimination, once that technique's own occurrence-list
+// rewrite stopped being the dominant cost and exposed BVE as the
+// next one (REPORT31.md). Even with the algorithmic fixes above, a
+// single variable that genuinely occurs in thousands of clauses on
+// both polarities still costs `O(occurrences^2)` `resolve_with_marks`
+// calls if its elimination is ultimately accepted (the early-exit
+// above only helps the *rejected* case) -- REPORT31.md's profiling
+// measured real, legitimate files needing up to ~994x their clause
+// count in resolve calls to complete BVE fully, and a genuinely
+// pathological one exceeding 2845x (and still climbing) without this
+// cap. 2000 sits comfortably above every legitimate value measured
+// while cutting off runaway growth well before it becomes a
+// multi-second, let alone unbounded, cost. Running out of budget is
+// always safe, for the same reason it was for subsumption:
+// abandoning an in-progress or not-yet-attempted elimination never
+// changes whether the formula is satisfiable, only how compact it
+// ends up.
+//
+// STAGE39.md: moved to [`params::Preprocess::bve_work_budget_factor`]
+// (runtime-configurable); 2000, named above, is [`params::default`]'s
+// value for it, unchanged. See `reports/REPORT39.md` for whether a
+// sweep against `apn-sbox5-cut3-symmbreak.cnf` (REPORT31.md's
+// pathological file) found a better default.
 
 /// Applies bounded variable elimination (the NiVER rule: Subbarayan &
 /// Pradhan, SAT 2004): a variable `v` is eliminated by resolving every
@@ -1269,7 +1293,11 @@ mod tests {
     #[test]
     fn test_eliminate_subsumed_clauses_removes_superset() {
         let mut clauses = vec![vec![1, 2], vec![1, 2, 3]];
-        let num_removed = eliminate_subsumed_clauses(&mut clauses, 3);
+        let num_removed = eliminate_subsumed_clauses(
+            &mut clauses,
+            3,
+            params::default().preprocess.subsumption_work_budget_factor,
+        );
         assert_eq!(num_removed, 1);
         assert_eq!(clauses.len(), 1);
     }
@@ -1277,7 +1305,11 @@ mod tests {
     #[test]
     fn test_eliminate_subsumed_clauses_removes_duplicates() {
         let mut clauses = vec![vec![1, -2], vec![1, -2]];
-        let num_removed = eliminate_subsumed_clauses(&mut clauses, 2);
+        let num_removed = eliminate_subsumed_clauses(
+            &mut clauses,
+            2,
+            params::default().preprocess.subsumption_work_budget_factor,
+        );
         assert_eq!(num_removed, 1);
         assert_eq!(clauses.len(), 1);
     }
@@ -1297,11 +1329,20 @@ mod tests {
         let original: Vec<Clause> = vec![vec![1], vec![1, 2], vec![1, 2, 4]];
 
         let mut want = original.clone();
-        let want_removed = eliminate_subsumed_clauses(&mut want, 4);
+        let want_removed = eliminate_subsumed_clauses(
+            &mut want,
+            4,
+            params::default().preprocess.subsumption_work_budget_factor,
+        );
 
         for num_threads in [1, 2, 3, 4, 8] {
             let mut got = original.clone();
-            let got_removed = eliminate_subsumed_clauses_parallel(&mut got, 4, num_threads);
+            let got_removed = eliminate_subsumed_clauses_parallel(
+                &mut got,
+                4,
+                num_threads,
+                params::default().preprocess.subsumption_work_budget_factor,
+            );
             assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
             assert_eq!(got, want, "num_threads={num_threads}");
         }
@@ -1317,7 +1358,11 @@ mod tests {
             cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
         let mut want = problem.clauses.clone();
-        let want_removed = eliminate_subsumed_clauses(&mut want, problem.num_vars);
+        let want_removed = eliminate_subsumed_clauses(
+            &mut want,
+            problem.num_vars,
+            params::default().preprocess.subsumption_work_budget_factor,
+        );
         assert!(
             want_removed > 0,
             "test file has nothing to subsume; pick a different file"
@@ -1325,8 +1370,12 @@ mod tests {
 
         for num_threads in [1, 2, 3, 4, 8, 16] {
             let mut got = problem.clauses.clone();
-            let got_removed =
-                eliminate_subsumed_clauses_parallel(&mut got, problem.num_vars, num_threads);
+            let got_removed = eliminate_subsumed_clauses_parallel(
+                &mut got,
+                problem.num_vars,
+                num_threads,
+                params::default().preprocess.subsumption_work_budget_factor,
+            );
             assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
             assert_eq!(got, want, "num_threads={num_threads}");
         }
@@ -1417,7 +1466,11 @@ mod tests {
             let want = brute_force_subsumed_clauses(&original);
 
             let mut got = original.clone();
-            eliminate_subsumed_clauses(&mut got, num_vars as usize);
+            eliminate_subsumed_clauses(
+                &mut got,
+                num_vars as usize,
+                params::default().preprocess.subsumption_work_budget_factor,
+            );
 
             assert_eq!(
                 got, want,
@@ -1437,13 +1490,13 @@ mod tests {
         let problem =
             cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
-        let want = run(&problem, 0, 1);
+        let want = run(&problem, 0, 1, params::default().preprocess);
         let want_problem = want
             .problem
             .as_ref()
             .expect("expected a simplified problem");
         for num_threads in [1, 2, 4, 8, 16] {
-            let got = run(&problem, 0, num_threads);
+            let got = run(&problem, 0, num_threads, params::default().preprocess);
             let got_problem = got.problem.as_ref().expect("expected a simplified problem");
             assert_eq!(
                 got.stats.clauses_before, want.stats.clauses_before,
@@ -1740,7 +1793,7 @@ mod tests {
             ],
         };
 
-        let result = run(&problem, 0, 1);
+        let result = run(&problem, 0, 1, params::default().preprocess);
         assert!(!result.unsat);
         let reduced = result.problem.as_ref().expect("expected a reduced problem");
         assert!(reduced.num_vars <= 2);
@@ -1760,7 +1813,7 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        let result = run(&problem, 0, 1);
+        let result = run(&problem, 0, 1, params::default().preprocess);
         assert!(result.unsat);
         assert!(result.problem.is_none());
     }
@@ -1786,7 +1839,7 @@ mod tests {
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
 
-        let result = run(&problem, 0, 1);
+        let result = run(&problem, 0, 1, params::default().preprocess);
         assert!(!result.unsat);
         assert!(
             !result.eliminated.is_empty(),
@@ -1824,7 +1877,7 @@ mod tests {
             num_vars: 2, // variable 2 never appears in any clause
             clauses: vec![vec![1]],
         };
-        let result = run(&problem, 0, 1);
+        let result = run(&problem, 0, 1, params::default().preprocess);
         assert!(!result.unsat);
         let reduced = result.problem.as_ref().expect("expected a reduced problem");
 

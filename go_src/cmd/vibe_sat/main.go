@@ -22,6 +22,7 @@ import (
 	"vibe_sat/internal/dfs"
 	"vibe_sat/internal/hillclimb"
 	"vibe_sat/internal/occurrence"
+	"vibe_sat/internal/params"
 	"vibe_sat/internal/preprocess"
 	"vibe_sat/internal/solution"
 )
@@ -45,6 +46,35 @@ func main() {
 		os.Exit(0)
 	}
 
+	// STAGE39.md: --reset-internal-params writes the resolved config
+	// path with every internal parameter's built-in default and exits,
+	// without ever reading --input or running anything -- same
+	// early-exit shape as --help above, since cliargs.validate already
+	// made --input/--algorithm optional for this case.
+	if args.ResetInternalParams {
+		path := args.InternalParamsPath
+		if path == "" {
+			path = params.DefaultConfigFileName
+		}
+		if err := params.Save(path, params.Default()); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		if args.Verbose >= 1 {
+			fmt.Println("wrote default internal parameters to", path)
+		}
+		os.Exit(0)
+	}
+
+	internalParams, paramsSource, err := params.Resolve(args.InternalParamsPath)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	if args.Verbose >= 1 && paramsSource != "built-in defaults" {
+		fmt.Println("internal parameters: loaded from", paramsSource)
+	}
+
 	warnIfOversubscribed(args)
 
 	problem, err := cnf.ReadDIMACS(args.InputFile, args.Verbose)
@@ -60,7 +90,7 @@ func main() {
 	originalNumVars := problem.NumVars
 	var preResult *preprocess.Result
 	if !args.NoPreprocessing {
-		preResult = preprocess.Run(problem, args.Verbose, args.NumThreads)
+		preResult = preprocess.Run(problem, args.Verbose, args.NumThreads, internalParams.Preprocess)
 		if preResult.Unsat {
 			// Preprocessing alone already proves the original problem
 			// has no solution, regardless of which algorithm was
@@ -81,7 +111,7 @@ func main() {
 	case "dfs":
 		runDFS(problem, preResult, originalNumVars, args)
 	case "cdcl":
-		runCDCL(problem, preResult, originalNumVars, args)
+		runCDCL(problem, preResult, originalNumVars, args, internalParams.CDCL)
 	}
 
 	exit(startTime, args.Verbose)
@@ -256,7 +286,7 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 // deleted; nil leaves it unbounded, as before Stage 12. If preResult
 // is non-nil, the found assignment is reconstructed back to
 // originalNumVars variables before being written out.
-func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
+func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args, cdclParams params.CDCL) {
 	rng := newSeededRand()
 
 	var timeLimit *time.Duration
@@ -295,7 +325,7 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 		restartStrategy = cdcl.RestartRoundRobin
 	}
 
-	result := cdcl.RunParallel(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, args.NumThreads, rng, args.Verbose)
+	result := cdcl.RunParallel(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, args.NumThreads, rng, args.Verbose, cdclParams)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

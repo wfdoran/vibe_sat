@@ -10,7 +10,9 @@
 // lib.rs's own doc comment for why) rather than being declared
 // directly here with "mod X;". This changes nothing about the
 // compiled binary's behavior, only where the module tree is rooted.
-use vibe_sat::{assignment, cdcl, cliargs, cnf, dfs, hillclimb, occurrence, preprocess, solution};
+use vibe_sat::{
+    assignment, cdcl, cliargs, cnf, dfs, hillclimb, occurrence, params, preprocess, solution,
+};
 
 use assignment::Assignment;
 use preprocess::PreprocessResult;
@@ -38,6 +40,24 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
+    // STAGE39.md: --reset-internal-params bypasses the normal required-
+    // argument validation (no --input/--algorithm needed) the same way
+    // --help does above -- see cliargs::wants_reset_internal_params's
+    // doc comment for why this has to be a raw argv pre-scan rather
+    // than a field on Args itself.
+    if cliargs::wants_reset_internal_params(&argv) {
+        let path = cliargs::extract_internal_params_path(&argv)
+            .unwrap_or_else(|| params::DEFAULT_CONFIG_FILE_NAME.to_string());
+        if let Err(message) = params::save(&path, &params::default()) {
+            println!("{message}");
+            return ExitCode::from(1);
+        }
+        if cliargs::extract_verbose(&argv) >= 1 {
+            println!("wrote default internal parameters to {path}");
+        }
+        return ExitCode::from(0);
+    }
+
     let args = match Args::parse_from_args(argv) {
         Ok(args) => args,
         Err(message) => {
@@ -47,6 +67,18 @@ fn main() -> ExitCode {
     };
 
     warn_if_oversubscribed(&args);
+
+    let (internal_params, internal_params_source) =
+        match params::resolve(args.internal_params_path.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                println!("{message}");
+                return ExitCode::from(1);
+            }
+        };
+    if args.verbose >= 1 && internal_params_source != "built-in defaults" {
+        println!("internal parameters: loaded from {internal_params_source}");
+    }
 
     let problem = match cnf::read_dimacs(&args.input, args.verbose) {
         Ok(problem) => problem,
@@ -64,7 +96,12 @@ fn main() -> ExitCode {
     let mut preresult: Option<PreprocessResult> = None;
     let mut problem = problem;
     if !args.no_preprocessing {
-        let mut result = preprocess::run(&problem, args.verbose, args.num_threads);
+        let mut result = preprocess::run(
+            &problem,
+            args.verbose,
+            args.num_threads,
+            internal_params.preprocess,
+        );
         if result.unsat {
             // Preprocessing alone already proves the original problem
             // has no solution, regardless of which algorithm was
@@ -85,7 +122,13 @@ fn main() -> ExitCode {
         "hc" => run_hill_climb(&problem, &preresult, original_num_vars, &args),
         "ws" => run_walksat(&problem, &preresult, original_num_vars, &args),
         "dfs" => run_dfs(&problem, &preresult, original_num_vars, &args),
-        "cdcl" => run_cdcl(&problem, &preresult, original_num_vars, &args),
+        "cdcl" => run_cdcl(
+            &problem,
+            &preresult,
+            original_num_vars,
+            &args,
+            &internal_params.cdcl,
+        ),
         _ => Ok(()),
     };
     if let Err(message) = run_result {
@@ -318,6 +361,7 @@ fn run_cdcl(
     preresult: &Option<PreprocessResult>,
     original_num_vars: usize,
     args: &Args,
+    cdcl_params: &params::Cdcl,
 ) -> Result<(), String> {
     let mut rng = StdRng::from_rng(&mut rand::rng());
 
@@ -373,6 +417,7 @@ fn run_cdcl(
         args.num_threads,
         &mut rng,
         args.verbose,
+        cdcl_params,
     );
 
     if result.satisfiable {

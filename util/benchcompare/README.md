@@ -16,6 +16,11 @@ from `reports/REPORT8.md` through `reports/REPORT23.md` wrote, used
 once, and discarded. See `reports/REPORT22.md` item 18 and
 `reports/REPORT24.md` for the history and design rationale.
 
+See also [`util/paramtune`](../paramtune/README.md), `STAGE39.md`'s
+auto-tuning harness: it drives many `benchcompare` sweeps in a row,
+one per candidate value of an internal tuning parameter
+(`docs/internal-parameters.md`), to find which value performs best.
+
 STAGE37.md also uses this tool as CI's smoke test (see
 `.github/workflows/ci.yml`'s `smoke` job and `reports/REPORT37.md`):
 a small, curated set of `--algorithm`/`--num-threads`/

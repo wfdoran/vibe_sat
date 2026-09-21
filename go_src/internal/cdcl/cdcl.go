@@ -201,6 +201,7 @@ import (
 	"vibe_sat/internal/cnf"
 	"vibe_sat/internal/dfs"
 	"vibe_sat/internal/occurrence"
+	"vibe_sat/internal/params"
 	"vibe_sat/internal/preprocess"
 )
 
@@ -224,59 +225,59 @@ const (
 	perClauseOverheadBytes = 40
 )
 
-// clauseActivityDecay and activityRescaleThreshold implement
-// MiniSat's clause activity bookkeeping (see solver's clauseActivity
-// field): rather than multiplying every clause's activity by
-// clauseActivityDecay after every conflict (an O(clauses) cost per
-// conflict), the single clauseActivityIncrement is grown by
-// 1/clauseActivityDecay instead, which has the same relative effect
-// (older bumps count for less compared to newer ones) at O(1) cost.
-// If the increment ever grows past activityRescaleThreshold, every
-// clause's activity and the increment itself are divided back down by
-// the same factor, to stay well within float64's range over a very
-// long run. varActivityDecay is the analogous decay rate for
-// SelectVarVsids's per-variable activity (solver's varActivity
-// field); VSIDS conventionally decays faster than clause activity
-// does (MiniSat's own defaults: 0.95 for variables, 0.999 for
-// clauses), which is why these are two separate constants rather than
-// one shared rate.
-const (
-	clauseActivityDecay      = 0.999
-	varActivityDecay         = 0.95
-	activityRescaleThreshold = 1e100
-)
+// clauseActivityDecay and varActivityDecay (STAGE39.md: now
+// params.CDCL.ClauseActivityDecay/VarActivityDecay, runtime-
+// configurable) implement MiniSat's clause activity bookkeeping (see
+// solver's clauseActivity field): rather than multiplying every
+// clause's activity by clauseActivityDecay after every conflict (an
+// O(clauses) cost per conflict), the single clauseActivityIncrement is
+// grown by 1/clauseActivityDecay instead, which has the same relative
+// effect (older bumps count for less compared to newer ones) at O(1)
+// cost. If the increment ever grows past activityRescaleThreshold
+// (still a plain constant -- purely a numerical-safety cap, not a
+// tuning knob; see docs/internal-parameters.md), every clause's
+// activity and the increment itself are divided back down by the same
+// factor, to stay well within float64's range over a very long run.
+// varActivityDecay is the analogous decay rate for SelectVarVsids's
+// per-variable activity (solver's varActivity field); VSIDS
+// conventionally decays faster than clause activity does (MiniSat's
+// own defaults: 0.95 for variables, 0.999 for clauses), which is why
+// these are two separate fields rather than one shared rate.
+const activityRescaleThreshold = 1e100
 
-// lrbAlpha is the fixed learning-rate weight SelectVarLrb uses when
-// updating a variable's Q-value (see backtrackTo's doc comment): the
-// paper anneals this over the course of the search, starting high and
-// decaying toward a floor; this implementation keeps it fixed at a
-// value from within that range instead, as a documented
-// simplification (see the package doc comment).
-const lrbAlpha = 0.4
+// lrbAlpha (STAGE39.md: now params.CDCL.LRBAlpha) is the fixed
+// learning-rate weight SelectVarLrb uses when updating a variable's
+// Q-value (see backtrackTo's doc comment): the paper anneals this over
+// the course of the search, starting high and decaying toward a
+// floor; this implementation keeps it fixed at a value from within
+// that range instead, as a documented simplification (see the package
+// doc comment).
 
-// glueClauseLBDThreshold is Glucose's own "glue clause" cutoff
-// (Audemard & Simon 2009): a learned clause whose LBD is at or below
-// this is never a reduceClauseDatabase deletion candidate, regardless
-// of activity or memory pressure -- treated as close to permanently
-// useful, the same protection original (bootstrapped) clauses already
-// get. 2 is Glucose's own published value and the one essentially
-// every LBD-using solver since has kept unchanged.
+// glueClauseLBDThreshold (STAGE39.md: now
+// params.CDCL.GlueClauseLBDThreshold) is Glucose's own "glue clause"
+// cutoff (Audemard & Simon 2009): a learned clause whose LBD is at or
+// below this is never a reduceClauseDatabase deletion candidate,
+// regardless of activity or memory pressure -- treated as close to
+// permanently useful, the same protection original (bootstrapped)
+// clauses already get. 2 is Glucose's own published value and the one
+// essentially every LBD-using solver since has kept unchanged.
 //
-// glucoseWindowSize and glucoseK are RestartGlucose's own parameters
-// (see glucoseShouldRestart): glucoseWindowSize is how many of the
-// most recently learned clauses' LBDs make up the "recent" moving
-// average, and glucoseK is the factor the recent average is compared
-// against the all-time global average by.
+// glucoseWindowSize and glucoseK (now
+// params.CDCL.GlucoseWindowSize/GlucoseK) are RestartGlucose's own
+// parameters (see glucoseShouldRestart): glucoseWindowSize is how many
+// of the most recently learned clauses' LBDs make up the "recent"
+// moving average, and glucoseK is the factor the recent average is
+// compared against the all-time global average by.
 //
-// glucoseWindowSize keeps Glucose's own originally published value
-// (50): a benchmark sweep (STAGE35.md; see reports/REPORT35.md)
+// glucoseWindowSize's default keeps Glucose's own originally published
+// value (50): a benchmark sweep (STAGE35.md; see reports/REPORT35.md)
 // tried 30 and 100 against it and found neither a clear win --
 // 30 solved fewer instances outright, 100 was a statistical wash --
 // so there was no real evidence to move off the literature default.
 //
-// glucoseK does NOT keep Glucose's own value (0.8): the same sweep
-// found 0.6 solving as many or more instances as 0.8 while roughly
-// halving mean solve time among those solved (2.44s/2.18s vs.
+// glucoseK's default does NOT keep Glucose's own value (0.8): the same
+// sweep found 0.6 solving as many or more instances as 0.8 while
+// roughly halving mean solve time among those solved (2.44s/2.18s vs.
 // 3.27s/2.93s Go/Rust on the report's 52-file sample), a real,
 // measured win rather than a rounding-error difference -- restarting
 // less often than Glucose's own default suggests turned out to matter
@@ -284,11 +285,6 @@ const lrbAlpha = 0.4
 // found for VSIDS-over-LRB (REPORT13.md) and polynomial-over-Luby
 // (REPORT15.md): trust this project's own measurement over a
 // technique's published default once they disagree.
-const (
-	glueClauseLBDThreshold = 2
-	glucoseWindowSize      = 50
-	glucoseK               = 0.6
-)
 
 // minUndef/minRemovable/minFailed are literalRedundant's three-state
 // memoization marks for s.minState (parallel to a variable, sized
@@ -309,18 +305,6 @@ const (
 	minFailed
 )
 
-// minimizeWorkBudgetFactor scales minimizeClause's hard cap on total
-// reason-clause literals examined across one call (see
-// minimizeWorkBudget): STAGE36.md explicitly asked for a bound close
-// to O(n log n) in the size of the learned clause, and for an
-// absolute limit "just in case," matching the same concern that drove
-// Stage 30/31's subsumption/BVE work budgets. 20 was chosen the same
-// way those were: generous enough that it is never observed to
-// trigger on this project's own benchmark set (see
-// reports/REPORT36.md), while still being a real, finite cap rather
-// than no cap at all.
-const minimizeWorkBudgetFactor = 20
-
 // minimizeWorkBudget returns the total number of reason-clause
 // literals minimizeClause may examine (summed across every candidate
 // literal's literalRedundant call) while minimizing a clause of
@@ -328,57 +312,67 @@ const minimizeWorkBudgetFactor = 20
 // unminimized. bits.Len approximates log2(n)+1 -- cheap, integer-only,
 // and already this project's convention for "a log-shaped bound"
 // (see e.g. lubyTerm's own iterative doubling).
-func minimizeWorkBudget(n int) int {
-	return minimizeWorkBudgetFactor * n * (bits.Len(uint(n)) + 1)
+//
+// s.params.MinimizeWorkBudgetFactor (STAGE39.md: runtime-configurable;
+// was minimizeWorkBudgetFactor) scales the result: STAGE36.md
+// explicitly asked for a bound close to O(n log n) in the size of the
+// learned clause, and for an absolute limit "just in case," matching
+// the same concern that drove Stage 30/31's subsumption/BVE work
+// budgets. 20 is its default, chosen the same way those were:
+// generous enough that it is never observed to trigger on this
+// project's own benchmark set (see reports/REPORT36.md), while still
+// being a real, finite cap rather than no cap at all.
+func (s *solver) minimizeWorkBudget(n int) int {
+	return s.params.MinimizeWorkBudgetFactor * n * (bits.Len(uint(n)) + 1)
 }
 
-// lubyBaseConflicts and polynomialBaseConflicts are STAGE15.md's "b"
-// and "a": the scale constants for the Luby and polynomial restart
-// sequences respectively (see restartThreshold), expressed in
-// conflicts (see the package doc comment for why conflicts, not
-// decisions, is the chosen restart statistic). Both are internal
-// parameters, not exposed via --alg-params, per STAGE15.md's explicit
-// instruction that they're meant to be optimized later instead.
+// lubyBaseConflicts and polynomialBaseConflicts (STAGE39.md: now
+// params.CDCL.LubyBaseConflicts/PolynomialBaseConflicts) are
+// STAGE15.md's "b" and "a": the scale constants for the Luby and
+// polynomial restart sequences respectively (see restartThreshold),
+// expressed in conflicts (see the package doc comment for why
+// conflicts, not decisions, is the chosen restart statistic). Both
+// were internal parameters not exposed via --alg-params per
+// STAGE15.md's explicit instruction that they're meant to be optimized
+// later instead -- STAGE39.md is that later optimization
+// infrastructure, via params.CDCL/--internal-params rather than
+// --alg-params, since these apply regardless of which restart
+// strategy --alg-params val2 actually selects.
 //
-// lubyBaseConflicts uses MiniSat's own default Luby restart base (its
-// "-rfirst" option, 100 conflicts) -- a genuinely standard value in
-// the literature/practice, inherited unchanged by most MiniSat-
-// lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly the
-// kind of standard STAGE15.md asks to prefer when one exists.
+// lubyBaseConflicts's default uses MiniSat's own default Luby restart
+// base (its "-rfirst" option, 100 conflicts) -- a genuinely standard
+// value in the literature/practice, inherited unchanged by most
+// MiniSat-lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly
+// the kind of standard STAGE15.md asks to prefer when one exists.
 //
 // polynomialBaseConflicts has no such standard to inherit: the
 // quadratic sequence STAGE15.md originally specified under the name
 // "geometric" growth (a*k^2) is not itself a geometric sequence (see
 // the package doc comment), so no standard constant applies to this
-// exact formula. Per STAGE15.md's fallback instruction, this is
+// exact formula. Per STAGE15.md's fallback instruction, its default is
 // instead picked empirically to be about one second of work on this
 // project's own uf250/uuf250 benchmark sample: measured at
 // ~17,300-18,900 conflicts/second across ten sampled instances (five
 // uf250-1065, five uuf250-1065) under this project's current default
 // cdcl configuration (VSIDS + phase saving), rounded to 18000.
 //
-// geometricBaseConflicts and geometricGrowthFactor are "c" and "r"
-// for the true geometric schedule (RestartGeometric): the restart
-// interval starts at c conflicts and is multiplied by r after every
-// restart. Unlike polynomialBaseConflicts, a standard pairing of
+// geometricBaseConflicts and geometricGrowthFactor (now
+// params.CDCL.GeometricBaseConflicts/GeometricGrowthFactor) are "c"
+// and "r" for the true geometric schedule (RestartGeometric): the
+// restart interval starts at c conflicts and is multiplied by r after
+// every restart. Unlike polynomialBaseConflicts, a standard pairing of
 // these two constants does exist in the literature: MiniSat
-// 1.13/1.14's geometric restart scheme (the scheme Luby restarts
-// later replaced as MiniSat's default) used a base restart interval
-// of 100 conflicts -- the same "rfirst" constant reused here as
-// lubyBaseConflicts -- and a growth factor of 1.5. That 1.5 was
-// itself a practical (not theoretical) choice: a value a bit below
-// the golden ratio (~1.618), the same growth-factor reasoning used
-// when picking dynamic array growth factors to allow memory reuse
-// (a factor at or above the golden ratio can never reuse previously
-// freed memory as it grows). Per STAGE15.md's preference for a
-// standard value when one exists, both constants are taken from that
-// standard MiniSat pairing rather than re-derived empirically.
-const (
-	lubyBaseConflicts       = 100
-	polynomialBaseConflicts = 18000
-	geometricBaseConflicts  = lubyBaseConflicts
-	geometricGrowthFactor   = 1.5
-)
+// 1.13/1.14's geometric restart scheme (the scheme Luby restarts later
+// replaced as MiniSat's default) used a base restart interval of 100
+// conflicts -- the same "rfirst" default reused here as
+// lubyBaseConflicts's own default -- and a growth factor of 1.5. That
+// 1.5 was itself a practical (not theoretical) choice: a value a bit
+// below the golden ratio (~1.618), the same growth-factor reasoning
+// used when picking dynamic array growth factors to allow memory
+// reuse (a factor at or above the golden ratio can never reuse
+// previously freed memory as it grows). Per STAGE15.md's preference
+// for a standard value when one exists, both defaults are taken from
+// that standard MiniSat pairing rather than re-derived empirically.
 
 // SelectVarVariant identifies which heuristic Run should use to pick
 // the next branching variable. Values 0 and 1 match dfs.SelectVarVariant
@@ -494,6 +488,16 @@ type Result struct {
 type solver struct {
 	numVars int
 
+	// params holds STAGE39.md's runtime-configurable tuning constants
+	// for this run -- resolved once (see params.Resolve) before the
+	// search starts and never modified afterward. Every former
+	// compile-time constant this replaces (lubyBaseConflicts, lrbAlpha,
+	// glucoseK, ...) is now a field read off this value instead; see
+	// docs/internal-parameters.md for the full list and
+	// docs/internal-parameters.md's own rationale for which constants
+	// did *not* move here.
+	params params.CDCL
+
 	// clauses grows over time as clauses are learned (length >= 2
 	// only; a learned clause of length 1 is applied directly as a
 	// permanent level-0 fact instead, see addLearnedClause). watch is
@@ -538,10 +542,15 @@ type solver struct {
 	//
 	// lbdRecentBuf/lbdRecentPos/lbdRecentSum/lbdRecentFilled implement
 	// RestartGlucose's "recent" moving average as a fixed-size ring
-	// buffer of the last glucoseWindowSize learned clauses' LBDs (see
-	// recordLBD): lbdRecentSum is always the current sum of whatever is
-	// in the buffer, maintained incrementally (subtract the slot being
-	// overwritten, add the new value) rather than resummed each time.
+	// buffer of the last params.GlucoseWindowSize learned clauses' LBDs
+	// (see recordLBD): lbdRecentSum is always the current sum of
+	// whatever is in the buffer, maintained incrementally (subtract the
+	// slot being overwritten, add the new value) rather than resummed
+	// each time. Sized once, in newSolver (STAGE39.md: this can no
+	// longer be a fixed-size array now that its length is a runtime
+	// value, not a compile-time constant); len(lbdRecentBuf) is the
+	// window size wherever it's needed, rather than a second field
+	// duplicating params.GlucoseWindowSize.
 	// lbdGlobalSum/lbdGlobalCount are the corresponding all-time
 	// running sum/count since the search began (never reset, including
 	// across restarts -- see the package doc comment for why Glucose's
@@ -549,7 +558,7 @@ type solver struct {
 	// restart").
 	clauseLBD       []int
 	lbdScratch      []int
-	lbdRecentBuf    [glucoseWindowSize]int
+	lbdRecentBuf    []int
 	lbdRecentPos    int
 	lbdRecentSum    int
 	lbdRecentFilled bool
@@ -678,7 +687,7 @@ func clauseByteCost(clause cnf.Clause) int64 {
 // (STAGE13.md). restartStrategy is the restart schedule to use
 // (STAGE15.md). ok is false if this bootstrap alone already proves
 // problem unsatisfiable.
-func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy) (s *solver, ok bool) {
+func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy, p params.CDCL) (s *solver, ok bool) {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	x := assign.New(problem.NumVars)
 	if unsat, _ := preprocess.UnitPropagate(&clauses, x); unsat {
@@ -730,6 +739,8 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		trailLim:                []int{0},
 		seen:                    make([]bool, problem.NumVars+1),
 		minState:                make([]byte, problem.NumVars+1),
+		params:                  p,
+		lbdRecentBuf:            make([]int, p.GlucoseWindowSize),
 	}, true
 }
 
@@ -787,11 +798,11 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 // runLoop's own comment). rng supplies the randomness
 // SelectVarWeighted uses to break ties,
 // and verbose controls progress output, matching dfs.Run.
-func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, verbose int) Result {
+func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, verbose int, p params.CDCL) Result {
 	if verbose >= 1 {
 		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy)+describeMemoryLimit(memoryLimitBytes))
 	}
-	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil)
+	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p)
 	if verbose >= 1 {
 		fmt.Println(verdict(result))
 	}
@@ -835,9 +846,9 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 // which worker's answer wins a race to a verdict is not.
 // Result.NumDecisions/NumConflicts are summed across every worker,
 // win or lose, matching Stage 18's Result.NumNodes convention.
-func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, numThreads int, rng *rand.Rand, verbose int) Result {
+func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, numThreads int, rng *rand.Rand, verbose int, p params.CDCL) Result {
 	if numThreads <= 1 {
-		return Run(problem, timeLimit, variant, restartStrategy, memoryLimitBytes, rng, verbose)
+		return Run(problem, timeLimit, variant, restartStrategy, memoryLimitBytes, rng, verbose, p)
 	}
 
 	if verbose >= 1 {
@@ -870,7 +881,7 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 		go func(i int, peers []*exportBuffer) {
 			defer wg.Done()
 			threadStrategy := resolveRestartStrategy(restartStrategy, i)
-			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers)
+			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p)
 			if !results[i].TimedOut && stop.CompareAndSwap(false, true) {
 				winner.Store(int32(i))
 			}
@@ -904,7 +915,7 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 // per worker), matching Stage 17/18's identical runLoop/dfsWorker
 // pattern. stop/export/peers are nil for Run's own single-threaded
 // call; see the solver struct's doc comment for what each does.
-func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, stop *atomic.Bool, export *exportBuffer, peers []*exportBuffer) Result {
+func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, stop *atomic.Bool, export *exportBuffer, peers []*exportBuffer, p params.CDCL) Result {
 	// STAGE35.md: captured before newSolver's bootstrap, not after --
 	// see the package doc comment's time-check paragraph
 	// (reports/REPORT35.md) for why: a slow bootstrap (unit propagation
@@ -918,7 +929,7 @@ func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVa
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy)
+	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy, p)
 	if !ok {
 		return Result{Satisfiable: false}
 	}
@@ -1195,7 +1206,7 @@ func (s *solver) learnAndBackjump(confl int) {
 	newClause := s.addLearnedClause(learned, lbd)
 	s.assignLiteral(learned[0], backtrackLevel, newClause)
 
-	s.clauseActivityIncrement /= clauseActivityDecay
+	s.clauseActivityIncrement /= s.params.ClauseActivityDecay
 	if s.clauseActivityIncrement > activityRescaleThreshold {
 		for i := range s.clauseActivity {
 			s.clauseActivity[i] /= activityRescaleThreshold
@@ -1204,7 +1215,7 @@ func (s *solver) learnAndBackjump(confl int) {
 	}
 
 	if s.variant == SelectVarVsids {
-		s.varActivityIncrement /= varActivityDecay
+		s.varActivityIncrement /= s.params.VarActivityDecay
 		if s.varActivityIncrement > activityRescaleThreshold {
 			for v := range s.varActivity {
 				s.varActivity[v] /= activityRescaleThreshold
@@ -1294,7 +1305,7 @@ func (s *solver) recordLBD(lbd int) {
 	s.lbdRecentBuf[s.lbdRecentPos] = lbd
 	s.lbdRecentSum += lbd
 	s.lbdRecentPos++
-	if s.lbdRecentPos == glucoseWindowSize {
+	if s.lbdRecentPos == len(s.lbdRecentBuf) {
 		s.lbdRecentPos = 0
 		s.lbdRecentFilled = true
 	}
@@ -1318,9 +1329,9 @@ func (s *solver) glucoseShouldRestart() bool {
 	if !s.lbdRecentFilled {
 		return false
 	}
-	recentAvg := float64(s.lbdRecentSum) / float64(glucoseWindowSize)
+	recentAvg := float64(s.lbdRecentSum) / float64(len(s.lbdRecentBuf))
 	globalAvg := float64(s.lbdGlobalSum) / float64(s.lbdGlobalCount)
-	return recentAvg*glucoseK >= globalAvg
+	return recentAvg*s.params.GlucoseK >= globalAvg
 }
 
 // restartThreshold returns the number of conflicts that must elapse
@@ -1346,12 +1357,12 @@ func (s *solver) glucoseShouldRestart() bool {
 func (s *solver) restartThreshold() int {
 	switch s.restartStrategy {
 	case RestartLuby:
-		return lubyBaseConflicts * lubyTerm(s.restartCount)
+		return s.params.LubyBaseConflicts * lubyTerm(s.restartCount)
 	case RestartPolynomial:
 		k := s.restartCount + 1
-		return polynomialBaseConflicts * k * k
+		return s.params.PolynomialBaseConflicts * k * k
 	case RestartGeometric:
-		return int(geometricBaseConflicts * math.Pow(geometricGrowthFactor, float64(s.restartCount)))
+		return int(float64(s.params.GeometricBaseConflicts) * math.Pow(s.params.GeometricGrowthFactor, float64(s.restartCount)))
 	default: // RestartNone; never actually consulted (see maybeRestart)
 		return 0
 	}
@@ -1552,7 +1563,7 @@ func (s *solver) minimizeClause(learned cnf.Clause) cnf.Clause {
 	s.minTouched = s.minTouched[:0]
 	s.minWork = 0
 
-	budget := minimizeWorkBudget(len(learned))
+	budget := s.minimizeWorkBudget(len(learned))
 	kept := learned[:1]
 	for _, lit := range learned[1:] {
 		if s.minWork > budget || s.reason[lit.Var()] == noReason || !s.literalRedundant(lit, budget) {
@@ -1679,7 +1690,7 @@ func (s *solver) backtrackTo(level int) {
 		if s.variant == SelectVarLrb {
 			if interval := s.numConflicts - s.lrbAssignedAtConflict[v]; interval > 0 {
 				r := float64(s.lrbParticipated[v]) / float64(interval)
-				s.lrbQ[v] = (1-lrbAlpha)*s.lrbQ[v] + lrbAlpha*r
+				s.lrbQ[v] = (1-s.params.LRBAlpha)*s.lrbQ[v] + s.params.LRBAlpha*r
 			}
 			s.lrbParticipated[v] = 0
 		}
@@ -1791,7 +1802,7 @@ func (s *solver) reduceClauseDatabase() {
 
 	var eligible []int
 	for idx := s.numOriginalClauses; idx < len(s.clauses); idx++ {
-		if !locked[idx] && s.clauseLBD[idx] > glueClauseLBDThreshold {
+		if !locked[idx] && s.clauseLBD[idx] > s.params.GlueClauseLBDThreshold {
 			eligible = append(eligible, idx)
 		}
 	}

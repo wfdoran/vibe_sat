@@ -7,6 +7,7 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
+	"vibe_sat/internal/params"
 )
 
 // TestRunParallelWithOneThreadMatchesRun verifies STAGE20.md/
@@ -17,10 +18,10 @@ func TestRunParallelWithOneThreadMatchesRun(t *testing.T) {
 	problem := pigeonholeProblem(4, 3)
 
 	rng1 := rand.New(rand.NewPCG(7, 7))
-	want := Run(problem, nil, SelectVarVsids, RestartPolynomial, nil, rng1, 0)
+	want := Run(problem, nil, SelectVarVsids, RestartPolynomial, nil, rng1, 0, params.Default().CDCL)
 
 	rng2 := rand.New(rand.NewPCG(7, 7))
-	got := RunParallel(problem, nil, SelectVarVsids, RestartPolynomial, nil, 1, rng2, 0)
+	got := RunParallel(problem, nil, SelectVarVsids, RestartPolynomial, nil, 1, rng2, 0, params.Default().CDCL)
 
 	if got.Satisfiable != want.Satisfiable || got.NumDecisions != want.NumDecisions || got.NumConflicts != want.NumConflicts {
 		t.Errorf("RunParallel(..., 1, ...) = %+v, want %+v (from Run)", got, want)
@@ -38,7 +39,7 @@ func TestRunParallelFindsSatisfiableFormula(t *testing.T) {
 
 	for _, numThreads := range []int{2, 4, 8, 32} {
 		rng := rand.New(rand.NewPCG(1, uint64(numThreads)))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, numThreads, rng, 0)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, numThreads, rng, 0, params.Default().CDCL)
 		if !result.Satisfiable {
 			t.Fatalf("numThreads=%d: RunParallel() reported unsatisfiable for a satisfiable formula", numThreads)
 		}
@@ -72,7 +73,7 @@ func TestRunParallelProvesUnsatisfiablePigeonhole(t *testing.T) {
 
 	for _, numThreads := range []int{2, 4, 8, 16} {
 		rng := rand.New(rand.NewPCG(9, uint64(numThreads)))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, numThreads, rng, 0)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, numThreads, rng, 0, params.Default().CDCL)
 		if result.Satisfiable {
 			t.Errorf("numThreads=%d: RunParallel() reported satisfiable for an unsatisfiable formula", numThreads)
 		}
@@ -89,7 +90,7 @@ func TestRunParallelProvesUnsatisfiableLargerPigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(6, 5)
 	rng := rand.New(rand.NewPCG(11, 13))
 
-	result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 64, rng, 0)
+	result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 64, rng, 0, params.Default().CDCL)
 
 	if result.Satisfiable {
 		t.Error("RunParallel() reported satisfiable for an unsatisfiable formula")
@@ -107,7 +108,7 @@ func TestRunParallelRespectsTimeLimit(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 5))
 	limit := time.Nanosecond
 
-	result := RunParallel(problem, &limit, SelectVarVsids, RestartRoundRobin, nil, 8, rng, 0)
+	result := RunParallel(problem, &limit, SelectVarVsids, RestartRoundRobin, nil, 8, rng, 0, params.Default().CDCL)
 
 	if !result.TimedOut {
 		t.Error("RunParallel() did not report TimedOut with a near-zero time limit")
@@ -136,7 +137,7 @@ func TestRunParallelReportsExactlyOneWinner(t *testing.T) {
 
 	for trial := 0; trial < 20; trial++ {
 		rng := rand.New(rand.NewPCG(uint64(trial), 42))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 16, rng, 0)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 16, rng, 0, params.Default().CDCL)
 		if !result.Satisfiable {
 			t.Fatalf("trial %d: RunParallel() reported unsatisfiable for a satisfiable formula", trial)
 		}
@@ -246,7 +247,7 @@ func TestExportBufferPublishOwnsItsData(t *testing.T) {
 // design here.
 func TestImportClauseSkipsAlreadyFalsifiedClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver() reported ok = false unexpectedly")
 	}
@@ -266,7 +267,7 @@ func TestImportClauseSkipsAlreadyFalsifiedClause(t *testing.T) {
 // a clause when at least two of its literals are not currently false.
 func TestImportClauseAddsLiveClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone)
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL)
 	if !ok {
 		t.Fatal("newSolver() reported ok = false unexpectedly")
 	}

@@ -97,6 +97,50 @@ that's a typo rather than intentional.
 | `dfs` | Genuine divide-and-conquer: the search tree is seeded with up to `num-threads` disjoint starting branches, explored via work-stealing between threads. |
 | `cdcl` | A portfolio design: every thread independently searches the *entire* problem; the first to reach a verdict wins. Threads continuously share learned clauses with each other. |
 
+### `--internal-params=<filename>`, `-c <filename>`
+
+Path to a JSON file of runtime-configurable internal tuning constants
+(restart-schedule bases/growth factors, LRB's alpha, the Glucose
+restart policy's K/window size, learned-clause minimization's and
+preprocessing's work-budget factors) — see
+[internal-parameters.md](internal-parameters.md) for the complete
+list and every value's default.
+
+If not given, a file named `.vibe_sat.json` in the current directory
+is used automatically if one exists; otherwise every parameter keeps
+its built-in default. A parameter the file doesn't mention also keeps
+its default — only the values you actually want to override need to
+be present. Loading a config file (whether from this flag or the
+implicit `.vibe_sat.json`) is announced at `--verbose=1` or higher.
+An explicit `--internal-params` path that doesn't exist or can't be
+parsed is an error (`vibe_sat` exits rather than silently falling
+back to defaults).
+
+### `--reset-internal-params`, `-q`
+
+Write the file `--internal-params` would otherwise read from (the
+given path, or `.vibe_sat.json` in the current directory if
+`--internal-params` isn't given) populated with every internal
+parameter's current built-in default, then exit — without requiring
+`--input` or `--algorithm`. Intended as a starting point to hand-edit:
+run this once, then change only the values you want different from
+the defaults it just wrote.
+
+```
+$ vibe_sat --reset-internal-params
+$ cat .vibe_sat.json
+{
+  "cdcl": {
+    "lubyBaseConflicts": 100,
+    ...
+  },
+  "preprocess": {
+    "subsumptionWorkBudgetFactor": 64,
+    "bveWorkBudgetFactor": 2000
+  }
+}
+```
+
 ### `--help`, `-h`
 
 Print the built-in help text and exit.

@@ -51,6 +51,9 @@ struct RawArgs {
 
     #[arg(long = "num-threads", short = 'z', default_value_t = 1)]
     num_threads: usize,
+
+    #[arg(long = "internal-params", short = 'c')]
+    internal_params_path: Option<String>,
 }
 
 /// Command line arguments accepted by vibe_sat, after
@@ -111,6 +114,16 @@ pub struct Args {
     /// allowed (oversubscription); `main` prints a one-line warning at
     /// `--verbose >= 1` if it looks large enough to be unintentional.
     pub num_threads: usize,
+
+    /// `--internal-params`/`-c` (STAGE39.md): an explicit path to a
+    /// `.vibe_sat.json`-shaped file of runtime-configurable internal
+    /// tuning parameters (see the `params` module). If given, it is
+    /// always used -- and a missing or invalid file at this path is
+    /// always a hard error, never a silent fallback to the built-in
+    /// defaults. If not given, `.vibe_sat.json` in the current
+    /// directory is used if it exists, else the built-in defaults are
+    /// used; see [`params::resolve`].
+    pub internal_params_path: Option<String>,
 }
 
 /// Returns true if `argv` contains a `--help` or `-h` token anywhere.
@@ -120,6 +133,63 @@ pub struct Args {
 /// missing or invalid.
 pub fn wants_help(argv: &[String]) -> bool {
     argv.iter().any(|a| a == "--help" || a == "-h")
+}
+
+/// Returns true if `argv` contains a `--reset-internal-params` or `-q`
+/// token anywhere (STAGE39.md). Checked by `main` before attempting to
+/// parse the rest of the command line, exactly like [`wants_help`]: in
+/// clap's derive, `Args::input`/`Args::algorithm` are required fields,
+/// so `RawArgs::try_parse_from` refuses to return anything at all when
+/// they're missing -- there is no later point (mirroring Go's
+/// `validate()`, which runs after tokenizing) where a `ResetInternalParams`-
+/// style flag could still bypass that requirement. Scanning `argv`
+/// directly, before any parsing is attempted, sidesteps this
+/// entirely, matching `--help`'s own precedent exactly.
+pub fn wants_reset_internal_params(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|a| a == "--reset-internal-params" || a == "-q")
+}
+
+/// Extracts `--internal-params`/`-c`'s value from `argv`, if present.
+/// Used alongside [`wants_reset_internal_params`] to find
+/// `--reset-internal-params`'s target file: that whole codepath
+/// bypasses [`Args::parse_from_args`] (see [`wants_reset_internal_params`]'s
+/// doc comment), so it never gets a chance to populate
+/// `Args::internal_params_path` the normal way. Recognizes exactly the
+/// `--internal-params=<path>`, `--internal-params <path>`, and
+/// `-c <path>` forms clap itself accepts for this flag.
+pub fn extract_internal_params_path(argv: &[String]) -> Option<String> {
+    let mut iter = argv.iter();
+    while let Some(a) = iter.next() {
+        if let Some(v) = a.strip_prefix("--internal-params=") {
+            return Some(v.to_string());
+        }
+        if a == "--internal-params" || a == "-c" {
+            return iter.next().cloned();
+        }
+    }
+    None
+}
+
+/// Extracts `--verbose`/`-v`'s value from `argv`, defaulting to 0 if
+/// absent. Used alongside [`wants_reset_internal_params`] for the same
+/// reason as [`extract_internal_params_path`]: `--reset-internal-params`
+/// bypasses [`Args::parse_from_args`] entirely, so `Args::verbose`
+/// itself is never populated on that path, even though
+/// `--reset-internal-params`'s own "wrote default internal parameters
+/// to ..." announcement is still meant to respect `--verbose >= 1`
+/// like every other progress message.
+pub fn extract_verbose(argv: &[String]) -> i32 {
+    let mut iter = argv.iter();
+    while let Some(a) = iter.next() {
+        if let Some(v) = a.strip_prefix("--verbose=") {
+            return v.parse().unwrap_or(0);
+        }
+        if a == "--verbose" || a == "-v" {
+            return iter.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    0
 }
 
 /// Returns the full usage text printed when vibe_sat is invoked with
@@ -321,6 +391,29 @@ Options:
         is printed at --verbose=1 or higher if --num-threads is at
         least twice the core count, in case that's unintentional.
 
+  --internal-params=<filename>, -c <filename>
+        Read runtime-configurable internal tuning parameters (restart
+        base conflict counts, activity decay rates, the Glucose
+        restart window/threshold, work-budget factors, and similar
+        search-heuristic constants; STAGE39.md) from <filename>, a
+        JSON file shaped like the one --reset-internal-params writes.
+        Any field the file omits keeps its built-in default value. If
+        this flag is not given, vibe_sat looks for a file named
+        ".vibe_sat.json" in the current directory and uses it if
+        present; otherwise every parameter uses its built-in default.
+        Unlike the implicit ".vibe_sat.json" lookup, a file named
+        explicitly via this flag that does not exist, or is not valid
+        JSON, is always a hard error -- never a silent fallback to
+        defaults.
+
+  --reset-internal-params, -q
+        Write the built-in default internal tuning parameters to
+        ".vibe_sat.json" in the current directory (or to the file
+        named by --internal-params/-c, if given), then exit
+        immediately, without requiring --input or --algorithm. Intended
+        as a starting point: run this once, then edit the resulting
+        file's values before using --internal-params to try them.
+
   --help, -h
         Print this help message and exit.
 "#
@@ -408,6 +501,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         no_preprocessing: raw.no_preprocessing,
         memory_limit_bytes,
         num_threads: raw.num_threads,
+        internal_params_path: raw.internal_params_path,
     })
 }
 
@@ -1195,6 +1289,10 @@ mod tests {
             "-p",
             "--no-preprocessing",
             "-x",
+            "--internal-params",
+            "-c",
+            "--reset-internal-params",
+            "-q",
             "--help",
             "-h",
         ] {
@@ -1222,6 +1320,120 @@ mod tests {
         argv.push("-x");
         let args = Args::parse_from_args(argv).expect("expected successful parse");
         assert!(args.no_preprocessing);
+    }
+
+    #[test]
+    fn test_wants_reset_internal_params_long_form() {
+        assert!(wants_reset_internal_params(&[
+            "vibe_sat".to_string(),
+            "--reset-internal-params".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_wants_reset_internal_params_short_form() {
+        assert!(wants_reset_internal_params(&[
+            "vibe_sat".to_string(),
+            "-q".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_wants_reset_internal_params_false_without_flag() {
+        assert!(!wants_reset_internal_params(&[
+            "vibe_sat".to_string(),
+            "--input=problem.cnf".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_reset_internal_params_bypasses_missing_required_args() {
+        // Unlike a normal parse, --reset-internal-params must not
+        // require --input/--algorithm at all -- but that's enforced by
+        // main() checking wants_reset_internal_params before ever
+        // calling Args::parse_from_args, not by anything in this
+        // module's own parsing, so there is nothing to assert about
+        // Args::parse_from_args here; this test just documents that
+        // wants_reset_internal_params itself doesn't care what else is
+        // (or isn't) in argv.
+        assert!(wants_reset_internal_params(&[
+            "vibe_sat".to_string(),
+            "--reset-internal-params".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn test_extract_internal_params_path_long_form_equals() {
+        assert_eq!(
+            extract_internal_params_path(&[
+                "vibe_sat".to_string(),
+                "--internal-params=custom.json".to_string(),
+            ]),
+            Some("custom.json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_internal_params_path_long_form_space() {
+        assert_eq!(
+            extract_internal_params_path(&[
+                "vibe_sat".to_string(),
+                "--internal-params".to_string(),
+                "custom.json".to_string(),
+            ]),
+            Some("custom.json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_internal_params_path_short_form() {
+        assert_eq!(
+            extract_internal_params_path(&[
+                "vibe_sat".to_string(),
+                "-c".to_string(),
+                "custom.json".to_string(),
+            ]),
+            Some("custom.json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_internal_params_path_absent() {
+        assert_eq!(
+            extract_internal_params_path(&["vibe_sat".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_verbose_present() {
+        assert_eq!(
+            extract_verbose(&["vibe_sat".to_string(), "-v".to_string(), "2".to_string(),]),
+            2
+        );
+        assert_eq!(
+            extract_verbose(&["vibe_sat".to_string(), "--verbose=3".to_string()]),
+            3
+        );
+    }
+
+    #[test]
+    fn test_extract_verbose_absent_defaults_to_zero() {
+        assert_eq!(extract_verbose(&["vibe_sat".to_string()]), 0);
+    }
+
+    #[test]
+    fn test_parse_internal_params_flag() {
+        let mut argv = base_hc_args();
+        argv.push("--internal-params=custom.json");
+        let args = Args::parse_from_args(argv).expect("expected successful parse");
+        assert_eq!(args.internal_params_path, Some("custom.json".to_string()));
+    }
+
+    #[test]
+    fn test_parse_internal_params_flag_absent_is_none() {
+        let args = Args::parse_from_args(base_hc_args()).expect("expected successful parse");
+        assert_eq!(args.internal_params_path, None);
     }
 
     #[test]

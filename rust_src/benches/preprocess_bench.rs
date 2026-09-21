@@ -19,6 +19,7 @@
 use std::time::Instant;
 
 use vibe_sat::cnf::read_dimacs;
+use vibe_sat::params;
 use vibe_sat::preprocess;
 
 fn main() {
@@ -26,10 +27,10 @@ fn main() {
     let problem = read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
     let start = Instant::now();
-    preprocess::run(&problem, 0, 1);
+    preprocess::run(&problem, 0, 1, params::default().preprocess);
     println!("BenchmarkRunHard: {:?}", start.elapsed());
 
     let start = Instant::now();
-    preprocess::run(&problem, 0, 8);
+    preprocess::run(&problem, 0, 8, params::default().preprocess);
     println!("BenchmarkRunHardParallel8: {:?}", start.elapsed());
 }

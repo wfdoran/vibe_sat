@@ -171,6 +171,7 @@ use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
 use crate::dfs::{select_var, select_var_fast_pick};
 use crate::occurrence::{self, Lists};
+use crate::params;
 use crate::preprocess;
 
 mod clause_share;
@@ -279,53 +280,57 @@ fn resolve_restart_strategy(
     }
 }
 
-/// `LUBY_BASE_CONFLICTS` and `POLYNOMIAL_BASE_CONFLICTS` are
-/// STAGE15.md's "b" and "a": the scale constants for the Luby and
-/// polynomial restart sequences respectively (see
-/// [`restart_threshold`]), expressed in conflicts (see the module doc
-/// comment for why conflicts, not decisions, is the chosen restart
-/// statistic). Both are internal parameters, not exposed via
-/// `--alg-params`, per STAGE15.md's explicit instruction that they're
-/// meant to be optimized later instead.
-///
-/// `LUBY_BASE_CONFLICTS` uses MiniSat's own default Luby restart base
-/// (its `-rfirst` option, 100 conflicts) -- a genuinely standard
-/// value in the literature/practice, inherited unchanged by most
-/// MiniSat-lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly
-/// the kind of standard STAGE15.md asks to prefer when one exists.
-///
-/// `POLYNOMIAL_BASE_CONFLICTS` has no such standard to inherit: the
-/// quadratic sequence STAGE15.md originally specified under the name
-/// "geometric" growth (a*k^2) is not itself a geometric sequence (see
-/// the module doc comment), so no standard constant applies to this
-/// exact formula. Per STAGE15.md's fallback instruction, this is
-/// instead picked empirically to be about one second of work on this
-/// project's own uf250/uuf250 benchmark sample: measured at
-/// ~17,300-18,900 conflicts/second across ten sampled instances (five
-/// uf250-1065, five uuf250-1065) under this project's current default
-/// `cdcl` configuration (VSIDS + phase saving), rounded to 18000.
-///
-/// `GEOMETRIC_BASE_CONFLICTS` and `GEOMETRIC_GROWTH_FACTOR` are "c"
-/// and "r" for the true geometric schedule (`RestartStrategy::Geometric`):
-/// the restart interval starts at c conflicts and is multiplied by r
-/// after every restart. Unlike `POLYNOMIAL_BASE_CONFLICTS`, a standard
-/// pairing of these two constants does exist in the literature:
-/// MiniSat 1.13/1.14's geometric restart scheme (the scheme Luby
-/// restarts later replaced as MiniSat's default) used a base restart
-/// interval of 100 conflicts -- the same "rfirst" constant reused
-/// here as `LUBY_BASE_CONFLICTS` -- and a growth factor of 1.5. That
-/// 1.5 was itself a practical (not theoretical) choice: a value a bit
-/// below the golden ratio (~1.618), the same growth-factor reasoning
-/// used when picking dynamic array growth factors to allow memory
-/// reuse (a factor at or above the golden ratio can never reuse
-/// previously freed memory as it grows). Per STAGE15.md's preference
-/// for a standard value when one exists, both constants are taken
-/// from that standard MiniSat pairing rather than re-derived
-/// empirically.
-const LUBY_BASE_CONFLICTS: usize = 100;
-const POLYNOMIAL_BASE_CONFLICTS: usize = 18000;
-const GEOMETRIC_BASE_CONFLICTS: usize = LUBY_BASE_CONFLICTS;
-const GEOMETRIC_GROWTH_FACTOR: f64 = 1.5;
+// `LUBY_BASE_CONFLICTS` and `POLYNOMIAL_BASE_CONFLICTS` are
+// STAGE15.md's "b" and "a": the scale constants for the Luby and
+// polynomial restart sequences respectively (see
+// [`restart_threshold`]), expressed in conflicts (see the module doc
+// comment for why conflicts, not decisions, is the chosen restart
+// statistic). Both are internal parameters, not exposed via
+// `--alg-params`, per STAGE15.md's explicit instruction that they're
+// meant to be optimized later instead.
+//
+// `LUBY_BASE_CONFLICTS` uses MiniSat's own default Luby restart base
+// (its `-rfirst` option, 100 conflicts) -- a genuinely standard
+// value in the literature/practice, inherited unchanged by most
+// MiniSat-lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly
+// the kind of standard STAGE15.md asks to prefer when one exists.
+//
+// `POLYNOMIAL_BASE_CONFLICTS` has no such standard to inherit: the
+// quadratic sequence STAGE15.md originally specified under the name
+// "geometric" growth (a*k^2) is not itself a geometric sequence (see
+// the module doc comment), so no standard constant applies to this
+// exact formula. Per STAGE15.md's fallback instruction, this is
+// instead picked empirically to be about one second of work on this
+// project's own uf250/uuf250 benchmark sample: measured at
+// ~17,300-18,900 conflicts/second across ten sampled instances (five
+// uf250-1065, five uuf250-1065) under this project's current default
+// `cdcl` configuration (VSIDS + phase saving), rounded to 18000.
+//
+// `GEOMETRIC_BASE_CONFLICTS` and `GEOMETRIC_GROWTH_FACTOR` are "c"
+// and "r" for the true geometric schedule (`RestartStrategy::Geometric`):
+// the restart interval starts at c conflicts and is multiplied by r
+// after every restart. Unlike `POLYNOMIAL_BASE_CONFLICTS`, a standard
+// pairing of these two constants does exist in the literature:
+// MiniSat 1.13/1.14's geometric restart scheme (the scheme Luby
+// restarts later replaced as MiniSat's default) used a base restart
+// interval of 100 conflicts -- the same "rfirst" constant reused
+// here as `LUBY_BASE_CONFLICTS` -- and a growth factor of 1.5. That
+// 1.5 was itself a practical (not theoretical) choice: a value a bit
+// below the golden ratio (~1.618), the same growth-factor reasoning
+// used when picking dynamic array growth factors to allow memory
+// reuse (a factor at or above the golden ratio can never reuse
+// previously freed memory as it grows). Per STAGE15.md's preference
+// for a standard value when one exists, both constants are taken
+// from that standard MiniSat pairing rather than re-derived
+// empirically.
+//
+// STAGE39.md: all four of these moved from compile-time constants to
+// runtime-configurable fields on [`params::Cdcl`]
+// (`luby_base_conflicts`, `polynomial_base_conflicts`,
+// `geometric_base_conflicts`, `geometric_growth_factor`), so they can
+// be experimented with via `.vibe_sat.json` without a rebuild; the
+// values described above are exactly [`params::default`]'s values for
+// these fields, unchanged by the migration.
 
 /// Returns the i-th term (0-indexed) of the Luby, Sinclair & Zuckerman
 /// restart sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, ...
@@ -371,16 +376,20 @@ fn luby_term(i: usize) -> usize {
 /// and with constant ratio "r" between consecutive terms. Truncated
 /// (rather than rounded) to a `usize`, matching MiniSat's own
 /// geometric restart implementation.
-fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) -> usize {
+fn restart_threshold(
+    restart_strategy: RestartStrategy,
+    restart_count: usize,
+    p: &params::Cdcl,
+) -> usize {
     match restart_strategy {
-        RestartStrategy::Luby => LUBY_BASE_CONFLICTS * luby_term(restart_count),
+        RestartStrategy::Luby => p.luby_base_conflicts * luby_term(restart_count),
         RestartStrategy::Polynomial => {
             let k = restart_count + 1;
-            POLYNOMIAL_BASE_CONFLICTS * k * k
+            p.polynomial_base_conflicts * k * k
         }
         RestartStrategy::Geometric => {
-            (GEOMETRIC_BASE_CONFLICTS as f64 * GEOMETRIC_GROWTH_FACTOR.powi(restart_count as i32))
-                as usize
+            (p.geometric_base_conflicts as f64
+                * p.geometric_growth_factor.powi(restart_count as i32)) as usize
         }
         RestartStrategy::None => 0, // never actually consulted (see maybe_restart)
         // Never actually reaches a real solver: run/run_parallel
@@ -394,45 +403,49 @@ fn restart_threshold(restart_strategy: RestartStrategy, restart_count: usize) ->
     }
 }
 
-/// STAGE34.md: `GLUE_CLAUSE_LBD_THRESHOLD` is the LBD at or below
-/// which a learned clause is a "glue clause" -- protected from
-/// [`reduce_clause_database`] regardless of activity. `GLUCOSE_K` and
-/// `GLUCOSE_WINDOW_SIZE` are Glucose's own restart policy's parameters
-/// (see [`glucose_should_restart`]).
-///
-/// `GLUCOSE_WINDOW_SIZE` keeps Glucose's own originally published
-/// value (50): a benchmark sweep (STAGE35.md; see
-/// `reports/REPORT35.md`) tried 30 and 100 against it and found
-/// neither a clear win -- 30 solved fewer instances outright, 100 was
-/// a statistical wash -- so there was no real evidence to move off the
-/// literature default.
-///
-/// `GLUCOSE_K` does NOT keep Glucose's own value (0.8): the same
-/// sweep found 0.6 solving as many or more instances as 0.8 while
-/// roughly halving mean solve time among those solved (2.44s/2.18s
-/// vs. 3.27s/2.93s Go/Rust on the report's 52-file sample), a real,
-/// measured win rather than a rounding-error difference -- restarting
-/// less often than Glucose's own default suggests turned out to
-/// matter on this project's own benchmark mix, matching the pattern
-/// already found for VSIDS-over-LRB (`reports/REPORT13.md`) and
-/// polynomial-over-Luby (`reports/REPORT15.md`): trust this project's
-/// own measurement over a technique's published default once they
-/// disagree.
-const GLUE_CLAUSE_LBD_THRESHOLD: usize = 2;
-const GLUCOSE_WINDOW_SIZE: usize = 50;
-const GLUCOSE_K: f64 = 0.6;
+// STAGE34.md: `GLUE_CLAUSE_LBD_THRESHOLD` is the LBD at or below
+// which a learned clause is a "glue clause" -- protected from
+// [`reduce_clause_database`] regardless of activity. `GLUCOSE_K` and
+// `GLUCOSE_WINDOW_SIZE` are Glucose's own restart policy's parameters
+// (see [`glucose_should_restart`]).
+//
+// `GLUCOSE_WINDOW_SIZE` keeps Glucose's own originally published
+// value (50): a benchmark sweep (STAGE35.md; see
+// `reports/REPORT35.md`) tried 30 and 100 against it and found
+// neither a clear win -- 30 solved fewer instances outright, 100 was
+// a statistical wash -- so there was no real evidence to move off the
+// literature default.
+//
+// `GLUCOSE_K` does NOT keep Glucose's own value (0.8): the same
+// sweep found 0.6 solving as many or more instances as 0.8 while
+// roughly halving mean solve time among those solved (2.44s/2.18s
+// vs. 3.27s/2.93s Go/Rust on the report's 52-file sample), a real,
+// measured win rather than a rounding-error difference -- restarting
+// less often than Glucose's own default suggests turned out to
+// matter on this project's own benchmark mix, matching the pattern
+// already found for VSIDS-over-LRB (`reports/REPORT13.md`) and
+// polynomial-over-Luby (`reports/REPORT15.md`): trust this project's
+// own measurement over a technique's published default once they
+// disagree.
+// STAGE39.md: `GLUE_CLAUSE_LBD_THRESHOLD`, `GLUCOSE_WINDOW_SIZE`, and
+// `GLUCOSE_K` all moved from compile-time constants to
+// runtime-configurable fields on [`params::Cdcl`]
+// (`glue_clause_lbd_threshold`, `glucose_window_size`, `glucose_k`);
+// the values described above are exactly [`params::default`]'s values
+// for these fields, unchanged by the migration.
 
-/// STAGE34.md's Glucose-restart bookkeeping: a fixed-size ring buffer
-/// of the last `GLUCOSE_WINDOW_SIZE` learned clauses' LBDs (kept as an
-/// incrementally-updated sum, so [`record_lbd`] is O(1) regardless of
-/// window size) alongside an all-time running sum/count -- never
-/// reset, including across restarts, since restarts don't erase
-/// learned clauses or their LBDs either. Allocated unconditionally
-/// (cheap: one `[usize; 50]` plus four scalars) but only ever
-/// consulted when `restart_strategy` is actually
-/// `RestartStrategy::Glucose`.
+/// STAGE34.md's Glucose-restart bookkeeping: a ring buffer (STAGE39.md:
+/// `Vec`, sized at construction time to the runtime-configurable
+/// `glucose_window_size` -- was a fixed-size array when that was a
+/// compile-time constant) of the most recent learned clauses' LBDs
+/// (kept as an incrementally-updated sum, so [`record_lbd`] is O(1)
+/// regardless of window size) alongside an all-time running sum/count
+/// -- never reset, including across restarts, since restarts don't
+/// erase learned clauses or their LBDs either. Allocated
+/// unconditionally (cheap) but only ever consulted when
+/// `restart_strategy` is actually `RestartStrategy::Glucose`.
 struct GlucoseState {
-    recent_buf: [usize; GLUCOSE_WINDOW_SIZE],
+    recent_buf: Vec<usize>,
     recent_pos: usize,
     recent_sum: usize,
     recent_filled: bool,
@@ -441,9 +454,9 @@ struct GlucoseState {
 }
 
 impl GlucoseState {
-    fn new() -> Self {
+    fn new(window_size: usize) -> Self {
         Self {
-            recent_buf: [0; GLUCOSE_WINDOW_SIZE],
+            recent_buf: vec![0; window_size],
             recent_pos: 0,
             recent_sum: 0,
             recent_filled: false,
@@ -463,7 +476,7 @@ fn record_lbd(glucose: &mut GlucoseState, lbd: usize) {
     glucose.recent_buf[glucose.recent_pos] = lbd;
     glucose.recent_sum += lbd;
     glucose.recent_pos += 1;
-    if glucose.recent_pos == GLUCOSE_WINDOW_SIZE {
+    if glucose.recent_pos == glucose.recent_buf.len() {
         glucose.recent_pos = 0;
         glucose.recent_filled = true;
     }
@@ -483,13 +496,13 @@ fn record_lbd(glucose: &mut GlucoseState, lbd: usize) {
 /// triggering, both because the ring buffer isn't a meaningful
 /// average until then and because `global_count` must be positive to
 /// divide by.
-fn glucose_should_restart(glucose: &GlucoseState) -> bool {
+fn glucose_should_restart(glucose: &GlucoseState, glucose_k: f64) -> bool {
     if !glucose.recent_filled {
         return false;
     }
-    let recent_avg = glucose.recent_sum as f64 / GLUCOSE_WINDOW_SIZE as f64;
+    let recent_avg = glucose.recent_sum as f64 / glucose.recent_buf.len() as f64;
     let global_avg = glucose.global_sum as f64 / glucose.global_count as f64;
-    recent_avg * GLUCOSE_K >= global_avg
+    recent_avg * glucose_k >= global_avg
 }
 
 /// Implements STAGE15.md's restart schedules (see the module doc
@@ -542,6 +555,7 @@ fn maybe_restart(
     lrb: &mut LrbState,
     saved_phase: &mut [Value],
     glucose: &GlucoseState,
+    p: &params::Cdcl,
 ) {
     if restart_strategy == RestartStrategy::None {
         return;
@@ -550,10 +564,10 @@ fn maybe_restart(
         return;
     }
     if restart_strategy == RestartStrategy::Glucose {
-        if !glucose_should_restart(glucose) {
+        if !glucose_should_restart(glucose, p.glucose_k) {
             return;
         }
-    } else if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count) {
+    } else if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count, p) {
         return;
     }
     backtrack_to(
@@ -567,26 +581,33 @@ fn maybe_restart(
         num_conflicts,
         lrb,
         saved_phase,
+        p.lrb_alpha,
     );
     *conflicts_since_restart = 0;
     *restart_count += 1;
 }
 
-/// `VAR_ACTIVITY_DECAY` is `SelectVarVariant::Vsids`'s per-variable
-/// analogue of `CLAUSE_ACTIVITY_DECAY` (see [`VsidsState`]); VSIDS
-/// conventionally decays faster than clause activity does (MiniSat's
-/// own defaults: 0.95 for variables, 0.999 for clauses), which is why
-/// this is a separate constant rather than reusing
-/// `CLAUSE_ACTIVITY_DECAY`.
-const VAR_ACTIVITY_DECAY: f64 = 0.95;
+// `VAR_ACTIVITY_DECAY` is `SelectVarVariant::Vsids`'s per-variable
+// analogue of `CLAUSE_ACTIVITY_DECAY` (see [`VsidsState`]); VSIDS
+// conventionally decays faster than clause activity does (MiniSat's
+// own defaults: 0.95 for variables, 0.999 for clauses), which is why
+// this is a separate constant rather than reusing
+// `CLAUSE_ACTIVITY_DECAY`.
+//
+// STAGE39.md: moved to [`params::Cdcl::var_activity_decay`]
+// (runtime-configurable); the value above is
+// [`params::default`]'s value for it, unchanged.
 
-/// `LRB_ALPHA` is the fixed learning-rate weight `SelectVarVariant::Lrb`
-/// uses when updating a variable's Q-value (see [`backtrack_to`]'s doc
-/// comment): the paper anneals this over the course of the search,
-/// starting high and decaying toward a floor; this implementation
-/// keeps it fixed at a value from within that range instead, as a
-/// documented simplification (see the module doc comment).
-const LRB_ALPHA: f64 = 0.4;
+// The fixed learning-rate weight `SelectVarVariant::Lrb` uses when
+// updating a variable's Q-value (see [`backtrack_to`]'s doc comment):
+// the paper anneals this over the course of the search, starting high
+// and decaying toward a floor; this implementation keeps it fixed at
+// a value from within that range instead, as a documented
+// simplification (see the module doc comment).
+//
+// STAGE39.md: moved to [`params::Cdcl::lrb_alpha`]
+// (runtime-configurable); 0.4, the value named above, is
+// [`params::default`]'s value for it, unchanged.
 
 /// Per-variable VSIDS bookkeeping (`SelectVarVariant::Vsids` only):
 /// `activity[v]` is bumped by `increment` every time variable `v` is
@@ -678,7 +699,14 @@ const PER_CLAUSE_OVERHEAD_BYTES: i64 = 40;
 /// clause's activity and the increment itself are divided back down
 /// by the same factor, to stay well within f64's range over a very
 /// long run.
-const CLAUSE_ACTIVITY_DECAY: f64 = 0.999;
+///
+/// STAGE39.md: `CLAUSE_ACTIVITY_DECAY` moved to
+/// [`params::Cdcl::clause_activity_decay`] (runtime-configurable;
+/// 0.999, named above, is [`params::default`]'s value, unchanged).
+/// `ACTIVITY_RESCALE_THRESHOLD` stays a plain compile-time constant --
+/// it is a structural numerical-stability safety cap (keeping
+/// activities well within f64's range), never a search-quality tuning
+/// knob, so there is no reason to expose it via `.vibe_sat.json`.
 const ACTIVITY_RESCALE_THRESHOLD: f64 = 1e100;
 
 /// Estimates `clause`'s contribution to the clause database's memory
@@ -730,6 +758,7 @@ pub fn run<R: Rng>(
     memory_limit_bytes: Option<i64>,
     rng: &mut R,
     verbose: i32,
+    p: &params::Cdcl,
 ) -> SolveResult {
     if verbose >= 1 {
         println!(
@@ -748,6 +777,7 @@ pub fn run<R: Rng>(
         None,
         None,
         &[],
+        p,
     );
     if verbose >= 1 {
         println!("{}", verdict(&result));
@@ -802,6 +832,7 @@ pub fn run_parallel<R: Rng>(
     num_threads: usize,
     rng: &mut R,
     verbose: i32,
+    p: &params::Cdcl,
 ) -> SolveResult {
     if num_threads <= 1 {
         return run(
@@ -812,6 +843,7 @@ pub fn run_parallel<R: Rng>(
             memory_limit_bytes,
             rng,
             verbose,
+            p,
         );
     }
 
@@ -876,6 +908,7 @@ pub fn run_parallel<R: Rng>(
                         Some(stop),
                         Some(export),
                         peers,
+                        p,
                     );
                     if !result.timed_out
                         && stop
@@ -988,6 +1021,7 @@ fn run_loop<R: Rng>(
     stop: Option<&AtomicBool>,
     export: Option<&ExportBuffer>,
     peers: &[&ExportBuffer],
+    p: &params::Cdcl,
 ) -> SolveResult {
     // STAGE35.md: captured before bootstrap's, not after -- see the
     // module doc comment's time-check paragraph (reports/REPORT35.md)
@@ -1056,7 +1090,7 @@ fn run_loop<R: Rng>(
     // for it.
     let mut clause_lbd = vec![0usize; num_original_clauses];
     let mut lbd_scratch: Vec<usize> = Vec::new();
-    let mut glucose = GlucoseState::new();
+    let mut glucose = GlucoseState::new(p.glucose_window_size);
 
     // STAGE36.md: minimize_clause's own scratch space (see
     // literal_redundant and MIN_UNDEF/MIN_REMOVABLE/MIN_FAILED).
@@ -1181,6 +1215,7 @@ fn run_loop<R: Rng>(
                 &mut min_touched,
                 &mut min_stack,
                 &mut min_work,
+                p.minimize_work_budget_factor,
             );
             record_lbd(&mut glucose, lbd);
             backtrack_to(
@@ -1194,6 +1229,7 @@ fn run_loop<R: Rng>(
                 num_conflicts,
                 &mut lrb,
                 &mut saved_phase,
+                p.lrb_alpha,
             );
             let new_clause = add_learned_clause(
                 &learned,
@@ -1237,7 +1273,7 @@ fn run_loop<R: Rng>(
             // grow the increment so future activity bumps count for
             // relatively more than past ones -- the O(1) equivalent of
             // decaying every clause's activity individually.
-            clause_activity_increment /= CLAUSE_ACTIVITY_DECAY;
+            clause_activity_increment /= p.clause_activity_decay;
             if clause_activity_increment > ACTIVITY_RESCALE_THRESHOLD {
                 for a in clause_activity.iter_mut() {
                     *a /= ACTIVITY_RESCALE_THRESHOLD;
@@ -1245,7 +1281,7 @@ fn run_loop<R: Rng>(
                 clause_activity_increment /= ACTIVITY_RESCALE_THRESHOLD;
             }
             if variant == SelectVarVariant::Vsids {
-                vsids.increment /= VAR_ACTIVITY_DECAY;
+                vsids.increment /= p.var_activity_decay;
                 if vsids.increment > ACTIVITY_RESCALE_THRESHOLD {
                     for a in vsids.activity.iter_mut() {
                         *a /= ACTIVITY_RESCALE_THRESHOLD;
@@ -1267,6 +1303,7 @@ fn run_loop<R: Rng>(
                     &x,
                     &mut reason,
                     num_original_clauses,
+                    p.glue_clause_lbd_threshold,
                 );
             }
 
@@ -1304,6 +1341,7 @@ fn run_loop<R: Rng>(
                 &mut lrb,
                 &mut saved_phase,
                 &glucose,
+                p,
             );
             continue;
         }
@@ -1540,17 +1578,20 @@ const MIN_UNDEF: u8 = 0;
 const MIN_REMOVABLE: u8 = 1;
 const MIN_FAILED: u8 = 2;
 
-/// `MINIMIZE_WORK_BUDGET_FACTOR` scales [`minimize_clause`]'s hard cap
-/// on total reason-clause literals examined across one call (see
-/// [`minimize_work_budget`]): STAGE36.md explicitly asked for a bound
-/// close to O(n log n) in the size of the learned clause, and for an
-/// absolute limit "just in case," matching the same concern that drove
-/// Stage 30/31's subsumption/BVE work budgets. 20 was chosen the same
-/// way those were: generous enough that it is never observed to
-/// trigger on this project's own benchmark set (see
-/// `reports/REPORT36.md`), while still being a real, finite cap rather
-/// than no cap at all.
-const MINIMIZE_WORK_BUDGET_FACTOR: usize = 20;
+// `MINIMIZE_WORK_BUDGET_FACTOR` scales [`minimize_clause`]'s hard cap
+// on total reason-clause literals examined across one call (see
+// [`minimize_work_budget`]): STAGE36.md explicitly asked for a bound
+// close to O(n log n) in the size of the learned clause, and for an
+// absolute limit "just in case," matching the same concern that drove
+// Stage 30/31's subsumption/BVE work budgets. 20 was chosen the same
+// way those were: generous enough that it is never observed to
+// trigger on this project's own benchmark set (see
+// `reports/REPORT36.md`), while still being a real, finite cap rather
+// than no cap at all.
+//
+// STAGE39.md: moved to [`params::Cdcl::minimize_work_budget_factor`]
+// (runtime-configurable); 20, named above, is [`params::default`]'s
+// value for it, unchanged.
 
 /// Returns the total number of reason-clause literals
 /// [`minimize_clause`] may examine (summed across every candidate
@@ -1560,9 +1601,9 @@ const MINIMIZE_WORK_BUDGET_FACTOR: usize = 20;
 /// approximation of `log2(n)+1` -- already this project's convention
 /// for "a log-shaped bound" (see e.g. `luby_term`'s own iterative
 /// doubling).
-fn minimize_work_budget(n: usize) -> usize {
+fn minimize_work_budget(n: usize, work_budget_factor: usize) -> usize {
     let bits_len = (usize::BITS - n.leading_zeros()) as usize;
-    MINIMIZE_WORK_BUDGET_FACTOR * n * (bits_len + 1)
+    work_budget_factor * n * (bits_len + 1)
 }
 
 /// One entry in [`literal_redundant`]'s explicit, iterative-DFS stack:
@@ -1607,6 +1648,7 @@ fn minimize_clause(
     min_touched: &mut Vec<usize>,
     min_stack: &mut Vec<MinimizeFrame>,
     min_work: &mut usize,
+    work_budget_factor: usize,
 ) -> Clause {
     for &v in min_touched.iter() {
         min_state[v] = MIN_UNDEF;
@@ -1614,7 +1656,7 @@ fn minimize_clause(
     min_touched.clear();
     *min_work = 0;
 
-    let budget = minimize_work_budget(learned.len());
+    let budget = minimize_work_budget(learned.len(), work_budget_factor);
     let mut kept = Vec::with_capacity(learned.len());
     kept.push(learned[0]);
     for &lit in &learned[1..] {
@@ -1801,6 +1843,7 @@ fn analyze(
     min_touched: &mut Vec<usize>,
     min_stack: &mut Vec<MinimizeFrame>,
     min_work: &mut usize,
+    minimize_work_budget_factor: usize,
 ) -> (Clause, usize, usize) {
     for s in seen.iter_mut() {
         *s = false;
@@ -1870,6 +1913,7 @@ fn analyze(
         min_touched,
         min_stack,
         min_work,
+        minimize_work_budget_factor,
     );
 
     let mut backtrack_level = 0;
@@ -1959,6 +2003,7 @@ fn backtrack_to(
     num_conflicts: usize,
     lrb: &mut LrbState,
     saved_phase: &mut [Value],
+    lrb_alpha: f64,
 ) {
     let cut = trail_lim[level_target + 1];
     for &v in &trail[cut..] {
@@ -1966,7 +2011,7 @@ fn backtrack_to(
             let interval = num_conflicts - lrb.assigned_at_conflict[v];
             if interval > 0 {
                 let r = lrb.participated[v] as f64 / interval as f64;
-                lrb.q[v] = (1.0 - LRB_ALPHA) * lrb.q[v] + LRB_ALPHA * r;
+                lrb.q[v] = (1.0 - lrb_alpha) * lrb.q[v] + lrb_alpha * r;
             }
             lrb.participated[v] = 0;
         }
@@ -2080,6 +2125,7 @@ fn reduce_clause_database(
     x: &Assignment,
     reason: &mut [Option<usize>],
     num_original_clauses: usize,
+    glue_clause_lbd_threshold: usize,
 ) {
     let mut locked = vec![false; clauses.len()];
     for (v, &value) in x.iter().enumerate().skip(1) {
@@ -2091,7 +2137,7 @@ fn reduce_clause_database(
     }
 
     let mut eligible: Vec<usize> = (num_original_clauses..clauses.len())
-        .filter(|&idx| !locked[idx] && clause_lbd[idx] > GLUE_CLAUSE_LBD_THRESHOLD)
+        .filter(|&idx| !locked[idx] && clause_lbd[idx] > glue_clause_lbd_threshold)
         .collect();
     eligible.sort_by(|&a, &b| match clause_lbd[b].cmp(&clause_lbd[a]) {
         std::cmp::Ordering::Equal => clause_activity[a].partial_cmp(&clause_activity[b]).unwrap(),
@@ -2422,6 +2468,7 @@ mod tests {
             &mut min_touched,
             &mut min_stack,
             &mut min_work,
+            params::default().cdcl.minimize_work_budget_factor,
         );
 
         assert_eq!(backtrack_level, 0);
@@ -2682,6 +2729,7 @@ mod tests {
             &mut min_touched,
             &mut min_stack,
             &mut min_work,
+            params::default().cdcl.minimize_work_budget_factor,
         );
 
         assert_eq!(
@@ -2784,6 +2832,7 @@ mod tests {
                 None,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
             assert!(
                 result.satisfiable,
@@ -2835,6 +2884,7 @@ mod tests {
                 None,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
             assert!(
                 !result.satisfiable,
@@ -2935,6 +2985,7 @@ mod tests {
             &x,
             &mut reason,
             num_original_clauses,
+            params::default().cdcl.glue_clause_lbd_threshold,
         );
 
         assert_eq!(working_problem.clauses.len(), before - 1);
@@ -3005,6 +3056,7 @@ mod tests {
             &x,
             &mut reason,
             num_original_clauses,
+            params::default().cdcl.glue_clause_lbd_threshold,
         );
 
         assert_eq!(working_problem.clauses.len(), before);
@@ -3031,10 +3083,11 @@ mod tests {
         let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 7];
+        let glue_clause_lbd_threshold = params::default().cdcl.glue_clause_lbd_threshold;
 
         let idx_glue = add_learned_clause(
             &vec![-1, 3],
-            GLUE_CLAUSE_LBD_THRESHOLD,
+            glue_clause_lbd_threshold,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
@@ -3046,7 +3099,7 @@ mod tests {
         .expect("expected a stored clause");
         let idx_non_glue_low = add_learned_clause(
             &vec![-2, 4],
-            GLUE_CLAUSE_LBD_THRESHOLD + 1,
+            glue_clause_lbd_threshold + 1,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
@@ -3058,7 +3111,7 @@ mod tests {
         .expect("expected a stored clause");
         let idx_non_glue_high = add_learned_clause(
             &vec![-5, 6],
-            GLUE_CLAUSE_LBD_THRESHOLD + 1,
+            glue_clause_lbd_threshold + 1,
             &mut working_problem.clauses,
             &mut lists,
             &mut watch,
@@ -3083,6 +3136,7 @@ mod tests {
             &x,
             &mut reason,
             num_original_clauses,
+            params::default().cdcl.glue_clause_lbd_threshold,
         );
 
         assert_eq!(working_problem.clauses.len(), before - 1);
@@ -3158,6 +3212,7 @@ mod tests {
             &x,
             &mut reason,
             num_original_clauses,
+            params::default().cdcl.glue_clause_lbd_threshold,
         );
 
         assert_eq!(working_problem.clauses.len(), before - 1);
@@ -3178,47 +3233,49 @@ mod tests {
     /// comparison.
     #[test]
     fn test_glucose_should_restart() {
-        let mut glucose = GlucoseState::new();
+        let p = params::default().cdcl;
+        let glucose_window_size = p.glucose_window_size;
+        let mut glucose = GlucoseState::new(glucose_window_size);
 
         // Fill all but one slot of the recent window with LBD 2
         // (low/good); the window isn't full yet, so this must never
         // trigger regardless of how bad a single additional LBD looks.
-        for i in 0..GLUCOSE_WINDOW_SIZE - 1 {
+        for i in 0..glucose_window_size - 1 {
             record_lbd(&mut glucose, 2);
             assert!(
-                !glucose_should_restart(&glucose),
-                "glucose_should_restart() = true before the recent window (size {GLUCOSE_WINDOW_SIZE}) is full (i={i})"
+                !glucose_should_restart(&glucose, p.glucose_k),
+                "glucose_should_restart() = true before the recent window (size {glucose_window_size}) is full (i={i})"
             );
         }
 
         // One more low-LBD conflict fills the window at a recent
         // average of 2, equal to the global average (also 2) --
-        // recent_avg*GLUCOSE_K (2*0.8=1.6) is well below global_avg
+        // recent_avg*glucose_k (2*0.8=1.6) is well below global_avg
         // (2), so no restart yet.
         record_lbd(&mut glucose, 2);
         assert!(
-            !glucose_should_restart(&glucose),
+            !glucose_should_restart(&glucose, p.glucose_k),
             "glucose_should_restart() = true with recent and global averages both at their best (LBD 2)"
         );
 
         // Now drive the recent window to a much worse (higher) LBD
-        // than the global history: after GLUCOSE_WINDOW_SIZE more
+        // than the global history: after glucose_window_size more
         // conflicts at LBD 20, the recent window average is 20 (all
-        // GLUCOSE_WINDOW_SIZE slots hold 20), while the global average
-        // is dragged only partway up, so recent_avg*GLUCOSE_K must
+        // glucose_window_size slots hold 20), while the global average
+        // is dragged only partway up, so recent_avg*glucose_k must
         // exceed it and a restart must be signaled.
-        for _ in 0..GLUCOSE_WINDOW_SIZE {
+        for _ in 0..glucose_window_size {
             record_lbd(&mut glucose, 20);
         }
-        let recent_avg = glucose.recent_sum as f64 / GLUCOSE_WINDOW_SIZE as f64;
+        let recent_avg = glucose.recent_sum as f64 / glucose_window_size as f64;
         let global_avg = glucose.global_sum as f64 / glucose.global_count as f64;
-        let want = recent_avg * GLUCOSE_K >= global_avg;
+        let want = recent_avg * p.glucose_k >= global_avg;
         assert!(
             want,
-            "test setup error: expected the LBD-20 run to make recent_avg*GLUCOSE_K >= global_avg true"
+            "test setup error: expected the LBD-20 run to make recent_avg*glucose_k >= global_avg true"
         );
         assert_eq!(
-            glucose_should_restart(&glucose),
+            glucose_should_restart(&glucose, p.glucose_k),
             want,
             "recent_avg={recent_avg} global_avg={global_avg}"
         );
@@ -3260,15 +3317,16 @@ mod tests {
         // unrelated reason: establish a low-LBD baseline global
         // average, then drive the recent window to a much worse LBD
         // (mirroring test_glucose_should_restart's own setup).
-        let mut glucose = GlucoseState::new();
-        for _ in 0..GLUCOSE_WINDOW_SIZE {
+        let p = params::default().cdcl;
+        let mut glucose = GlucoseState::new(p.glucose_window_size);
+        for _ in 0..p.glucose_window_size {
             record_lbd(&mut glucose, 2);
         }
-        for _ in 0..GLUCOSE_WINDOW_SIZE {
+        for _ in 0..p.glucose_window_size {
             record_lbd(&mut glucose, 20);
         }
         assert!(
-            glucose_should_restart(&glucose),
+            glucose_should_restart(&glucose, p.glucose_k),
             "test setup error: expected glucose_should_restart() = true"
         );
 
@@ -3287,6 +3345,7 @@ mod tests {
             &mut lrb,
             &mut saved_phase,
             &glucose,
+            &p,
         );
 
         assert_eq!(restart_count, 0, "no restart actually happens at the root");
@@ -3314,6 +3373,7 @@ mod tests {
             Some(200),
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(!result.satisfiable);
@@ -3339,6 +3399,7 @@ mod tests {
             Some(64),
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(result.satisfiable, "expected satisfiable");
@@ -3448,6 +3509,7 @@ mod tests {
             &mut min_touched,
             &mut min_stack,
             &mut min_work,
+            params::default().cdcl.minimize_work_budget_factor,
         );
 
         assert!(
@@ -3510,9 +3572,10 @@ mod tests {
             10,
             &mut lrb,
             &mut saved_phase,
+            params::default().cdcl.lrb_alpha,
         );
 
-        let want_q = LRB_ALPHA * (3.0 / 5.0);
+        let want_q = params::default().cdcl.lrb_alpha * (3.0 / 5.0);
         assert!(
             (lrb.q[1] - want_q).abs() < 1e-9,
             "lrb.q[1] = {}, want {}",
@@ -3570,6 +3633,7 @@ mod tests {
             0,
             &mut lrb,
             &mut saved_phase,
+            params::default().cdcl.lrb_alpha,
         );
 
         assert_eq!(saved_phase[1], Value::True);
@@ -3610,6 +3674,7 @@ mod tests {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(!result.satisfiable);
@@ -3629,6 +3694,7 @@ mod tests {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(!result.satisfiable);
@@ -3664,9 +3730,10 @@ mod tests {
     /// threshold(k) = LUBY_BASE_CONFLICTS * luby_term(k).
     #[test]
     fn test_restart_threshold_luby() {
+        let p = params::default().cdcl;
         for (k, term) in [1, 1, 2, 1, 1, 2, 4].into_iter().enumerate() {
-            let want = LUBY_BASE_CONFLICTS * term;
-            assert_eq!(restart_threshold(RestartStrategy::Luby, k), want);
+            let want = p.luby_base_conflicts * term;
+            assert_eq!(restart_threshold(RestartStrategy::Luby, k, &p), want);
         }
     }
 
@@ -3677,9 +3744,10 @@ mod tests {
     /// a*1^2, a*2^2, a*3^2, ....
     #[test]
     fn test_restart_threshold_polynomial() {
+        let p = params::default().cdcl;
         for k in 0..4 {
-            let want = POLYNOMIAL_BASE_CONFLICTS * (k + 1) * (k + 1);
-            assert_eq!(restart_threshold(RestartStrategy::Polynomial, k), want);
+            let want = p.polynomial_base_conflicts * (k + 1) * (k + 1);
+            assert_eq!(restart_threshold(RestartStrategy::Polynomial, k, &p), want);
         }
     }
 
@@ -3690,10 +3758,11 @@ mod tests {
     /// between consecutive terms, unlike the polynomial case above.
     #[test]
     fn test_restart_threshold_geometric() {
+        let p = params::default().cdcl;
         for k in 0..4 {
-            let want =
-                (GEOMETRIC_BASE_CONFLICTS as f64 * GEOMETRIC_GROWTH_FACTOR.powi(k as i32)) as usize;
-            assert_eq!(restart_threshold(RestartStrategy::Geometric, k), want);
+            let want = (p.geometric_base_conflicts as f64
+                * p.geometric_growth_factor.powi(k as i32)) as usize;
+            assert_eq!(restart_threshold(RestartStrategy::Geometric, k, &p), want);
         }
         // Directly pin the first four terms against the known
         // constants (base 100, ratio 1.5), so a future change to the
@@ -3701,7 +3770,7 @@ mod tests {
         // formula-based check above, while this pins the actual
         // numbers STAGE15.md's default configuration produces today.
         for (k, want) in [100, 150, 225, 337].into_iter().enumerate() {
-            assert_eq!(restart_threshold(RestartStrategy::Geometric, k), want);
+            assert_eq!(restart_threshold(RestartStrategy::Geometric, k, &p), want);
         }
     }
 
@@ -3724,7 +3793,7 @@ mod tests {
         let mut saved_phase = vec![Value::False; 3];
         let mut conflicts_since_restart = 1_000_000usize;
         let mut restart_count = 0usize;
-        let glucose = GlucoseState::new();
+        let glucose = GlucoseState::new(params::default().cdcl.glucose_window_size);
 
         maybe_restart(
             RestartStrategy::None,
@@ -3740,6 +3809,7 @@ mod tests {
             &mut lrb,
             &mut saved_phase,
             &glucose,
+            &params::default().cdcl,
         );
 
         assert_eq!(restart_count, 0, "RestartStrategy::None must never restart");
@@ -3786,7 +3856,7 @@ mod tests {
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
         let mut saved_phase = vec![Value::False; 3];
-        let glucose = GlucoseState::new();
+        let glucose = GlucoseState::new(params::default().cdcl.glucose_window_size);
 
         current_level += 1;
         trail_lim.push(trail.len());
@@ -3803,7 +3873,8 @@ mod tests {
             &mut lrb,
         );
 
-        let mut conflicts_since_restart = LUBY_BASE_CONFLICTS * luby_term(0) - 1;
+        let mut conflicts_since_restart =
+            params::default().cdcl.luby_base_conflicts * luby_term(0) - 1;
         let mut restart_count = 0usize;
         maybe_restart(
             RestartStrategy::Luby,
@@ -3819,6 +3890,7 @@ mod tests {
             &mut lrb,
             &mut saved_phase,
             &glucose,
+            &params::default().cdcl,
         );
         assert_eq!(restart_count, 0, "below threshold, must not restart yet");
         assert_ne!(
@@ -3842,6 +3914,7 @@ mod tests {
             &mut lrb,
             &mut saved_phase,
             &glucose,
+            &params::default().cdcl,
         );
 
         assert_eq!(restart_count, 1, "threshold reached");
@@ -3879,6 +3952,7 @@ mod tests {
                 None,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
 
             assert!(
@@ -3915,6 +3989,7 @@ mod tests {
                 None,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
             assert!(
                 result.satisfiable,
@@ -3969,6 +4044,7 @@ mod tests {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(!result.satisfiable);
@@ -3991,6 +4067,7 @@ mod tests {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
         assert!(result.satisfiable);
 
@@ -4006,6 +4083,7 @@ mod tests {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
         assert!(!result.satisfiable);
     }
@@ -4024,6 +4102,7 @@ mod tests {
             None,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(
@@ -4050,6 +4129,7 @@ mod tests {
             None,
             &mut rng1,
             0,
+            &params::default().cdcl,
         );
 
         let mut rng2 = StdRng::seed_from_u64(7);
@@ -4062,6 +4142,7 @@ mod tests {
             1,
             &mut rng2,
             0,
+            &params::default().cdcl,
         );
 
         assert_eq!(got.satisfiable, want.satisfiable);
@@ -4090,6 +4171,7 @@ mod tests {
                 num_threads,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
             assert!(
                 result.satisfiable,
@@ -4134,6 +4216,7 @@ mod tests {
                 num_threads,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
             assert!(
                 !result.satisfiable,
@@ -4160,6 +4243,7 @@ mod tests {
             64,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(!result.satisfiable);
@@ -4184,6 +4268,7 @@ mod tests {
             8,
             &mut rng,
             0,
+            &params::default().cdcl,
         );
 
         assert!(result.timed_out);
@@ -4219,6 +4304,7 @@ mod tests {
                 16,
                 &mut rng,
                 0,
+                &params::default().cdcl,
             );
             assert!(result.satisfiable, "trial {trial}: expected satisfiable");
             for (ci, clause) in problem.clauses.iter().enumerate() {

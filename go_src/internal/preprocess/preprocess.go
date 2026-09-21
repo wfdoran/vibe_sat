@@ -19,6 +19,7 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
+	"vibe_sat/internal/params"
 )
 
 // maxRounds bounds how many times the full technique pipeline
@@ -116,7 +117,7 @@ type Stats struct {
 // elimination) remains single-threaded regardless of numThreads; see
 // REPORT25.md for why BVE in particular was not also threaded this
 // stage.
-func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
+func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess) *Result {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	assignment := assign.New(problem.NumVars)
 	var eliminated []EliminationStep
@@ -126,7 +127,7 @@ func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
 	// round -- see eliminateVariables's doc comment on its own budget
 	// parameter for why a fresh-every-call budget would fail to bound
 	// this loop's total work.
-	bveBudget := bveWorkBudgetFactor * len(problem.Clauses)
+	bveBudget := p.BVEWorkBudgetFactor * len(problem.Clauses)
 
 	for round := 0; round < maxRounds; round++ {
 		changed := false
@@ -145,7 +146,7 @@ func Run(problem *cnf.Problem, verbose int, numThreads int) *Result {
 			changed = true
 		}
 
-		if subsumed := eliminateSubsumedClausesParallel(&clauses, problem.NumVars, numThreads); subsumed > 0 {
+		if subsumed := eliminateSubsumedClausesParallel(&clauses, problem.NumVars, numThreads, p.SubsumptionWorkBudgetFactor); subsumed > 0 {
 			stats.ClausesSubsumed += subsumed
 			changed = true
 		}

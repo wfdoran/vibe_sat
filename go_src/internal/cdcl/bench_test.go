@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"vibe_sat/internal/cnf"
+	"vibe_sat/internal/params"
 )
 
 // STAGE23.md: profiling harness for cdcl. These are ordinary Go
@@ -53,7 +54,7 @@ func BenchmarkRunHardSingleThreaded(b *testing.B) {
 	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, SelectVarVsids, RestartPolynomial, nil, rng, 0)
+		result := Run(problem, nil, SelectVarVsids, RestartPolynomial, nil, rng, 0, params.Default().CDCL)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}
@@ -69,7 +70,7 @@ func BenchmarkRunHardParallel8(b *testing.B) {
 	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 8, rng, 0)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 8, rng, 0, params.Default().CDCL)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}
@@ -88,7 +89,7 @@ func BenchmarkRunHardParallel32(b *testing.B) {
 	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 32, rng, 0)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 32, rng, 0, params.Default().CDCL)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}
