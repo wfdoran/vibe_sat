@@ -54,7 +54,7 @@ func BenchmarkRunHardSingleThreaded(b *testing.B) {
 	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, nil, SelectVarVsids, RestartPolynomial, nil, rng, 0, params.Default().CDCL)
+		result := Run(problem, nil, SelectVarVsids, RestartPolynomial, nil, rng, 0, params.Default().CDCL, PhaseSaving)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}
@@ -70,7 +70,7 @@ func BenchmarkRunHardParallel8(b *testing.B) {
 	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 8, rng, 0, params.Default().CDCL)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 8, rng, 0, params.Default().CDCL, PhaseSaving)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}
@@ -89,7 +89,7 @@ func BenchmarkRunHardParallel32(b *testing.B) {
 	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 32, rng, 0, params.Default().CDCL)
+		result := RunParallel(problem, nil, SelectVarVsids, RestartRoundRobin, nil, 32, rng, 0, params.Default().CDCL, PhaseSaving)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}

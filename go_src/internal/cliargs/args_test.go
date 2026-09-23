@@ -363,14 +363,42 @@ func TestParseCDCLRejectsOutOfRangeAlgParams(t *testing.T) {
 	}
 }
 
-// TestParseCDCLRejectsFourAlgParams verifies that --algorithm=cdcl
-// rejects more than three --alg-params values (STAGE15.md's restart
-// strategy makes three the maximum: SelectVar variant, restart
-// strategy, memory limit).
-func TestParseCDCLRejectsFourAlgParams(t *testing.T) {
-	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "1", "100", "5"})
+// TestParseCDCLRejectsFiveAlgParams verifies that --algorithm=cdcl
+// rejects more than four --alg-params values (STAGE43.md's phase
+// strategy makes four the maximum: SelectVar variant, restart
+// strategy, memory limit, phase strategy).
+func TestParseCDCLRejectsFiveAlgParams(t *testing.T) {
+	_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "0", "1", "100", "0", "5"})
 	if err == nil {
-		t.Fatalf("expected error for four alg-params with algorithm=cdcl")
+		t.Fatalf("expected error for five alg-params with algorithm=cdcl")
+	}
+}
+
+// TestParseCDCLAcceptsPhaseStrategy verifies that --algorithm=cdcl
+// accepts a fourth --alg-params value of 0-3, selecting the phase
+// strategy (STAGE43.md): 0 = saving, 1 = target, 2 = WalkSAT
+// rephasing, 3 = round-robin.
+func TestParseCDCLAcceptsPhaseStrategy(t *testing.T) {
+	for _, phase := range []int64{0, 1, 2, 3} {
+		args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", "2", "100MB", strconv.FormatInt(phase, 10)})
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error for --alg-params 2 2 100MB %d: %v", phase, err)
+		}
+		if len(args.AlgParams) != 3 || args.AlgParams[2] != phase {
+			t.Errorf("AlgParams = %v, want [2 2 %d]", args.AlgParams, phase)
+		}
+	}
+}
+
+// TestParseCDCLRejectsOutOfRangePhaseStrategy verifies that
+// --algorithm=cdcl rejects a fourth --alg-params value outside 0-3
+// (STAGE43.md).
+func TestParseCDCLRejectsOutOfRangePhaseStrategy(t *testing.T) {
+	for _, phase := range []string{"4", "-1"} {
+		_, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", "2", "100MB", phase})
+		if err == nil {
+			t.Errorf("expected error for --alg-params 2 2 100MB %s with --algorithm=cdcl", phase)
+		}
 	}
 }
 

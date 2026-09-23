@@ -4,7 +4,7 @@
 //! spelling may be used interchangeably.
 //!
 //! `--alg-params`/`-p` is unusual in that it accepts between one and
-//! three values (`--alg-params <val1> [<val2> <val3>]`); clap's
+//! four values (`--alg-params <val1> [<val2> <val3> <val4>]`); clap's
 //! `num_args` supports this directly. `--algorithm=cdcl`'s third
 //! value (STAGE12.md, a memory limit like "100MB"; shifted from the
 //! second value to the third by STAGE15.md's restart strategy) isn't
@@ -43,7 +43,7 @@ struct RawArgs {
     #[arg(long = "time-limit-secs", short = 't')]
     time_limit_secs: Option<i64>,
 
-    #[arg(long = "alg-params", short = 'p', num_args = 1..=3, allow_negative_numbers = true)]
+    #[arg(long = "alg-params", short = 'p', num_args = 1..=4, allow_negative_numbers = true)]
     alg_params: Option<Vec<String>>,
 
     #[arg(long = "no-preprocessing", short = 'x')]
@@ -82,12 +82,13 @@ pub struct Args {
     /// Optional time limit, in seconds, for the search.
     pub time_limit_secs: Option<i64>,
 
-    /// Algorithm-specific integer parameters (1 to 3 values); see
+    /// Algorithm-specific integer parameters (1 to 4 values); see
     /// [`help_text`] for what each value means per algorithm. For
-    /// `--algorithm=cdcl`, this holds the first (SelectVar) and second
-    /// (restart strategy, STAGE15.md) values -- the third (a memory
-    /// limit) is parsed separately into `memory_limit_bytes`, since it
-    /// isn't a plain integer.
+    /// `--algorithm=cdcl`, this holds the first (SelectVar), second
+    /// (restart strategy, STAGE15.md), and fourth (phase strategy,
+    /// STAGE43.md) values, in that order -- the third (a memory limit)
+    /// is parsed separately into `memory_limit_bytes`, since it isn't
+    /// a plain integer.
     pub alg_params: Option<Vec<i64>>,
 
     /// Skip preprocessing (STAGE8.md); default is to run it.
@@ -238,8 +239,8 @@ Options:
         "dfs" (which will otherwise run until it finds a solution or
         exhausts the search space, however long that takes).
 
-  --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
-        Algorithm-specific parameters (1 to 3 integer values); at
+  --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
+        Algorithm-specific parameters (1 to 4 integer values); at
         least one of --alg-params or --time-limit-secs is required for
         "hc"/"ws". The meaning of each value depends on --algorithm:
           hc   val1 = number of random restarts to perform.
@@ -342,6 +343,38 @@ Options:
                      grows without bound. Note: val1 and val2 must
                      both be given to set val3, even if they are just
                      the defaults (2 and 1).
+               val4 = phase-selection strategy (STAGE43.md): which
+                     technique guesses a newly-decided variable's
+                     polarity.
+                 0 = phase saving (STAGE14.md): guess the polarity the
+                     variable last held before becoming unassigned, or
+                     False if it has never been assigned before.
+                 1 = target phase (Chanseok Oh): guess the polarity
+                     recorded at the search's deepest trail so far (the
+                     most variables ever simultaneously assigned
+                     without conflict), tracked separately from -- and
+                     never overwritten by -- ordinary phase saving.
+                 2 = periodic WalkSAT rephasing (reports/REPORT33.md
+                     item 6): behaves like phase saving, except that
+                     every so many restarts a short WalkSAT burst runs
+                     over the current clause database and its result
+                     overwrites the saved phase wholesale. In the rare
+                     case that burst happens to be a complete
+                     satisfying assignment on its own, that assignment
+                     is reported as the search's own verdict directly.
+                 3 = round-robin (--num-threads > 1 only): worker 0
+                     uses phase saving, worker 1 target phase, worker
+                     2 WalkSAT rephasing, worker 3 phase saving again,
+                     and so on, diversifying strategy across the
+                     portfolio the same way val2=4 diversifies restart
+                     schedules.
+               Optional; defaults to 0 (phase saving) with
+               --num-threads=1, or to 3 (round-robin) with
+               --num-threads > 1, matching val2's own default
+               convention. Note: val1, val2, and val3 must all be
+               given to set val4, even if val3 is a memory limit you
+               don't otherwise want (--alg-params's values are
+               positional).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -454,9 +487,9 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
 
     if let Some(values) = &raw.alg_params {
         if raw.algorithm == "cdcl" {
-            if values.len() > 3 {
+            if values.len() > 4 {
                 return Err(
-                    "for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, and an optional learned-clause database memory limit)"
+                    "for --algorithm=cdcl, --alg-params accepts at most four values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)"
                         .to_string(),
                 );
             }
@@ -476,6 +509,25 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
                 let limit = parse_byte_size(third)
                     .map_err(|e| format!("invalid memory limit for --alg-params: {e}"))?;
                 memory_limit_bytes = Some(limit);
+            }
+            if let Some(fourth) = values.get(3) {
+                // STAGE43.md's phase-selection strategy: a plain
+                // integer, like the first/second values, appended to
+                // alg_params as its third element (alg_params[2]) even
+                // though it's the *fourth* raw --alg-params token --
+                // memory_limit_bytes (the third token) is parsed into
+                // its own field above, not into alg_params, so
+                // alg_params itself only ever holds select_var/
+                // restart/phase, never the memory limit. A known
+                // wrinkle of this positional design (already true of
+                // the second/third values): selecting a phase strategy
+                // from the command line requires also giving an
+                // explicit memory limit value as the third value, even
+                // for a caller who wants no real memory cap.
+                let p = fourth
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid value for --alg-params: \"{fourth}\""))?;
+                alg_params.push(p);
             }
         } else {
             for value in values {
@@ -680,6 +732,19 @@ fn validate(args: &Args) -> Result<(), String> {
             {
                 return Err(
                     "for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes"
+                        .to_string(),
+                );
+            }
+            // STAGE43.md adds a fourth alg_params element (phase
+            // strategy: 0 = saving, 1 = target, 2 = WalkSAT rephasing,
+            // 3 = round-robin across all three by worker index; see
+            // cdcl::PhaseStrategy).
+            if let Some(params) = &args.alg_params
+                && let Some(&phase) = params.get(2)
+                && !(0..=3).contains(&phase)
+            {
+                return Err(
+                    "for --algorithm=cdcl, the fourth --alg-params value must be 0, 1, 2, or 3 (selecting the phase-selection strategy)"
                         .to_string(),
                 );
             }
@@ -1001,9 +1066,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cdcl_rejects_four_alg_params() {
-        // STAGE15.md's restart strategy makes three the maximum
-        // (SelectVar variant, restart strategy, memory limit).
+    fn test_parse_cdcl_rejects_five_alg_params() {
+        // STAGE43.md's phase strategy makes four the maximum
+        // (SelectVar variant, restart strategy, memory limit, phase
+        // strategy).
         let result = Args::parse_from_args([
             "vibe_sat",
             "--input=problem.cnf",
@@ -1012,9 +1078,51 @@ mod tests {
             "0",
             "1",
             "100",
+            "0",
             "5",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cdcl_accepts_phase_strategy() {
+        // STAGE43.md's phase-selection strategy: a fourth --alg-params
+        // value of 0-3.
+        for phase in [0i64, 1i64, 2i64, 3i64] {
+            let args = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                "2",
+                "2",
+                "100MB",
+                &phase.to_string(),
+            ])
+            .unwrap_or_else(|e| panic!("Parse returned unexpected error for phase={phase}: {e}"));
+            assert_eq!(args.alg_params, Some(vec![2, 2, phase]));
+            assert_eq!(args.memory_limit_bytes, Some(100 * 1024 * 1024));
+        }
+    }
+
+    #[test]
+    fn test_parse_cdcl_rejects_out_of_range_phase_strategy() {
+        for phase in ["4", "-1"] {
+            let result = Args::parse_from_args([
+                "vibe_sat",
+                "--input=problem.cnf",
+                "--algorithm=cdcl",
+                "--alg-params",
+                "2",
+                "2",
+                "100MB",
+                phase,
+            ]);
+            assert!(
+                result.is_err(),
+                "expected error for --alg-params 2 2 100MB {phase} with --algorithm=cdcl"
+            );
+        }
     }
 
     #[test]
@@ -1174,8 +1282,8 @@ mod tests {
         // Tested against RawArgs directly (the raw clap-parsed
         // tokens) regardless of the hc-specific restriction on
         // length, to confirm clap's num_args range collects up to
-        // three values; the business-rule rejection is covered
-        // separately above.
+        // four values (STAGE43.md); the business-rule rejection is
+        // covered separately above.
         let raw = RawArgs::try_parse_from([
             "vibe_sat",
             "--input=problem.cnf",
@@ -1184,11 +1292,17 @@ mod tests {
             "1",
             "2",
             "3",
+            "4",
         ])
         .expect("expected successful clap parse");
         assert_eq!(
             raw.alg_params,
-            Some(vec!["1".to_string(), "2".to_string(), "3".to_string()])
+            Some(vec![
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string()
+            ])
         );
     }
 

@@ -42,6 +42,14 @@ pub struct Cdcl {
     pub glucose_window_size: usize,
     pub glucose_k: f64,
     pub minimize_work_budget_factor: usize,
+    /// STAGE43.md's periodic-WalkSAT-rephasing parameters
+    /// (`cdcl::PhaseStrategy::RephaseWalkSAT`; `reports/REPORT33.md`
+    /// item 6): a WalkSAT burst runs every `rephase_interval_restarts`
+    /// restarts, bounded to `rephase_max_flips` flips, and its
+    /// resulting assignment overwrites `cdcl`'s saved-phase array.
+    /// Meaningless for every other `PhaseStrategy`.
+    pub rephase_interval_restarts: usize,
+    pub rephase_max_flips: usize,
 }
 
 /// Runtime-configurable tuning constants for `preprocess` (STAGE39.md).
@@ -75,6 +83,8 @@ pub fn default() -> Params {
             glucose_window_size: 50,
             glucose_k: 0.6,
             minimize_work_budget_factor: 20,
+            rephase_interval_restarts: 50,
+            rephase_max_flips: 1000,
         },
         preprocess: Preprocess {
             subsumption_work_budget_factor: 64,
@@ -165,6 +175,15 @@ fn apply(params: &mut Params, value: &json::Value) {
         {
             params.cdcl.minimize_work_budget_factor = v;
         }
+        if let Some(v) = cdcl
+            .get("rephaseIntervalRestarts")
+            .and_then(json::Value::as_usize)
+        {
+            params.cdcl.rephase_interval_restarts = v;
+        }
+        if let Some(v) = cdcl.get("rephaseMaxFlips").and_then(json::Value::as_usize) {
+            params.cdcl.rephase_max_flips = v;
+        }
     }
     if let Some(preprocess) = value.get("preprocess") {
         if let Some(v) = preprocess
@@ -206,7 +225,7 @@ fn format_f64(v: f64) -> String {
 /// `json.MarshalIndent(p, "", "  ")`), with a trailing newline.
 fn render(p: &Params) -> String {
     format!(
-        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {}\n  }}\n}}\n",
+        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {}\n  }}\n}}\n",
         p.cdcl.luby_base_conflicts,
         p.cdcl.polynomial_base_conflicts,
         p.cdcl.geometric_base_conflicts,
@@ -218,6 +237,8 @@ fn render(p: &Params) -> String {
         p.cdcl.glucose_window_size,
         format_f64(p.cdcl.glucose_k),
         p.cdcl.minimize_work_budget_factor,
+        p.cdcl.rephase_interval_restarts,
+        p.cdcl.rephase_max_flips,
         p.preprocess.subsumption_work_budget_factor,
         p.preprocess.bve_work_budget_factor,
     )
@@ -628,6 +649,8 @@ mod tests {
         assert_eq!(d.cdcl.glucose_window_size, 50);
         assert_eq!(d.cdcl.glucose_k, 0.6);
         assert_eq!(d.cdcl.minimize_work_budget_factor, 20);
+        assert_eq!(d.cdcl.rephase_interval_restarts, 50);
+        assert_eq!(d.cdcl.rephase_max_flips, 1000);
         assert_eq!(d.preprocess.subsumption_work_budget_factor, 64);
         assert_eq!(d.preprocess.bve_work_budget_factor, 2000);
     }

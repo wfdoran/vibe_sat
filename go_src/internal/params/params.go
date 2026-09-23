@@ -52,6 +52,16 @@ type CDCL struct {
 	GlucoseWindowSize        int     `json:"glucoseWindowSize"`
 	GlucoseK                 float64 `json:"glucoseK"`
 	MinimizeWorkBudgetFactor int     `json:"minimizeWorkBudgetFactor"`
+
+	// RephaseIntervalRestarts and RephaseMaxFlips are STAGE43.md's
+	// periodic-WalkSAT-rephasing parameters (cdcl.PhaseRephaseWalkSAT;
+	// REPORT33.md item 6): a WalkSAT burst runs every
+	// RephaseIntervalRestarts restarts, bounded to RephaseMaxFlips
+	// flips, and its resulting assignment overwrites cdcl's saved-phase
+	// array (see cdcl.go's rephaseFromWalkSAT). Meaningless for every
+	// other PhaseStrategy, which never read either field.
+	RephaseIntervalRestarts int `json:"rephaseIntervalRestarts"`
+	RephaseMaxFlips         int `json:"rephaseMaxFlips"`
 }
 
 // Preprocess holds Stage-8 preprocessing's runtime-configurable
@@ -85,6 +95,8 @@ func Default() Params {
 			GlucoseWindowSize:        50,
 			GlucoseK:                 0.6,
 			MinimizeWorkBudgetFactor: 20,
+			RephaseIntervalRestarts:  50,
+			RephaseMaxFlips:          1000,
 		},
 		Preprocess: Preprocess{
 			SubsumptionWorkBudgetFactor: 64,

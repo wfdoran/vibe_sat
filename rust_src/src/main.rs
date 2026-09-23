@@ -408,6 +408,25 @@ fn run_cdcl(
         _ => cdcl::RestartStrategy::Polynomial,
     };
 
+    // STAGE43.md leaves the default phase strategy up to this
+    // implementation too, following the exact same convention
+    // restart_strategy just above already established:
+    // PhaseStrategy::Saving (STAGE14.md's original, unconditionally-on
+    // behavior) with a single thread, since no benchmark evidence yet
+    // favors a different single fixed choice (see reports/REPORT43.md);
+    // PhaseStrategy::RoundRobin once --num-threads > 1 and no explicit
+    // --alg-params phase value overrides it, diversifying phase
+    // strategy across the portfolio's workers rather than racing every
+    // worker with the identical phase source.
+    let phase_strategy = match args.alg_params.as_deref() {
+        Some([_, _, 0, ..]) => cdcl::PhaseStrategy::Saving,
+        Some([_, _, 1, ..]) => cdcl::PhaseStrategy::Target,
+        Some([_, _, 2, ..]) => cdcl::PhaseStrategy::RephaseWalkSAT,
+        Some([_, _, 3, ..]) => cdcl::PhaseStrategy::RoundRobin,
+        _ if args.num_threads > 1 => cdcl::PhaseStrategy::RoundRobin,
+        _ => cdcl::PhaseStrategy::Saving,
+    };
+
     let result = cdcl::run_parallel(
         problem,
         time_limit,
@@ -418,6 +437,7 @@ fn run_cdcl(
         &mut rng,
         args.verbose,
         cdcl_params,
+        phase_strategy,
     );
 
     if result.satisfiable {

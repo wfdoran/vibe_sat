@@ -184,6 +184,65 @@
 //     writes). There is no shared clause database for minimization to
 //     contend with, no "stop the world" pause, and no multithreaded-
 //     safety design needed beyond what analyze already has.
+//
+// STAGE43.md adds two alternatives to STAGE14.md's plain phase saving
+// (see PhaseStrategy), both real, literature-backed techniques
+// REPORT41.md identified as untried here:
+//
+//   - PhaseTarget (Chanseok Oh, "Between SAT and UNSAT: The Fun and
+//     Joy of Clause Learning," and the MapleSAT/MapleLCMDist line of
+//     SAT Competition winners that popularized it): decide guesses
+//     the polarity the search held at its deepest trail (the most
+//     variables ever simultaneously assigned without conflict, an
+//     approximation for "the assignment that came closest to
+//     satisfying"), tracked separately from -- and never overwritten
+//     by -- the ordinary most-recently-held phase savedPhase already
+//     tracks. This is a deliberately simplified reading of the
+//     technique: real implementations (CaDiCaL, Kissat) cycle between
+//     several phase sources across a "stable/unstable" mode switch;
+//     this implementation only ever tracks and uses the one target
+//     array, no mode-cycling.
+//   - PhaseRephaseWalkSAT (REPORT33.md item 6, this project's own
+//     concrete answer to "a CDCL/local-search hybrid"): every
+//     params.CDCL.RephaseIntervalRestarts restarts, a short WalkSAT
+//     burst (internal/hillclimb.RunWalkSat, bounded to
+//     params.CDCL.RephaseMaxFlips flips) runs over the current clause
+//     database, and its resulting assignment overwrites savedPhase
+//     wholesale -- a deliberate "shock" to phase-saving's otherwise
+//     purely backtrack-driven memory, on the theory that a local
+//     search's global view of the formula sometimes finds a
+//     genuinely better phase than incremental backtracking alone
+//     would stumble into. If that WalkSAT burst happens to return a
+//     *complete* satisfying assignment -- rare, but a real possibility
+//     REPORT43.md/STAGE43.md flagged explicitly, since WalkSAT is
+//     itself a complete, if incomplete-search, SAT method -- runLoop
+//     notices immediately (rephaseFromWalkSAT sets
+//     solver.earlyExitSAT) and returns that assignment as the
+//     search's own verdict rather than discarding a solution already
+//     in hand and continuing to search for one via CDCL.
+//
+// A fourth family from the same literature -- Kissat's "inverted" and
+// "original" rephase targets (flip every saved-phase bit, or reset to
+// the fixed pre-search phase, respectively; both used purely for
+// diversification, not because either polarity is expected to be
+// better) -- is documented here but not implemented: REPORT43.md
+// covers why (a scheduling/mode-cycling architecture change bigger
+// than this stage's scope, not a limitation of the idea itself).
+//
+// Per STAGE43.md's design question (user-selectable vs. "try them all
+// and pick the best automatically"): PhaseStrategy is selectable via
+// --alg-params, the same convention SelectVarVariant/RestartStrategy
+// already use, rather than a new, separate mechanism. For
+// multithreaded cdcl (STAGE20.md/STAGE21.md's Option B), PhaseRoundRobin
+// diversifies strategy across worker threads exactly the way
+// RestartRoundRobin already diversifies restart schedules (see
+// phaseRoundRobinStrategies/resolvePhaseStrategy) -- the portfolio
+// design's existing "whichever worker finishes first wins" behavior
+// already amounts to "try several and keep whichever performs best,"
+// with no new decision logic needed to get that property; this is
+// preferred over building a sequential try-N-then-pick mechanism
+// within one single-threaded run, which would need to run the search
+// multiple times just to compare them.
 package cdcl
 
 import (
@@ -200,6 +259,7 @@ import (
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
 	"vibe_sat/internal/dfs"
+	"vibe_sat/internal/hillclimb"
 	"vibe_sat/internal/occurrence"
 	"vibe_sat/internal/params"
 	"vibe_sat/internal/preprocess"
@@ -468,6 +528,56 @@ func resolveRestartStrategy(restartStrategy RestartStrategy, threadIndex int) Re
 	return restartStrategy
 }
 
+// PhaseStrategy identifies which technique decide uses to guess a
+// newly-decided variable's polarity (STAGE43.md; see the package doc
+// comment for the literature behind each).
+type PhaseStrategy int
+
+const (
+	// PhaseSaving is STAGE14.md's original, and remains cdcl's default:
+	// guess the polarity the variable last held before becoming
+	// unassigned (solver.savedPhase), or False if it has never been
+	// assigned before.
+	PhaseSaving PhaseStrategy = 0
+	// PhaseTarget is STAGE43.md's addition: guess the polarity recorded
+	// in solver.targetPhase, the assignment snapshotted at the search's
+	// deepest trail so far (see updateTargetPhase), rather than the
+	// most recently held one.
+	PhaseTarget PhaseStrategy = 1
+	// PhaseRephaseWalkSAT is STAGE43.md's addition: behaves exactly
+	// like PhaseSaving (decide still reads solver.savedPhase) except
+	// that savedPhase is also periodically overwritten wholesale by a
+	// WalkSAT burst's result (see rephaseFromWalkSAT and maybeRestart).
+	PhaseRephaseWalkSAT PhaseStrategy = 2
+	// PhaseRoundRobin, like RestartRoundRobin, is meaningful only as a
+	// value RunParallel resolves away before ever constructing a
+	// *solver -- no solver's own phaseStrategy field is ever
+	// PhaseRoundRobin. It means: thread i uses
+	// phaseRoundRobinStrategies[i%3], diversifying phase-selection
+	// technique across the portfolio the same way RestartRoundRobin
+	// already diversifies restart schedules.
+	PhaseRoundRobin PhaseStrategy = 3
+)
+
+// phaseRoundRobinStrategies is PhaseRoundRobin's resolution order (see
+// resolvePhaseStrategy): thread 0 uses PhaseSaving, thread 1 uses
+// PhaseTarget, thread 2 uses PhaseRephaseWalkSAT, thread 3 cycles back
+// to PhaseSaving, and so on -- mirroring roundRobinStrategies exactly,
+// one entry per implemented strategy.
+var phaseRoundRobinStrategies = [3]PhaseStrategy{PhaseSaving, PhaseTarget, PhaseRephaseWalkSAT}
+
+// resolvePhaseStrategy returns the concrete phase strategy thread
+// threadIndex should actually use: phaseStrategy unchanged, unless it
+// is PhaseRoundRobin, in which case it resolves to
+// phaseRoundRobinStrategies[threadIndex%3]. Called with threadIndex 0
+// for Run, exactly like resolveRestartStrategy.
+func resolvePhaseStrategy(phaseStrategy PhaseStrategy, threadIndex int) PhaseStrategy {
+	if phaseStrategy == PhaseRoundRobin {
+		return phaseRoundRobinStrategies[threadIndex%3]
+	}
+	return phaseStrategy
+}
+
 // Result describes the outcome of a CDCL search.
 type Result struct {
 	Satisfiable  bool              // whether a satisfying assignment was found
@@ -610,6 +720,33 @@ type solver struct {
 	// initialization is needed.
 	savedPhase assign.Assignment
 
+	// phaseStrategy selects which technique decide uses to guess a
+	// polarity (STAGE43.md); fixed for the lifetime of one solver/Run
+	// call, like restartStrategy. targetPhase and bestTrailLen are
+	// PhaseTarget's own state (meaningless, and left at their zero
+	// values, for every other strategy): targetPhase holds the
+	// polarity each variable held at the moment updateTargetPhase last
+	// recorded a new trail-length record, sized numVars+1 exactly like
+	// savedPhase and with the same "zero value is assign.False, which
+	// is the right default for a variable never yet recorded" property;
+	// bestTrailLen is that record length itself, so updateTargetPhase
+	// can cheaply tell whether the current trail beats it.
+	phaseStrategy PhaseStrategy
+	targetPhase   assign.Assignment
+	bestTrailLen  int
+
+	// earlyExitSAT and earlyExitAssignment (STAGE43.md) let
+	// rephaseFromWalkSAT report a complete satisfying assignment
+	// straight to runLoop's main loop, for the rare but real case
+	// (flagged explicitly in STAGE43.md) that a periodic WalkSAT burst
+	// -- itself a complete SAT-solving method, not just a phase-quality
+	// heuristic -- happens to solve the whole problem outright. Left at
+	// their zero values (false, nil) for every strategy other than
+	// PhaseRephaseWalkSAT, and checked once per loop iteration
+	// alongside the existing stop/timeLimit checks.
+	earlyExitSAT        bool
+	earlyExitAssignment assign.Assignment
+
 	// restartStrategy selects which restart schedule maybeRestart
 	// applies (STAGE15.md); fixed for the lifetime of one solver/Run
 	// call. restartCount is how many restarts have happened so far,
@@ -687,7 +824,7 @@ func clauseByteCost(clause cnf.Clause) int64 {
 // (STAGE13.md). restartStrategy is the restart schedule to use
 // (STAGE15.md). ok is false if this bootstrap alone already proves
 // problem unsatisfiable.
-func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy, p params.CDCL) (s *solver, ok bool) {
+func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy, p params.CDCL, phaseStrategy PhaseStrategy) (s *solver, ok bool) {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	x := assign.New(problem.NumVars)
 	if unsat, _ := preprocess.UnitPropagate(&clauses, x); unsat {
@@ -733,6 +870,8 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		lrbParticipated:         make([]int, problem.NumVars+1),
 		lrbAssignedAtConflict:   make([]int, problem.NumVars+1),
 		savedPhase:              make(assign.Assignment, problem.NumVars+1),
+		phaseStrategy:           phaseStrategy,
+		targetPhase:             make(assign.Assignment, problem.NumVars+1),
 		x:                       x,
 		level:                   make([]int, problem.NumVars+1),
 		reason:                  reason,
@@ -798,11 +937,11 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 // runLoop's own comment). rng supplies the randomness
 // SelectVarWeighted uses to break ties,
 // and verbose controls progress output, matching dfs.Run.
-func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, verbose int, p params.CDCL) Result {
+func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, verbose int, p params.CDCL, phaseStrategy PhaseStrategy) Result {
 	if verbose >= 1 {
-		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy)+describeMemoryLimit(memoryLimitBytes))
+		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy, phaseStrategy)+describeMemoryLimit(memoryLimitBytes))
 	}
-	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p)
+	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p, resolvePhaseStrategy(phaseStrategy, 0))
 	if verbose >= 1 {
 		fmt.Println(verdict(result))
 	}
@@ -846,13 +985,13 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 // which worker's answer wins a race to a verdict is not.
 // Result.NumDecisions/NumConflicts are summed across every worker,
 // win or lose, matching Stage 18's Result.NumNodes convention.
-func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, numThreads int, rng *rand.Rand, verbose int, p params.CDCL) Result {
+func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, numThreads int, rng *rand.Rand, verbose int, p params.CDCL, phaseStrategy PhaseStrategy) Result {
 	if numThreads <= 1 {
-		return Run(problem, timeLimit, variant, restartStrategy, memoryLimitBytes, rng, verbose, p)
+		return Run(problem, timeLimit, variant, restartStrategy, memoryLimitBytes, rng, verbose, p, phaseStrategy)
 	}
 
 	if verbose >= 1 {
-		fmt.Println("cdcl:", describeParallelParams(timeLimit, variant, restartStrategy, numThreads)+describeMemoryLimit(memoryLimitBytes))
+		fmt.Println("cdcl:", describeParallelParams(timeLimit, variant, restartStrategy, phaseStrategy, numThreads)+describeMemoryLimit(memoryLimitBytes))
 	}
 
 	exportBuffers := make([]*exportBuffer, numThreads)
@@ -881,7 +1020,8 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 		go func(i int, peers []*exportBuffer) {
 			defer wg.Done()
 			threadStrategy := resolveRestartStrategy(restartStrategy, i)
-			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p)
+			threadPhaseStrategy := resolvePhaseStrategy(phaseStrategy, i)
+			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
 			if !results[i].TimedOut && stop.CompareAndSwap(false, true) {
 				winner.Store(int32(i))
 			}
@@ -915,7 +1055,7 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 // per worker), matching Stage 17/18's identical runLoop/dfsWorker
 // pattern. stop/export/peers are nil for Run's own single-threaded
 // call; see the solver struct's doc comment for what each does.
-func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, stop *atomic.Bool, export *exportBuffer, peers []*exportBuffer, p params.CDCL) Result {
+func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, memoryLimitBytes *int64, rng *rand.Rand, stop *atomic.Bool, export *exportBuffer, peers []*exportBuffer, p params.CDCL, phaseStrategy PhaseStrategy) Result {
 	// STAGE35.md: captured before newSolver's bootstrap, not after --
 	// see the package doc comment's time-check paragraph
 	// (reports/REPORT35.md) for why: a slow bootstrap (unit propagation
@@ -929,7 +1069,7 @@ func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVa
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy, p)
+	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy, p, phaseStrategy)
 	if !ok {
 		return Result{Satisfiable: false}
 	}
@@ -976,12 +1116,19 @@ func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVa
 			}
 			s.learnAndBackjump(confl)
 			s.conflictsSinceRestart++
-			s.maybeRestart()
+			s.maybeRestart(rng)
+			if s.earlyExitSAT {
+				return Result{Satisfiable: true, Assignment: s.earlyExitAssignment, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts}
+			}
 			continue
 		}
 
 		if s.allAssigned() {
 			return Result{Satisfiable: true, Assignment: s.x, NumDecisions: s.numDecisions, NumConflicts: s.numConflicts}
+		}
+
+		if s.phaseStrategy == PhaseTarget {
+			s.updateTargetPhase()
 		}
 
 		s.decide(rng)
@@ -1021,15 +1168,27 @@ func (s *solver) allAssigned() bool {
 	return true
 }
 
+// phaseFor returns the polarity decide should guess for v: solver.
+// targetPhase under PhaseTarget, solver.savedPhase otherwise (which
+// covers both PhaseSaving and PhaseRephaseWalkSAT -- the latter only
+// changes how savedPhase gets updated, in rephaseFromWalkSAT, not
+// which array decide reads).
+func (s *solver) phaseFor(v int) assign.Value {
+	if s.phaseStrategy == PhaseTarget {
+		return s.targetPhase[v]
+	}
+	return s.savedPhase[v]
+}
+
 // decide chooses the next branching variable according to s.variant
 // and pushes it onto the trail as a new decision level, guessing its
-// saved phase (STAGE14.md, see solver.savedPhase's doc comment) as
-// the polarity to try -- False, for a variable that has never been
-// assigned before, matching the fixed order earlier stages always
-// used. CDCL doesn't get to try both polarities at one level the way
-// dfs does; if the guessed polarity turns out wrong, conflict
-// analysis is what corrects it, by deriving a clause that forces the
-// other one once it backjumps here again.
+// phase (STAGE14.md/STAGE43.md; see phaseFor) as the polarity to try
+// -- False, for a variable that has never been recorded in that
+// phase source, matching the fixed order earlier stages always used.
+// CDCL doesn't get to try both polarities at one level the way dfs
+// does; if the guessed polarity turns out wrong, conflict analysis is
+// what corrects it, by deriving a clause that forces the other one
+// once it backjumps here again.
 func (s *solver) decide(rng *rand.Rand) {
 	var v int
 	switch s.variant {
@@ -1056,7 +1215,7 @@ func (s *solver) decide(rng *rand.Rand) {
 	s.currentLevel++
 	s.trailLim = append(s.trailLim, len(s.trail))
 	lit := cnf.Literal(-v)
-	if s.savedPhase[v] == assign.True {
+	if s.phaseFor(v) == assign.True {
 		lit = cnf.Literal(v)
 	}
 	s.assignLiteral(lit, s.currentLevel, noReason)
@@ -1265,7 +1424,7 @@ func (s *solver) learnAndBackjump(confl int) {
 // simply defers to the next conflict -- without resetting
 // conflictsSinceRestart or advancing restartCount, since no restart
 // actually happened.
-func (s *solver) maybeRestart() {
+func (s *solver) maybeRestart(rng *rand.Rand) {
 	if s.restartStrategy == RestartNone {
 		return
 	}
@@ -1279,6 +1438,7 @@ func (s *solver) maybeRestart() {
 		s.backtrackTo(0)
 		s.conflictsSinceRestart = 0
 		s.restartCount++
+		s.maybeRephase(rng)
 		return
 	}
 	if s.conflictsSinceRestart < s.restartThreshold() {
@@ -1287,6 +1447,93 @@ func (s *solver) maybeRestart() {
 	s.backtrackTo(0)
 	s.conflictsSinceRestart = 0
 	s.restartCount++
+	s.maybeRephase(rng)
+}
+
+// maybeRephase is STAGE43.md's hook into every restart: a no-op
+// unless s.phaseStrategy is PhaseRephaseWalkSAT and s.restartCount is
+// a multiple of params.CDCL.RephaseIntervalRestarts (so a WalkSAT
+// burst runs roughly every that-many restarts, not every single one
+// -- REPORT33.md's own "every so often (every N restarts, or N
+// conflicts)" framing, resolved here in favor of restart count since
+// maybeRestart is already this function's only caller and already
+// tracks it). A RephaseIntervalRestarts of 0 or less would divide by
+// zero; params.Default() never sets it that low, but a hand-edited
+// .vibe_sat.json could, so this guards against that explicitly rather
+// than panicking on a malformed config.
+func (s *solver) maybeRephase(rng *rand.Rand) {
+	if s.phaseStrategy != PhaseRephaseWalkSAT {
+		return
+	}
+	if s.params.RephaseIntervalRestarts <= 0 || s.restartCount%s.params.RephaseIntervalRestarts != 0 {
+		return
+	}
+	s.rephaseFromWalkSAT(rng)
+}
+
+// rephaseFromWalkSAT runs one bounded WalkSAT burst (internal/
+// hillclimb.RunWalkSat, reusing s.lists -- the current, learned-
+// clause-augmented occurrence lists maybeImport/addLearnedClause
+// already maintain, not a fresh rebuild -- so the burst benefits from
+// everything CDCL has learned so far too) and copies its resulting
+// assignment into s.savedPhase wholesale, overwriting whatever
+// backtracking had saved there. A single try (NumTries = 1), bounded
+// to params.CDCL.RephaseMaxFlips flips: this is a periodic nudge, not
+// a full local-search run in its own right, so it needs to stay cheap
+// relative to how rarely it fires.
+//
+// STAGE43.md flags the case this handles explicitly: WalkSAT is a
+// complete SAT-solving method on its own, not just a phase-quality
+// heuristic, so its burst can -- rarely, but really -- return a
+// complete satisfying assignment outright. When that happens, this
+// sets s.earlyExitSAT/s.earlyExitAssignment instead of merely
+// updating savedPhase, so runLoop reports that solution as the
+// search's own verdict rather than discarding it and continuing to
+// search for one via CDCL.
+func (s *solver) rephaseFromWalkSAT(rng *rand.Rand) {
+	numTries := 1
+	result := hillclimb.RunWalkSat(
+		&cnf.Problem{NumVars: s.numVars, Clauses: s.clauses},
+		s.lists,
+		hillclimb.WalkSatParams{
+			NumTries:       &numTries,
+			MaxFlipsPerTry: s.params.RephaseMaxFlips,
+			NoisePercent:   hillclimb.DefaultNoisePercent,
+		},
+		rng,
+		0,
+	)
+	if result.Satisfiable {
+		s.earlyExitSAT = true
+		s.earlyExitAssignment = result.Assignment
+		return
+	}
+	copy(s.savedPhase, result.Assignment)
+}
+
+// updateTargetPhase is PhaseTarget's own bookkeeping (STAGE43.md),
+// called once per main-loop iteration whenever propagation has just
+// settled without conflict (runLoop) -- the same point decide is
+// about to be called from, i.e. exactly when the trail's current
+// length is meaningful to compare. Chanseok Oh's "target phase":
+// whenever the trail is longer than it has ever been before in this
+// run (a new record, not merely equal -- ties keep the earlier,
+// already-recorded snapshot, which is an arbitrary but harmless choice
+// since both are equally deep), snapshot every currently-assigned
+// variable's polarity into s.targetPhase. Variables not yet assigned
+// at the time of a given snapshot simply keep whatever s.targetPhase
+// already held for them (a later snapshot's own assigned variables
+// overwrite it then, if it becomes assigned by that point) -- the same
+// "leave untouched, don't reset to Unassigned" merge behavior
+// s.savedPhase's own update (see unassign) already relies on.
+func (s *solver) updateTargetPhase() {
+	if len(s.trail) <= s.bestTrailLen {
+		return
+	}
+	s.bestTrailLen = len(s.trail)
+	for _, v := range s.trail {
+		s.targetPhase[v] = s.x[v]
+	}
 }
 
 // recordLBD folds one freshly learned clause's LBD into both of
@@ -1892,8 +2139,8 @@ func isFalse(lit cnf.Literal, assignment assign.Assignment) bool {
 
 // describeParams formats the configured time limit and SelectVar
 // variant for the "cdcl:" announcement printed at verbose level 1.
-func describeParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy) string {
-	description := fmt.Sprintf("select_var=%d restart=%d", variant, restartStrategy)
+func describeParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, phaseStrategy PhaseStrategy) string {
+	description := fmt.Sprintf("select_var=%d restart=%d phase=%d", variant, restartStrategy, phaseStrategy)
 	if timeLimit != nil {
 		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
 	}
@@ -1903,8 +2150,8 @@ func describeParams(timeLimit *time.Duration, variant SelectVarVariant, restartS
 // describeParallelParams is describeParams, extended with the worker
 // count, for RunParallel's "cdcl: ..." announcement (STAGE20.md/
 // STAGE21.md), matching dfs.describeParallelParams's identical role.
-func describeParallelParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, numThreads int) string {
-	return fmt.Sprintf("num_threads=%d %s", numThreads, describeParams(timeLimit, variant, restartStrategy))
+func describeParallelParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, phaseStrategy PhaseStrategy, numThreads int) string {
+	return fmt.Sprintf("num_threads=%d %s", numThreads, describeParams(timeLimit, variant, restartStrategy, phaseStrategy))
 }
 
 // describeMemoryLimit formats an optional STAGE12.md memory limit for

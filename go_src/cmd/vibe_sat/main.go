@@ -325,7 +325,27 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 		restartStrategy = cdcl.RestartRoundRobin
 	}
 
-	result := cdcl.RunParallel(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, args.NumThreads, rng, args.Verbose, cdclParams)
+	// STAGE43.md leaves the default phase strategy up to this
+	// implementation too, following the exact same convention
+	// restartStrategy just above already established: cdcl.PhaseSaving
+	// (STAGE14.md's original, unconditionally-on behavior) with a
+	// single thread, since no benchmark evidence yet favors a
+	// different single fixed choice (see REPORT43.md); cdcl.
+	// PhaseRoundRobin once --num-threads > 1 and no explicit
+	// --alg-params phase value overrides it, diversifying phase
+	// strategy across the portfolio's workers rather than racing every
+	// worker with the identical phase source (see cdcl.RunParallel's
+	// doc comment for why this needs no "pick the best" logic of its
+	// own: whichever worker's strategy actually helps on a given
+	// problem tends to also be the one that finishes first).
+	phaseStrategy := cdcl.PhaseSaving
+	if len(args.AlgParams) >= 3 {
+		phaseStrategy = cdcl.PhaseStrategy(args.AlgParams[2])
+	} else if args.NumThreads > 1 {
+		phaseStrategy = cdcl.PhaseRoundRobin
+	}
+
+	result := cdcl.RunParallel(problem, timeLimit, variant, restartStrategy, args.MemoryLimitBytes, args.NumThreads, rng, args.Verbose, cdclParams, phaseStrategy)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

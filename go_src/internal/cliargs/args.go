@@ -5,10 +5,10 @@
 // spelling may be used interchangeably.
 //
 // The standard library's flag package is intentionally not used here:
-// --alg-params/-p can take between one and three values
-// (--alg-params <val1> [<val2> <val3>]), which flag's one-value-per-
-// flag model cannot express, so this package implements its own small
-// tokenizer instead.
+// --alg-params/-p can take between one and four values
+// (--alg-params <val1> [<val2> <val3> <val4>]), which flag's
+// one-value-per-flag model cannot express, so this package implements
+// its own small tokenizer instead.
 package cliargs
 
 import (
@@ -25,7 +25,7 @@ type Args struct {
 	Algorithm       string  // --algorithm / -a : solving algorithm to use (required, unless ResetInternalParams; "hc", "ws", "dfs", or "cdcl")
 	OutputFile      string  // --output / -o : where to write the solution, if any ("" means unset)
 	TimeLimitSecs   *int    // --time-limit-secs / -t : optional search time limit, in seconds
-	AlgParams       []int64 // --alg-params / -p : 1 to 3 algorithm-specific integer parameters
+	AlgParams       []int64 // --alg-params / -p : 1 to 4 algorithm-specific integer parameters
 	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
 
 	// InternalParamsPath is --internal-params/-c (STAGE39.md): an
@@ -76,7 +76,7 @@ type Args struct {
 // given in the space-separated form (e.g. "-p 10 20"). A maxValues of
 // 0 marks a boolean flag that takes no value at all (e.g.
 // --no-preprocessing); every other flag here consumes exactly one
-// value, except --alg-params/-p, which takes up to three.
+// value, except --alg-params/-p, which takes up to four.
 type flagSpec struct {
 	long      string
 	short     string
@@ -90,7 +90,7 @@ var flagSpecs = []flagSpec{
 	{long: "algorithm", short: "a", maxValues: 1},
 	{long: "output", short: "o", maxValues: 1},
 	{long: "time-limit-secs", short: "t", maxValues: 1},
-	{long: "alg-params", short: "p", maxValues: 3},
+	{long: "alg-params", short: "p", maxValues: 4},
 	{long: "no-preprocessing", short: "x", maxValues: 0},
 	{long: "num-threads", short: "z", maxValues: 1},
 	{long: "internal-params", short: "c", maxValues: 1},
@@ -314,8 +314,8 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		// value (restart strategy) is a plain integer, appended to
 		// AlgParams just like the first.
 		if args.Algorithm == "cdcl" {
-			if len(values) > 3 {
-				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most three values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, and an optional learned-clause database memory limit)")
+			if len(values) > 4 {
+				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most four values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)")
 			}
 			if len(values) >= 1 {
 				p, err := strconv.ParseInt(values[0], 10, 64)
@@ -331,12 +331,31 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 				}
 				args.AlgParams = append(args.AlgParams, p)
 			}
-			if len(values) == 3 {
+			if len(values) >= 3 {
 				limit, err := parseByteSize(values[2])
 				if err != nil {
 					return nil, fmt.Errorf("invalid memory limit for --alg-params: %w", err)
 				}
 				args.MemoryLimitBytes = &limit
+			}
+			if len(values) == 4 {
+				// STAGE43.md's phase-selection strategy: a plain integer,
+				// like val1/val2, appended to AlgParams as its third
+				// element (AlgParams[2]) even though it's the *fourth*
+				// raw --alg-params token -- MemoryLimitBytes (the third
+				// token) is parsed into its own field above, not into
+				// AlgParams, so AlgParams itself only ever holds
+				// SelectVar/restart/phase, never the memory limit. A
+				// known wrinkle of this positional design (already true
+				// of val2/val3): selecting a phase strategy from the
+				// command line requires also giving an explicit memory
+				// limit value as val3, even for a caller who wants no
+				// real memory cap.
+				p, err := strconv.ParseInt(values[3], 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid value for --alg-params: %q", values[3])
+				}
+				args.AlgParams = append(args.AlgParams, p)
 			}
 		} else {
 			for _, value := range values {
@@ -451,6 +470,9 @@ func validate(args *Args, rawValues map[string][]string) error {
 		// meaningful with --num-threads > 1; see cdcl.RestartRoundRobin).
 		// STAGE34.md adds a fifth restart-strategy value (5 = Glucose's
 		// own data-driven policy based on LBD; see cdcl.RestartGlucose).
+		// STAGE43.md adds a fourth AlgParams element (phase strategy:
+		// 0 = saving, 1 = target, 2 = WalkSAT rephasing, 3 = round-robin
+		// across all three by worker index; see cdcl.PhaseStrategy).
 		if len(args.AlgParams) >= 1 && (args.AlgParams[0] < 0 || args.AlgParams[0] > 3) {
 			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)")
 		}
@@ -459,6 +481,9 @@ func validate(args *Args, rawValues map[string][]string) error {
 		}
 		if args.MemoryLimitBytes != nil && *args.MemoryLimitBytes < 1 {
 			return fmt.Errorf("for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes")
+		}
+		if len(args.AlgParams) >= 3 && (args.AlgParams[2] < 0 || args.AlgParams[2] > 3) {
+			return fmt.Errorf("for --algorithm=cdcl, the fourth --alg-params value must be 0, 1, 2, or 3 (selecting the phase-selection strategy)")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
 			return fmt.Errorf("--time-limit-secs must be a positive integer")

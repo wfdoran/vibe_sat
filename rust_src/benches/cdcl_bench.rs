@@ -29,7 +29,7 @@ use std::time::Instant;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use vibe_sat::cdcl::{RestartStrategy, SelectVarVariant, run, run_parallel};
+use vibe_sat::cdcl::{PhaseStrategy, RestartStrategy, SelectVarVariant, run, run_parallel};
 use vibe_sat::cnf::read_dimacs;
 use vibe_sat::params;
 
@@ -49,6 +49,7 @@ fn main() {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         ));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardSingleThreaded: {:?}", start.elapsed());
@@ -67,6 +68,7 @@ fn main() {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         ));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardParallel8: {:?}", start.elapsed());
@@ -89,6 +91,7 @@ fn main() {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         ));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardParallel32: {:?}", start.elapsed());

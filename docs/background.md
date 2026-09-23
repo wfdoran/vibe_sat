@@ -191,6 +191,46 @@ already found for VSIDS-over-LRB and polynomial-over-Luby above. Not
 (yet) this project's default regardless; see `reports/REPORT34.md`/
 `reports/REPORT35.md` for why.
 
+## Phase-selection strategies
+
+Every time `cdcl` branches on a new variable, it has to guess which
+polarity (true or false) to try first — get it right and the search
+moves on; get it wrong and conflict analysis eventually corrects it,
+at the cost of some wasted work in between. `vibe_sat` offers four
+strategies for this guess (`--alg-params` `val4`, `cdcl` only).
+
+The default, **phase saving** (Stage 14), is the simplest and the one
+essentially every MiniSat-lineage solver has used since the mid-2000s:
+remember whatever polarity a variable last held before becoming
+unassigned, and guess that again next time. **Target phase**
+(Chanseok Oh; `val4=1`) tracks a second, separate memory instead: the
+polarity every variable held at the single deepest point the trail
+ever reached (the most variables ever simultaneously assigned without
+a conflict) — an approximation for "the assignment that came closest
+to satisfying everything" — and guesses from that instead of the most
+recent value. **Periodic WalkSAT rephasing** (`val4=2`,
+`reports/REPORT33.md`'s own concrete answer to "should CDCL and local
+search be combined") behaves like ordinary phase saving between
+bursts, but every so many restarts runs a short, bounded WalkSAT burst
+over the current clause database and copies its resulting assignment
+into the saved-phase array wholesale — a deliberate "shock" on the
+theory that local search's global view of the formula sometimes finds
+a better phase than incremental backtracking alone would stumble
+into. WalkSAT is itself a complete SAT-solving method, not just a
+phase-quality heuristic, so on rare occasions that burst returns a
+fully satisfying assignment on its own; when it does, `cdcl` reports
+that solution directly rather than discarding it and continuing to
+search.
+
+With more than one thread, the default becomes **round-robin**
+(`val4=3`): worker 0 gets phase saving, worker 1 target phase, worker
+2 WalkSAT rephasing, worker 3 back to phase saving, and so on —
+diversifying the portfolio the same way restart-strategy round-robin
+already does, rather than racing several workers with the identical
+phase source. See `reports/REPORT43.md` for how the three
+single-threaded strategies compared on this project's own benchmark
+set.
+
 ## Clause-database management
 
 Learned clauses accumulate without bound unless something prunes

@@ -39,6 +39,8 @@ A parameter's JSON key (where it has one) is the name used inside
 | `glucoseWindowSize` | `50` | same | Size of the recent-LBD window `RestartGlucose` averages over (Glucose's own published value). |
 | `glucoseK` | `0.6` | same | Multiplier on the recent-window LBD average that `RestartGlucose` compares against the global average to decide whether to restart. Benchmark-tuned away from Glucose's own published `0.8` — see `REPORT35.md`. |
 | `minimizeWorkBudgetFactor` | `20` | same | Scales `minimizeClause`'s hard work-budget cap (`factor * n * (bits.Len(n)+1)`), bounding how much recursive-minimization work one learned clause can cost. |
+| `rephaseIntervalRestarts` | `50` | `cdcl.go` / `cdcl/mod.rs` | How many restarts elapse between periodic WalkSAT rephasing bursts (`--alg-params` val4=2, `STAGE43.md`); meaningless for every other phase strategy. |
+| `rephaseMaxFlips` | `1000` | same | Caps how many flips one WalkSAT rephasing burst may make, so the periodic "nudge" stays cheap relative to how rarely it fires. |
 
 ### `preprocess` section
 

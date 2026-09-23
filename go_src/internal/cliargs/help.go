@@ -46,8 +46,8 @@ Options:
         "dfs" (which will otherwise run until it finds a solution or
         exhausts the search space, however long that takes).
 
-  --alg-params <val1> [<val2> <val3>], -p <val1> [<val2> <val3>]
-        Algorithm-specific parameters (1 to 3 integer values); at
+  --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
+        Algorithm-specific parameters (1 to 4 integer values); at
         least one of --alg-params or --time-limit-secs is required for
         "hc"/"ws". The meaning of each value depends on --algorithm:
           hc   val1 = number of random restarts to perform.
@@ -150,6 +150,38 @@ Options:
                      grows without bound. Note: val1 and val2 must
                      both be given to set val3, even if they are just
                      the defaults (2 and 1).
+               val4 = phase-selection strategy (STAGE43.md): which
+                     technique decide uses to guess a newly-decided
+                     variable's polarity.
+                 0 = phase saving (STAGE14.md): guess the polarity the
+                     variable last held before becoming unassigned, or
+                     False if it has never been assigned before.
+                 1 = target phase (Chanseok Oh): guess the polarity
+                     recorded at the search's deepest trail so far (the
+                     most variables ever simultaneously assigned
+                     without conflict), tracked separately from -- and
+                     never overwritten by -- ordinary phase saving.
+                 2 = periodic WalkSAT rephasing (reports/REPORT33.md
+                     item 6): behaves like phase saving, except that
+                     every so many restarts a short WalkSAT burst runs
+                     over the current clause database and its result
+                     overwrites the saved phase wholesale. In the rare
+                     case that burst happens to be a complete
+                     satisfying assignment on its own, that assignment
+                     is reported as the search's own verdict directly.
+                 3 = round-robin (--num-threads > 1 only): worker 0
+                     uses phase saving, worker 1 target phase, worker
+                     2 WalkSAT rephasing, worker 3 phase saving again,
+                     and so on, diversifying strategy across the
+                     portfolio the same way val2=4 diversifies restart
+                     schedules.
+               Optional; defaults to 0 (phase saving) with
+               --num-threads=1, or to 3 (round-robin) with
+               --num-threads > 1, matching val2's own default
+               convention. Note: val1, val2, and val3 must all be
+               given to set val4, even if val3 is a memory limit you
+               don't otherwise want (--alg-params's values are
+               positional).
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -203,9 +235,10 @@ Options:
         STAGE39.md: path to a JSON file of runtime-configurable
         internal tuning constants (restart-schedule bases/growth
         factors, LRB's alpha, RestartGlucose's K/window size, learned-
-        clause minimization's and preprocessing's work-budget factors
-        -- see docs/internal-parameters.md for the complete list and
-        every value's default). If not given, a file named
+        clause minimization's and preprocessing's work-budget factors,
+        WalkSAT rephasing's interval/flip budget -- see
+        docs/internal-parameters.md for the complete list and every
+        value's default). If not given, a file named
         .vibe_sat.json in the current directory is used if present;
         otherwise every parameter keeps its built-in default. A
         parameter the file doesn't mention also keeps its default --

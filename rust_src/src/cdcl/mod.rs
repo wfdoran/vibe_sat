@@ -170,6 +170,7 @@ use rand::{Rng, RngExt, SeedableRng};
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
 use crate::dfs::{select_var, select_var_fast_pick};
+use crate::hillclimb::walksat::{WalkSatParams, run_walksat};
 use crate::occurrence::{self, Lists};
 use crate::params;
 use crate::preprocess;
@@ -277,6 +278,63 @@ fn resolve_restart_strategy(
         ROUND_ROBIN_STRATEGIES[thread_index % 3]
     } else {
         restart_strategy
+    }
+}
+
+/// Identifies which technique [`decision_literal`] uses to guess a
+/// newly-decided variable's polarity (STAGE43.md; see the module doc
+/// comment for the literature behind each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseStrategy {
+    /// STAGE14.md's original, and `cdcl`'s default: guess the
+    /// polarity the variable last held before becoming unassigned
+    /// (`saved_phase`), or `False` if it has never been assigned
+    /// before.
+    Saving,
+    /// STAGE43.md's addition: guess the polarity recorded in
+    /// `target_phase`, the assignment snapshotted at the search's
+    /// deepest trail so far (see [`update_target_phase`]), rather
+    /// than the most recently held one.
+    Target,
+    /// STAGE43.md's addition: behaves exactly like `Saving`
+    /// (`decision_literal` still reads `saved_phase`) except that
+    /// `saved_phase` is also periodically overwritten wholesale by a
+    /// WalkSAT burst's result (see [`maybe_rephase`] and
+    /// [`maybe_restart`]).
+    RephaseWalkSAT,
+    /// Like `RestartStrategy::RoundRobin`, meaningful only as a value
+    /// [`run_parallel`] resolves away before ever calling
+    /// [`run_loop`] -- `run_loop`'s own `phase_strategy` parameter is
+    /// never `PhaseRoundRobin`. It means: worker i uses
+    /// `PHASE_ROUND_ROBIN_STRATEGIES[i % 3]`, diversifying
+    /// phase-selection technique across the portfolio the same way
+    /// `RestartStrategy::RoundRobin` already diversifies restart
+    /// schedules.
+    RoundRobin,
+}
+
+/// [`PhaseStrategy::RoundRobin`]'s resolution order (see
+/// [`resolve_phase_strategy`]): worker 0 uses `Saving`, worker 1
+/// `Target`, worker 2 `RephaseWalkSAT`, worker 3 cycles back to
+/// `Saving`, and so on -- mirroring [`ROUND_ROBIN_STRATEGIES`]
+/// exactly, one entry per implemented strategy.
+const PHASE_ROUND_ROBIN_STRATEGIES: [PhaseStrategy; 3] = [
+    PhaseStrategy::Saving,
+    PhaseStrategy::Target,
+    PhaseStrategy::RephaseWalkSAT,
+];
+
+/// Returns the concrete phase strategy worker `thread_index` should
+/// actually use: `phase_strategy` unchanged, unless it is
+/// `PhaseStrategy::RoundRobin`, in which case it resolves to
+/// `PHASE_ROUND_ROBIN_STRATEGIES[thread_index % 3]`. Called with
+/// `thread_index` 0 for [`run`], exactly like
+/// [`resolve_restart_strategy`].
+fn resolve_phase_strategy(phase_strategy: PhaseStrategy, thread_index: usize) -> PhaseStrategy {
+    if phase_strategy == PhaseStrategy::RoundRobin {
+        PHASE_ROUND_ROBIN_STRATEGIES[thread_index % 3]
+    } else {
+        phase_strategy
     }
 }
 
@@ -540,8 +598,15 @@ fn glucose_should_restart(glucose: &GlucoseState, glucose_k: f64) -> bool {
 /// root regardless of strategy, so this simply defers to the next
 /// conflict -- without resetting `*conflicts_since_restart` or
 /// advancing `*restart_count`, since no restart actually happened.
+/// Returns `Some(assignment)` if a periodic WalkSAT rephasing burst
+/// (see [`maybe_rephase`]) happened to solve the whole problem
+/// outright -- the rare edge case STAGE43.md flags explicitly, since
+/// WalkSAT is a complete SAT-solving method on its own, not just a
+/// phase-quality heuristic. `None` in every other case (including
+/// every call where no restart happens at all, or `phase_strategy`
+/// isn't [`PhaseStrategy::RephaseWalkSAT`]).
 #[allow(clippy::too_many_arguments)]
-fn maybe_restart(
+fn maybe_restart<R: Rng>(
     restart_strategy: RestartStrategy,
     conflicts_since_restart: &mut usize,
     restart_count: &mut usize,
@@ -556,19 +621,23 @@ fn maybe_restart(
     saved_phase: &mut [Value],
     glucose: &GlucoseState,
     p: &params::Cdcl,
-) {
+    phase_strategy: PhaseStrategy,
+    working_problem: &Problem,
+    lists: &Lists,
+    rng: &mut R,
+) -> Option<Assignment> {
     if restart_strategy == RestartStrategy::None {
-        return;
+        return None;
     }
     if *current_level == 0 {
-        return;
+        return None;
     }
     if restart_strategy == RestartStrategy::Glucose {
         if !glucose_should_restart(glucose, p.glucose_k) {
-            return;
+            return None;
         }
     } else if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count, p) {
-        return;
+        return None;
     }
     backtrack_to(
         0,
@@ -585,6 +654,84 @@ fn maybe_restart(
     );
     *conflicts_since_restart = 0;
     *restart_count += 1;
+    maybe_rephase(
+        phase_strategy,
+        *restart_count,
+        p,
+        working_problem,
+        lists,
+        saved_phase,
+        rng,
+    )
+}
+
+/// STAGE43.md's hook into every restart: a no-op unless
+/// `phase_strategy` is [`PhaseStrategy::RephaseWalkSAT`] and
+/// `restart_count` is a multiple of `p.rephase_interval_restarts` (so
+/// a WalkSAT burst runs roughly every that-many restarts, not every
+/// single one -- `reports/REPORT33.md`'s own "every so often (every N
+/// restarts, or N conflicts)" framing, resolved here in favor of
+/// restart count since [`maybe_restart`] is already this function's
+/// only caller and already tracks it). A `rephase_interval_restarts`
+/// of 0 would divide by zero; [`params::default`] never sets it that
+/// low, but a hand-edited `.vibe_sat.json` could, so this guards
+/// against that explicitly rather than panicking on a malformed
+/// config.
+fn maybe_rephase<R: Rng>(
+    phase_strategy: PhaseStrategy,
+    restart_count: usize,
+    p: &params::Cdcl,
+    working_problem: &Problem,
+    lists: &Lists,
+    saved_phase: &mut [Value],
+    rng: &mut R,
+) -> Option<Assignment> {
+    if phase_strategy != PhaseStrategy::RephaseWalkSAT {
+        return None;
+    }
+    if p.rephase_interval_restarts == 0
+        || !restart_count.is_multiple_of(p.rephase_interval_restarts)
+    {
+        return None;
+    }
+    rephase_from_walksat(working_problem, lists, p, saved_phase, rng)
+}
+
+/// Runs one bounded WalkSAT burst ([`run_walksat`], reusing `lists`
+/// -- the current, learned-clause-augmented occurrence lists
+/// [`clause_share::maybe_import`]/`add_learned_clause` already
+/// maintain, not a fresh rebuild -- so the burst benefits from
+/// everything CDCL has learned so far too) and copies its resulting
+/// assignment into `saved_phase` wholesale, overwriting whatever
+/// backtracking had saved there. A single try (`num_tries = Some(1)`),
+/// bounded to `p.rephase_max_flips` flips: this is a periodic nudge,
+/// not a full local-search run in its own right, so it needs to stay
+/// cheap relative to how rarely it fires. Returns `Some(assignment)`
+/// if that burst happens to be a complete satisfying assignment on
+/// its own (see [`maybe_restart`]'s doc comment).
+fn rephase_from_walksat<R: Rng>(
+    working_problem: &Problem,
+    lists: &Lists,
+    p: &params::Cdcl,
+    saved_phase: &mut [Value],
+    rng: &mut R,
+) -> Option<Assignment> {
+    let result = run_walksat(
+        working_problem,
+        lists,
+        WalkSatParams {
+            num_tries: Some(1),
+            max_flips_per_try: p.rephase_max_flips,
+            ..WalkSatParams::default()
+        },
+        rng,
+        0,
+    );
+    if result.satisfiable {
+        return Some(result.assignment);
+    }
+    saved_phase.copy_from_slice(&result.assignment);
+    None
 }
 
 // `VAR_ACTIVITY_DECAY` is `SelectVarVariant::Vsids`'s per-variable
@@ -759,11 +906,12 @@ pub fn run<R: Rng>(
     rng: &mut R,
     verbose: i32,
     p: &params::Cdcl,
+    phase_strategy: PhaseStrategy,
 ) -> SolveResult {
     if verbose >= 1 {
         println!(
             "cdcl: {}{}",
-            describe_params(time_limit, variant, restart_strategy),
+            describe_params(time_limit, variant, restart_strategy, phase_strategy),
             describe_memory_limit(memory_limit_bytes)
         );
     }
@@ -778,6 +926,7 @@ pub fn run<R: Rng>(
         None,
         &[],
         p,
+        resolve_phase_strategy(phase_strategy, 0),
     );
     if verbose >= 1 {
         println!("{}", verdict(&result));
@@ -833,6 +982,7 @@ pub fn run_parallel<R: Rng>(
     rng: &mut R,
     verbose: i32,
     p: &params::Cdcl,
+    phase_strategy: PhaseStrategy,
 ) -> SolveResult {
     if num_threads <= 1 {
         return run(
@@ -844,13 +994,20 @@ pub fn run_parallel<R: Rng>(
             rng,
             verbose,
             p,
+            phase_strategy,
         );
     }
 
     if verbose >= 1 {
         println!(
             "cdcl: {}{}",
-            describe_parallel_params(time_limit, variant, restart_strategy, num_threads),
+            describe_parallel_params(
+                time_limit,
+                variant,
+                restart_strategy,
+                phase_strategy,
+                num_threads
+            ),
             describe_memory_limit(memory_limit_bytes)
         );
     }
@@ -890,6 +1047,7 @@ pub fn run_parallel<R: Rng>(
                 let stop = &stop;
                 let winner = &winner;
                 let thread_strategy = resolve_restart_strategy(restart_strategy, i);
+                let thread_phase_strategy = resolve_phase_strategy(phase_strategy, i);
 
                 scope.spawn(move || {
                     // The winner CAS must happen here, inside this
@@ -909,6 +1067,7 @@ pub fn run_parallel<R: Rng>(
                         Some(export),
                         peers,
                         p,
+                        thread_phase_strategy,
                     );
                     if !result.timed_out
                         && stop
@@ -1022,6 +1181,7 @@ fn run_loop<R: Rng>(
     export: Option<&ExportBuffer>,
     peers: &[&ExportBuffer],
     p: &params::Cdcl,
+    phase_strategy: PhaseStrategy,
 ) -> SolveResult {
     // STAGE35.md: captured before bootstrap's, not after -- see the
     // module doc comment's time-check paragraph (reports/REPORT35.md)
@@ -1115,6 +1275,12 @@ fn run_loop<R: Rng>(
     // exactly the polarity a variable that has never been assigned
     // before should default to (see backtrack_to's doc comment).
     let mut saved_phase = vec![Value::False; problem.num_vars + 1];
+
+    // STAGE43.md's `PhaseStrategy::Target` bookkeeping (see
+    // update_target_phase): meaningless, and left at their zero
+    // values, for every other strategy.
+    let mut target_phase = vec![Value::False; problem.num_vars + 1];
+    let mut best_trail_len = 0usize;
 
     // STAGE15.md's restart bookkeeping: conflicts_since_restart counts
     // conflicts since the previous restart (or since the search
@@ -1327,7 +1493,7 @@ fn run_loop<R: Rng>(
             );
 
             conflicts_since_restart += 1;
-            maybe_restart(
+            if let Some(solution) = maybe_restart(
                 restart_strategy,
                 &mut conflicts_since_restart,
                 &mut restart_count,
@@ -1342,7 +1508,25 @@ fn run_loop<R: Rng>(
                 &mut saved_phase,
                 &glucose,
                 p,
-            );
+                phase_strategy,
+                &working_problem,
+                &lists,
+                rng,
+            ) {
+                // STAGE43.md: a periodic WalkSAT rephasing burst is
+                // itself a complete SAT-solving method, so it can --
+                // rarely, but really -- return a complete satisfying
+                // assignment on its own; report it directly rather
+                // than discarding it and continuing to search via
+                // CDCL.
+                return SolveResult {
+                    satisfiable: true,
+                    assignment: solution,
+                    num_decisions,
+                    num_conflicts,
+                    timed_out: false,
+                };
+            }
             continue;
         }
 
@@ -1354,6 +1538,10 @@ fn run_loop<R: Rng>(
                 num_conflicts,
                 timed_out: false,
             };
+        }
+
+        if phase_strategy == PhaseStrategy::Target {
+            update_target_phase(&trail, &x, &mut target_phase, &mut best_trail_len);
         }
 
         // Decide: pick the next branching variable (see
@@ -1385,7 +1573,7 @@ fn run_loop<R: Rng>(
         current_level += 1;
         trail_lim.push(trail.len());
         assign_literal(
-            decision_literal(v, &saved_phase),
+            decision_literal(v, phase_strategy, &saved_phase, &target_phase),
             current_level,
             None,
             &mut x,
@@ -1941,17 +2129,69 @@ fn literal_assigned_true(v: usize, x: &Assignment) -> Literal {
     }
 }
 
+/// Returns the polarity [`decision_literal`] should guess for `v`:
+/// `target_phase[v]` under [`PhaseStrategy::Target`], `saved_phase[v]`
+/// otherwise -- which covers both [`PhaseStrategy::Saving`] and
+/// [`PhaseStrategy::RephaseWalkSAT`] (the latter only changes how
+/// `saved_phase` gets updated, in [`maybe_rephase`], not which array
+/// this reads).
+fn phase_for(
+    v: usize,
+    phase_strategy: PhaseStrategy,
+    saved_phase: &[Value],
+    target_phase: &[Value],
+) -> Value {
+    if phase_strategy == PhaseStrategy::Target {
+        target_phase[v]
+    } else {
+        saved_phase[v]
+    }
+}
+
 /// Returns the literal [`run`]'s decision step should assign when
-/// branching on variable `v` (STAGE14.md): its saved phase, i.e.
-/// whatever polarity it held the last time it was assigned before
-/// becoming unassigned again, or `False` if `saved_phase[v]` is still
-/// its default (a variable that has never been assigned before),
-/// matching the fixed order earlier stages always used.
-fn decision_literal(v: usize, saved_phase: &[Value]) -> Literal {
-    if saved_phase[v] == Value::True {
+/// branching on variable `v` (STAGE14.md/STAGE43.md): its phase (see
+/// [`phase_for`]), i.e. whatever polarity that phase source held for
+/// it, or `False` if it has never been recorded there (a variable
+/// that has never been assigned before), matching the fixed order
+/// earlier stages always used.
+fn decision_literal(
+    v: usize,
+    phase_strategy: PhaseStrategy,
+    saved_phase: &[Value],
+    target_phase: &[Value],
+) -> Literal {
+    if phase_for(v, phase_strategy, saved_phase, target_phase) == Value::True {
         v as Literal
     } else {
         -(v as Literal)
+    }
+}
+
+/// [`PhaseStrategy::Target`]'s own bookkeeping (STAGE43.md), called
+/// once per main-loop iteration whenever propagation has just settled
+/// without conflict ([`run_loop`]) -- the same point a decision is
+/// about to be made, i.e. exactly when the trail's current length is
+/// meaningful to compare. Chanseok Oh's "target phase": whenever the
+/// trail is longer than it has ever been before in this run (a new
+/// record, not merely equal -- ties keep the earlier, already-recorded
+/// snapshot, an arbitrary but harmless choice since both are equally
+/// deep), snapshot every currently-assigned variable's polarity into
+/// `target_phase`. Variables not yet assigned at the time of a given
+/// snapshot simply keep whatever `target_phase` already held for them
+/// -- the same "leave untouched, don't reset to `Unassigned`" merge
+/// behavior `saved_phase`'s own update already relies on.
+fn update_target_phase(
+    trail: &[usize],
+    x: &Assignment,
+    target_phase: &mut [Value],
+    best_trail_len: &mut usize,
+) {
+    if trail.len() <= *best_trail_len {
+        return;
+    }
+    *best_trail_len = trail.len();
+    for &v in trail {
+        target_phase[v] = x[v];
     }
 }
 
@@ -2227,6 +2467,7 @@ fn describe_params(
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
     restart_strategy: RestartStrategy,
+    phase_strategy: PhaseStrategy,
 ) -> String {
     let variant_code = match variant {
         SelectVarVariant::Weighted => 0,
@@ -2242,12 +2483,18 @@ fn describe_params(
         RestartStrategy::RoundRobin => 4,
         RestartStrategy::Glucose => 5,
     };
+    let phase_code = match phase_strategy {
+        PhaseStrategy::Saving => 0,
+        PhaseStrategy::Target => 1,
+        PhaseStrategy::RephaseWalkSAT => 2,
+        PhaseStrategy::RoundRobin => 3,
+    };
     match time_limit {
         Some(limit) => format!(
-            "select_var={variant_code} restart={restart_code} time_limit_secs={}",
+            "select_var={variant_code} restart={restart_code} phase={phase_code} time_limit_secs={}",
             limit.as_secs()
         ),
-        None => format!("select_var={variant_code} restart={restart_code}"),
+        None => format!("select_var={variant_code} restart={restart_code} phase={phase_code}"),
     }
 }
 
@@ -2259,11 +2506,12 @@ fn describe_parallel_params(
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
     restart_strategy: RestartStrategy,
+    phase_strategy: PhaseStrategy,
     num_threads: usize,
 ) -> String {
     format!(
         "num_threads={num_threads} {}",
-        describe_params(time_limit, variant, restart_strategy)
+        describe_params(time_limit, variant, restart_strategy, phase_strategy)
     )
 }
 
@@ -2833,6 +3081,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
             assert!(
                 result.satisfiable,
@@ -2885,6 +3134,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
             assert!(
                 !result.satisfiable,
@@ -3330,6 +3580,8 @@ mod tests {
             "test setup error: expected glucose_should_restart() = true"
         );
 
+        let lists = occurrence::build(&_working_problem);
+        let mut rng = StdRng::seed_from_u64(1);
         maybe_restart(
             // must not panic
             RestartStrategy::Glucose,
@@ -3346,6 +3598,10 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &p,
+            PhaseStrategy::Saving,
+            &_working_problem,
+            &lists,
+            &mut rng,
         );
 
         assert_eq!(restart_count, 0, "no restart actually happens at the root");
@@ -3374,6 +3630,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(!result.satisfiable);
@@ -3400,6 +3657,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(result.satisfiable, "expected satisfiable");
@@ -3644,7 +3902,11 @@ mod tests {
     #[test]
     fn test_decision_literal_uses_saved_phase() {
         let saved_phase = vec![Value::False, Value::True];
-        assert_eq!(decision_literal(1, &saved_phase), 1);
+        let target_phase = vec![Value::False, Value::False];
+        assert_eq!(
+            decision_literal(1, PhaseStrategy::Saving, &saved_phase, &target_phase),
+            1
+        );
     }
 
     /// Verifies the fallback: a variable that has never been assigned
@@ -3652,7 +3914,11 @@ mod tests {
     #[test]
     fn test_decision_literal_defaults_to_false() {
         let saved_phase = vec![Value::False, Value::False];
-        assert_eq!(decision_literal(1, &saved_phase), -1);
+        let target_phase = vec![Value::False, Value::False];
+        assert_eq!(
+            decision_literal(1, PhaseStrategy::Saving, &saved_phase, &target_phase),
+            -1
+        );
     }
 
     /// test_run_with_vsids_proves_unsatisfiable_pigeonhole and
@@ -3675,6 +3941,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(!result.satisfiable);
@@ -3695,6 +3962,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(!result.satisfiable);
@@ -3794,6 +4062,8 @@ mod tests {
         let mut conflicts_since_restart = 1_000_000usize;
         let mut restart_count = 0usize;
         let glucose = GlucoseState::new(params::default().cdcl.glucose_window_size);
+        let lists = occurrence::build(&_working_problem);
+        let mut rng = StdRng::seed_from_u64(1);
 
         maybe_restart(
             RestartStrategy::None,
@@ -3810,6 +4080,10 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
+            &_working_problem,
+            &lists,
+            &mut rng,
         );
 
         assert_eq!(restart_count, 0, "RestartStrategy::None must never restart");
@@ -3876,6 +4150,7 @@ mod tests {
         let mut conflicts_since_restart =
             params::default().cdcl.luby_base_conflicts * luby_term(0) - 1;
         let mut restart_count = 0usize;
+        let mut rng = StdRng::seed_from_u64(1);
         maybe_restart(
             RestartStrategy::Luby,
             &mut conflicts_since_restart,
@@ -3891,6 +4166,10 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
+            &working_problem,
+            &lists,
+            &mut rng,
         );
         assert_eq!(restart_count, 0, "below threshold, must not restart yet");
         assert_ne!(
@@ -3915,6 +4194,10 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
+            &working_problem,
+            &lists,
+            &mut rng,
         );
 
         assert_eq!(restart_count, 1, "threshold reached");
@@ -3953,6 +4236,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
 
             assert!(
@@ -3990,6 +4274,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
             assert!(
                 result.satisfiable,
@@ -4045,6 +4330,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(!result.satisfiable);
@@ -4068,6 +4354,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
         assert!(result.satisfiable);
 
@@ -4084,6 +4371,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
         assert!(!result.satisfiable);
     }
@@ -4103,6 +4391,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(
@@ -4130,6 +4419,7 @@ mod tests {
             &mut rng1,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         let mut rng2 = StdRng::seed_from_u64(7);
@@ -4143,6 +4433,7 @@ mod tests {
             &mut rng2,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert_eq!(got.satisfiable, want.satisfiable);
@@ -4172,6 +4463,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
             assert!(
                 result.satisfiable,
@@ -4217,6 +4509,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
             assert!(
                 !result.satisfiable,
@@ -4244,6 +4537,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(!result.satisfiable);
@@ -4269,6 +4563,7 @@ mod tests {
             &mut rng,
             0,
             &params::default().cdcl,
+            PhaseStrategy::Saving,
         );
 
         assert!(result.timed_out);
@@ -4305,6 +4600,7 @@ mod tests {
                 &mut rng,
                 0,
                 &params::default().cdcl,
+                PhaseStrategy::Saving,
             );
             assert!(result.satisfiable, "trial {trial}: expected satisfiable");
             for (ci, clause) in problem.clauses.iter().enumerate() {
@@ -4396,5 +4692,302 @@ mod tests {
 
         let got = buf.try_read(0).expect("expected Some");
         assert_eq!(got[0], 1, "publish must not alias the caller's slice");
+    }
+
+    // STAGE43.md: phase-selection strategy tests, mirroring
+    // go_src/internal/cdcl/phase_test.go's own coverage exactly.
+
+    /// Verifies that PhaseStrategy::RoundRobin resolves to
+    /// PHASE_ROUND_ROBIN_STRATEGIES[thread_index % 3], and every other
+    /// strategy is returned unchanged, mirroring
+    /// resolve_restart_strategy's own round-robin coverage.
+    #[test]
+    fn test_resolve_phase_strategy_round_robin() {
+        let want = [
+            PhaseStrategy::Saving,
+            PhaseStrategy::Target,
+            PhaseStrategy::RephaseWalkSAT,
+            PhaseStrategy::Saving,
+            PhaseStrategy::Target,
+        ];
+        for (i, &w) in want.iter().enumerate() {
+            assert_eq!(resolve_phase_strategy(PhaseStrategy::RoundRobin, i), w);
+        }
+        for strategy in [
+            PhaseStrategy::Saving,
+            PhaseStrategy::Target,
+            PhaseStrategy::RephaseWalkSAT,
+        ] {
+            assert_eq!(resolve_phase_strategy(strategy, 7), strategy);
+        }
+    }
+
+    /// Verifies that phase_for consults saved_phase, not target_phase,
+    /// for both PhaseStrategy::Saving and PhaseStrategy::RephaseWalkSAT
+    /// (the latter only changes how saved_phase gets updated, not
+    /// which array decision_literal reads -- see the module doc
+    /// comment).
+    #[test]
+    fn test_phase_for_saving_reads_saved_phase() {
+        for strategy in [PhaseStrategy::Saving, PhaseStrategy::RephaseWalkSAT] {
+            let saved_phase = vec![Value::Unassigned, Value::True];
+            let target_phase = vec![Value::Unassigned, Value::False];
+            assert_eq!(
+                phase_for(1, strategy, &saved_phase, &target_phase),
+                Value::True
+            );
+        }
+    }
+
+    /// Verifies that phase_for consults target_phase, not saved_phase,
+    /// under PhaseStrategy::Target.
+    #[test]
+    fn test_phase_for_target_reads_target_phase() {
+        let saved_phase = vec![Value::Unassigned, Value::False];
+        let target_phase = vec![Value::Unassigned, Value::True];
+        assert_eq!(
+            phase_for(1, PhaseStrategy::Target, &saved_phase, &target_phase),
+            Value::True
+        );
+    }
+
+    /// Verifies that update_target_phase snapshots every
+    /// currently-trailed variable's polarity into target_phase, and
+    /// advances best_trail_len, only when the trail is strictly longer
+    /// than the previous record.
+    #[test]
+    fn test_update_target_phase_records_new_record() {
+        let x: Assignment = vec![Value::Unassigned, Value::True, Value::False];
+        let trail = vec![1, 2];
+        let mut target_phase = vec![Value::False; 3];
+        let mut best_trail_len = 0usize;
+        update_target_phase(&trail, &x, &mut target_phase, &mut best_trail_len);
+        assert_eq!(best_trail_len, 2);
+        assert_eq!(target_phase[1], Value::True);
+        assert_eq!(target_phase[2], Value::False);
+    }
+
+    /// Verifies that a trail no longer than the existing record leaves
+    /// target_phase and best_trail_len untouched -- including the
+    /// exact-tie case, per update_target_phase's own doc comment
+    /// ("ties keep the earlier, already-recorded snapshot").
+    #[test]
+    fn test_update_target_phase_ignores_ties_and_shorter_trails() {
+        let x: Assignment = vec![Value::Unassigned, Value::True];
+        let trail = vec![1];
+        let mut target_phase = vec![Value::Unassigned, Value::False];
+        let mut best_trail_len = 1usize;
+        update_target_phase(&trail, &x, &mut target_phase, &mut best_trail_len);
+        assert_eq!(best_trail_len, 1, "must stay unchanged at 1");
+        assert_eq!(
+            target_phase[1],
+            Value::False,
+            "a tie must not overwrite target_phase"
+        );
+    }
+
+    /// Verifies that maybe_rephase is a no-op for every strategy other
+    /// than PhaseStrategy::RephaseWalkSAT, even with restart_count at
+    /// an exact multiple of rephase_interval_restarts.
+    #[test]
+    fn test_maybe_rephase_only_fires_for_rephase_walksat() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let lists = occurrence::build(&problem);
+        for strategy in [PhaseStrategy::Saving, PhaseStrategy::Target] {
+            let mut saved_phase = vec![Value::Unassigned, Value::True];
+            let p = params::Cdcl {
+                rephase_interval_restarts: 50,
+                rephase_max_flips: 100,
+                ..params::default().cdcl
+            };
+            let mut rng = StdRng::seed_from_u64(1);
+            let solution = maybe_rephase(
+                strategy,
+                50,
+                &p,
+                &problem,
+                &lists,
+                &mut saved_phase,
+                &mut rng,
+            );
+            assert!(solution.is_none(), "strategy={strategy:?}: want no-op");
+            assert_eq!(
+                saved_phase[1],
+                Value::True,
+                "strategy={strategy:?}: maybe_rephase changed saved_phase, want no-op"
+            );
+        }
+    }
+
+    /// Verifies that maybe_rephase only actually runs a WalkSAT burst
+    /// when restart_count is a positive multiple of
+    /// rephase_interval_restarts, using saved_phase mutation as the
+    /// observable signal (a real burst always overwrites saved_phase
+    /// wholesale -- see rephase_from_walksat).
+    #[test]
+    fn test_maybe_rephase_respects_interval() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let lists = occurrence::build(&problem);
+        let p = params::Cdcl {
+            rephase_interval_restarts: 3,
+            rephase_max_flips: 100,
+            ..params::default().cdcl
+        };
+        let mut saved_phase = vec![Value::True, Value::True, Value::True];
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let solution = maybe_rephase(
+            PhaseStrategy::RephaseWalkSAT,
+            2,
+            &p,
+            &problem,
+            &lists,
+            &mut saved_phase,
+            &mut rng,
+        );
+        assert!(solution.is_none());
+        assert_eq!(
+            saved_phase,
+            vec![Value::True, Value::True, Value::True],
+            "must not run at restart_count=2 (not a multiple of 3)"
+        );
+
+        maybe_rephase(
+            PhaseStrategy::RephaseWalkSAT,
+            3,
+            &p,
+            &problem,
+            &lists,
+            &mut saved_phase,
+            &mut rng,
+        );
+        // A real burst ran; every entry ended up True or False, never
+        // Unassigned (WalkSAT always produces a complete assignment)
+        // -- this is the only assertion that doesn't depend on
+        // WalkSAT's specific search trajectory.
+        assert!(
+            saved_phase[1] != Value::Unassigned && saved_phase[2] != Value::Unassigned,
+            "saved_phase = {saved_phase:?}, want a complete assignment after a WalkSAT burst"
+        );
+    }
+
+    /// Verifies that a rephase_interval_restarts of 0 never fires
+    /// rather than panicking on the modulo -- a hand-edited
+    /// `.vibe_sat.json` could set this, since params::default never
+    /// does.
+    #[test]
+    fn test_maybe_rephase_guards_non_positive_interval() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let lists = occurrence::build(&problem);
+        let p = params::Cdcl {
+            rephase_interval_restarts: 0,
+            rephase_max_flips: 100,
+            ..params::default().cdcl
+        };
+        let mut saved_phase = vec![Value::Unassigned, Value::True];
+        let mut rng = StdRng::seed_from_u64(1);
+        let solution = maybe_rephase(
+            PhaseStrategy::RephaseWalkSAT,
+            0,
+            &p,
+            &problem,
+            &lists,
+            &mut saved_phase,
+            &mut rng,
+        );
+        assert!(solution.is_none(), "must not panic, must not run");
+        assert_eq!(saved_phase[1], Value::True);
+    }
+
+    /// Verifies STAGE43.md's flagged edge case directly: when a
+    /// WalkSAT burst returns a complete satisfying assignment,
+    /// rephase_from_walksat returns Some(assignment) rather than
+    /// merely updating saved_phase. Uses a single two-literal clause
+    /// and a generous flip budget so the burst is satisfied with
+    /// overwhelming probability on the first try.
+    #[test]
+    fn test_rephase_from_walksat_solves_early_exit() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let lists = occurrence::build(&problem);
+        let p = params::Cdcl {
+            rephase_max_flips: 1000,
+            ..params::default().cdcl
+        };
+        let mut saved_phase = vec![Value::Unassigned, Value::Unassigned, Value::Unassigned];
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let solution = rephase_from_walksat(&problem, &lists, &p, &mut saved_phase, &mut rng);
+
+        let solution = solution
+            .expect("a single two-literal clause must be solved by WalkSAT within 1000 flips");
+        assert!(
+            solution[1] == Value::True || solution[2] == Value::True,
+            "solution = {solution:?}, want at least one variable True (clause [1, 2] satisfied)"
+        );
+    }
+
+    /// End-to-end smoke test through run_loop (rather than calling
+    /// rephase_from_walksat directly, as
+    /// test_rephase_from_walksat_solves_early_exit already does
+    /// deterministically) confirming the wiring between maybe_restart,
+    /// maybe_rephase, and the early-exit check in run_loop's own main
+    /// loop doesn't break ordinary solving: a trivial satisfiable
+    /// problem, forced to rephase on every restart
+    /// (rephase_interval_restarts=1) with restarts firing after every
+    /// single conflict (a luby_base_conflicts of 1), must still reach
+    /// satisfiable=true, in at most one conflict for a single
+    /// three-literal clause -- a loose bound consistent with (though
+    /// not, on its own, conclusive proof of) the early-exit path
+    /// having actually fired, since normal CDCL resolution of this
+    /// trivial clause would also need only the one conflict.
+    #[test]
+    fn test_run_loop_returns_sat_on_walksat_early_exit() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2, 3]],
+        };
+        let p = params::Cdcl {
+            luby_base_conflicts: 1,
+            rephase_interval_restarts: 1,
+            rephase_max_flips: 1000,
+            ..params::default().cdcl
+        };
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let result = run_loop(
+            &problem,
+            None,
+            SelectVarVariant::Weighted,
+            RestartStrategy::Luby,
+            None,
+            &mut rng,
+            None,
+            None,
+            &[],
+            &p,
+            PhaseStrategy::RephaseWalkSAT,
+        );
+
+        assert!(
+            result.satisfiable,
+            "want satisfiable=true (a trivially satisfiable problem, with WalkSAT rephasing forced every restart)"
+        );
+        assert!(
+            result.num_conflicts <= 1,
+            "num_conflicts = {}, want at most 1 for this trivial problem",
+            result.num_conflicts
+        );
     }
 }
