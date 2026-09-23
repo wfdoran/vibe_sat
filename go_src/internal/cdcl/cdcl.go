@@ -640,9 +640,39 @@ type solver struct {
 	// backtrackTo's doc comment for why that's sound here). lists is
 	// the occurrence index from Stage 2, extended in place every time
 	// a clause is learned; unlike dfs's, this one must be mutable.
+	//
+	// STAGE45.md: lists is no longer propagate's own candidate source
+	// (see watchersPositive/watchersNegative below for that) -- it is
+	// kept only because rephaseFromWalkSAT still needs a genuine full
+	// occurrence index (WalkSAT's flip-scoring needs every clause
+	// mentioning a variable, not just the ones currently watching it).
 	clauses []cnf.Clause
 	watch   [][2]cnf.Literal
 	lists   *occurrence.Lists
+
+	// watchersPositive[v]/watchersNegative[v] (STAGE45.md) hold the
+	// indices of clauses *currently* watching literal +v/-v -- i.e.
+	// clauses c where watch[c][0] or watch[c][1] equals that literal
+	// right now. This is the genuine watched-literal candidate index
+	// propagate should have had from the start: unlike lists (the
+	// static, full occurrence index, kept only for
+	// rephaseFromWalkSAT's use now -- see its own doc comment), a
+	// clause's entry here moves (is removed from one literal's list,
+	// appended to another's) every time chooseWatch actually picks a
+	// new watch for it, so propagate visiting watchersFor(literal)
+	// only ever does work proportional to how many clauses are
+	// genuinely watching that literal right now, not how many clauses
+	// merely mention it. See REPORT45.md for why this distinction
+	// turned out to be exactly the gap REPORT23.md's/REPORT38.md's
+	// "genuinely different watch-list representation" was gesturing
+	// at: reusing lists as propagate's candidate source (this
+	// project's design from Stage 9 through Stage 44) still needed a
+	// per-candidate check-and-skip for the (often large) majority of
+	// occurrences that merely mention the literal without watching it,
+	// which is exactly the cost a real watch list is supposed to
+	// avoid.
+	watchersPositive [][]int
+	watchersNegative [][]int
 
 	// numOriginalClauses is len(clauses) immediately after bootstrap,
 	// before any clause is learned. Every clause at an index below
@@ -836,6 +866,35 @@ func clauseByteCost(clause cnf.Clause) int64 {
 	return perClauseOverheadBytes + int64(len(clause))*bytesPerLiteral
 }
 
+// appendWatcher (STAGE45.md) records that clause index c is now one
+// of lit's watchers, in whichever of pos/neg (both indexed by
+// variable number, mirroring occurrence.Lists' own Positive/Negative
+// shape) actually corresponds to lit's sign. A package-level function
+// rather than a *solver method since newSolver needs it before a
+// *solver exists yet to build watchersPositive/watchersNegative from
+// scratch.
+func appendWatcher(pos, neg [][]int, lit cnf.Literal, c int) {
+	if lit.IsNegative() {
+		neg[lit.Var()] = append(neg[lit.Var()], c)
+	} else {
+		pos[lit.Var()] = append(pos[lit.Var()], c)
+	}
+}
+
+// watchersFor returns a pointer to the slice of clause indices
+// currently watching lit (s.watchersPositive[lit.Var()] or
+// s.watchersNegative[lit.Var()], matching appendWatcher's own
+// pos/neg convention), so callers can append to or compact it in
+// place -- the same *[]int-returning pattern this file already uses
+// for minTouched/lbdRecentBuf-style scratch slices that need
+// reslicing without losing the backing array.
+func (s *solver) watchersFor(lit cnf.Literal) *[]int {
+	if lit.IsNegative() {
+		return &s.watchersNegative[lit.Var()]
+	}
+	return &s.watchersPositive[lit.Var()]
+}
+
 // newSolver builds the initial solver state for problem: a defensive
 // bootstrap round of unit propagation (see dfs.Run's identical
 // bootstrap step for why this is needed even though Stage 8's
@@ -854,6 +913,8 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 	}
 
 	watch := make([][2]cnf.Literal, len(clauses))
+	watchersPositive := make([][]int, problem.NumVars+1)
+	watchersNegative := make([][]int, problem.NumVars+1)
 	var estimatedBytes int64
 	for c, clause := range clauses {
 		first, foundFirst := chooseWatch(clause, x, 0)
@@ -865,6 +926,8 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 			return nil, false
 		}
 		watch[c] = [2]cnf.Literal{first, second}
+		appendWatcher(watchersPositive, watchersNegative, first, c)
+		appendWatcher(watchersPositive, watchersNegative, second, c)
 		estimatedBytes += clauseByteCost(clause)
 	}
 
@@ -877,6 +940,8 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		numVars:                 problem.NumVars,
 		clauses:                 clauses,
 		watch:                   watch,
+		watchersPositive:        watchersPositive,
+		watchersNegative:        watchersNegative,
 		lists:                   occurrence.Build(&cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}),
 		numOriginalClauses:      len(clauses),
 		clauseActivity:          make([]float64, len(clauses)),
@@ -1309,45 +1374,92 @@ func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 // single remaining literal -- there is very little for the added
 // check to skip, and it costs a real branch and an extra
 // Literal.Var() call on every single candidate, on every single call,
-// whether or not it ever pays off. See reports/REPORT23.md for the
-// full profile comparison and why this is left as a "bigger possible
-// change" (worth revisiting conditionally, e.g. only for longer
-// learned/imported clauses) rather than applied outright.
+// whether or not it ever pays off.
+//
+// STAGE45.md: from Stage 9 through Stage 44, this loop's own
+// candidate source was s.lists.Positive/Negative -- the *full*,
+// static occurrence index (every clause that ever mentions the
+// falsified literal), filtered down to actual watchers with a
+// per-candidate check-and-skip (a switch whose default case just
+// continued past any clause that turned out not to be watching this
+// literal after all). REPORT41.md's re-profile found this loop still
+// dominating at 97.66% of single-threaded CPU time -- unsurprising in
+// hindsight: reusing the occurrence index this way meant paying
+// O(occurrences of a literal) work on every single propagation of it,
+// not O(current watchers of a literal), which is the entire point of
+// the two-watched-literal scheme in the first place (Moskewicz et
+// al., Chaff, DAC 2001) and exactly the gap "a genuinely different
+// watch-list representation" (REPORT23.md/REPORT38.md's own phrasing)
+// was gesturing at without quite naming. s.watchersPositive/
+// s.watchersNegative (see their own doc comment) are the fix: a
+// dynamic, per-literal index that shrinks the moment a watch moves
+// away and grows the moment one moves in, so this loop now only ever
+// visits clauses that are genuinely watching the literal that just
+// became false.
+//
+// The scan below is MiniSat's own standard in-place compaction
+// pattern, adapted to Go: since a clause whose watch moves away
+// (chooseWatch found a replacement) must be removed from this
+// literal's watcher list, while every other clause visited stays, the
+// list is compacted in place with two indices -- scanned (how many
+// entries have been read) and keep (how many entries, of those
+// scanned, are being kept in this same list) -- rather than building
+// a fresh list or doing an O(n) shift per removal. A clause that
+// finds no replacement always stays a watcher of the literal that
+// just went false (there's nowhere better for it to watch until some
+// future backtrack un-falsifies that literal again), which is why
+// "no replacement" is the only case that writes into the kept prefix.
+// If a conflict is found mid-scan, the loop stops early (break), but
+// any not-yet-scanned entries are still genuine, valid watchers of
+// this literal and must be copied into the compacted prefix before
+// returning -- skipping this step would silently drop clauses from
+// their own watch list, a correctness bug that would only surface
+// later, as a missed propagation or a missed conflict, not here.
 func (s *solver) propagate() int {
 	for s.qHead < len(s.trail) {
 		v := s.trail[s.qHead]
 		s.qHead++
 
 		var falsifiedLiteral cnf.Literal
-		var candidates []int
 		if s.x[v] == assign.True {
 			falsifiedLiteral = cnf.Literal(-v)
-			candidates = s.lists.Negative[v]
 		} else {
 			falsifiedLiteral = cnf.Literal(v)
-			candidates = s.lists.Positive[v]
 		}
 
-		for _, c := range candidates {
+		watchers := s.watchersFor(falsifiedLiteral)
+		list := *watchers
+		keep := 0
+		scanned := 0
+		conflict := noReason
+
+	scan:
+		for scanned < len(list) {
+			c := list[scanned]
+			scanned++
+
 			watch := &s.watch[c]
 			var otherWatch cnf.Literal
 			var falsifiedSlot int
-			switch {
-			case watch[0] == falsifiedLiteral:
+			if watch[0] == falsifiedLiteral {
 				otherWatch, falsifiedSlot = watch[1], 0
-			case watch[1] == falsifiedLiteral:
+			} else {
 				otherWatch, falsifiedSlot = watch[0], 1
-			default:
-				continue // this clause isn't watching the falsified literal
 			}
 
 			if replacement, found := chooseWatch(s.clauses[c], s.x, otherWatch); found {
 				watch[falsifiedSlot] = replacement
-				continue
+				*s.watchersFor(replacement) = append(*s.watchersFor(replacement), c)
+				continue scan
 			}
 
+			// No replacement available: c keeps watching falsifiedLiteral.
+			list[keep] = c
+			keep++
+
 			if isFalse(otherWatch, s.x) {
-				return c // conflict: clause c is now fully false
+				conflict = c
+				break scan
 			}
 			forcedVar := otherWatch.Var()
 			if s.x[forcedVar] == assign.Unassigned {
@@ -1355,6 +1467,16 @@ func (s *solver) propagate() int {
 			}
 			// Otherwise otherWatch is already true: the clause is
 			// satisfied through it, and there is nothing to do.
+		}
+
+		if scanned < len(list) {
+			copy(list[keep:], list[scanned:])
+			keep += len(list) - scanned
+		}
+		*watchers = list[:keep]
+
+		if conflict != noReason {
+			return conflict
 		}
 	}
 	return noReason
@@ -2029,6 +2151,8 @@ func (s *solver) addLearnedClause(learned cnf.Clause, lbd int) int {
 		}
 	}
 	s.watch = append(s.watch, [2]cnf.Literal{learned[0], learned[best]})
+	*s.watchersFor(learned[0]) = append(*s.watchersFor(learned[0]), idx)
+	*s.watchersFor(learned[best]) = append(*s.watchersFor(learned[best]), idx)
 	return idx
 }
 
@@ -2121,6 +2245,24 @@ func (s *solver) reduceClauseDatabase() {
 	s.clauseActivity = newActivity
 	s.clauseLBD = newLBD
 	s.lists = occurrence.Build(&cnf.Problem{NumVars: s.numVars, Clauses: newClauses})
+
+	// STAGE45.md: watchersPositive/watchersNegative index by clause
+	// index too, exactly like watch itself, so they need the same
+	// wholesale rebuild-from-newWatch treatment as everything else
+	// above -- patching them in place would mean walking oldToNew
+	// for every entry in every watcher list, no cheaper than just
+	// rebuilding from newWatch directly, and far more error-prone.
+	// Fine either way: reduceClauseDatabase only runs when the
+	// (optional) memory limit is actually exceeded, not on every
+	// conflict, so this O(current clauses) rebuild is not the hot path.
+	newWatchersPositive := make([][]int, s.numVars+1)
+	newWatchersNegative := make([][]int, s.numVars+1)
+	for idx, w := range newWatch {
+		appendWatcher(newWatchersPositive, newWatchersNegative, w[0], idx)
+		appendWatcher(newWatchersPositive, newWatchersNegative, w[1], idx)
+	}
+	s.watchersPositive = newWatchersPositive
+	s.watchersNegative = newWatchersNegative
 
 	s.estimatedBytes = 0
 	for _, clause := range newClauses {

@@ -203,6 +203,8 @@ func (s *solver) importClause(lits cnf.Clause) {
 		}
 	}
 	s.watch = append(s.watch, [2]cnf.Literal{first, second})
+	*s.watchersFor(first) = append(*s.watchersFor(first), idx)
+	*s.watchersFor(second) = append(*s.watchersFor(second), idx)
 
 	if s.memoryLimitBytes != nil && s.estimatedBytes > *s.memoryLimitBytes {
 		s.reduceClauseDatabase()

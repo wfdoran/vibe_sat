@@ -146,6 +146,8 @@ pub(crate) fn maybe_import(
     num_conflicts: usize,
     clauses: &mut Vec<Clause>,
     lists: &mut crate::occurrence::Lists,
+    watchers_positive: &mut [Vec<usize>],
+    watchers_negative: &mut [Vec<usize>],
     watch: &mut Vec<[crate::cnf::Literal; 2]>,
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
@@ -164,6 +166,8 @@ pub(crate) fn maybe_import(
                 &lits,
                 clauses,
                 lists,
+                watchers_positive,
+                watchers_negative,
                 watch,
                 x,
                 clause_activity,
@@ -222,6 +226,8 @@ fn import_clause(
     lits: &Clause,
     clauses: &mut Vec<Clause>,
     lists: &mut crate::occurrence::Lists,
+    watchers_positive: &mut [Vec<usize>],
+    watchers_negative: &mut [Vec<usize>],
     watch: &mut Vec<[crate::cnf::Literal; 2]>,
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
@@ -249,4 +255,15 @@ fn import_clause(
         }
     }
     watch.push([first, second]);
+    // STAGE45.md: an imported clause's two initial watches must be
+    // registered here too, exactly like add_learned_clause already
+    // does for a self-learned one -- otherwise propagate's own
+    // watcher-list scan would never find this clause at all, silently
+    // making cross-thread clause sharing inert under the new
+    // watched-literal representation (this clause would still occupy
+    // memory and eventually get folded back in by
+    // reduce_clause_database's wholesale rebuild, but would
+    // contribute nothing to propagation until then).
+    super::append_watcher(watchers_positive, watchers_negative, first, idx);
+    super::append_watcher(watchers_positive, watchers_negative, second, idx);
 }

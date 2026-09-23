@@ -2,6 +2,7 @@ package cdcl
 
 import (
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 
@@ -276,5 +277,31 @@ func TestImportClauseAddsLiveClause(t *testing.T) {
 	s.importClause(cnf.Clause{cnf.Literal(2), cnf.Literal(3)})
 	if len(s.clauses) != before+1 {
 		t.Errorf("importClause() did not add a live clause; len(s.clauses) = %d, want %d", len(s.clauses), before+1)
+	}
+}
+
+// TestImportClauseRegistersWatcherLists verifies STAGE45.md's watcher
+// lists (watchersPositive/watchersNegative), not just watch itself,
+// are updated for an imported clause -- otherwise propagate (which
+// reads only the watcher lists now, not the old occurrence index)
+// would never find this clause as a candidate at all, silently making
+// clause sharing inert until the next reduceClauseDatabase rebuild
+// (which, with no memory limit set, may never happen).
+func TestImportClauseRegistersWatcherLists(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	if !ok {
+		t.Fatal("newSolver() reported ok = false unexpectedly")
+	}
+
+	s.importClause(cnf.Clause{cnf.Literal(2), cnf.Literal(3)})
+	idx := len(s.clauses) - 1
+	if idx < 0 {
+		t.Fatal("importClause() did not add the clause")
+	}
+	for _, lit := range s.watch[idx] {
+		if !slices.Contains(*s.watchersFor(lit), idx) {
+			t.Errorf("imported clause %d watches %v but does not appear in watchersFor(%v) = %v", idx, lit, lit, *s.watchersFor(lit))
+		}
 	}
 }

@@ -1242,6 +1242,8 @@ fn run_loop<R: Rng>(
 
     let mut peer_cursors = vec![0u64; peers.len()];
     let mut lists = occurrence::build(&working_problem);
+    let (mut watchers_positive, mut watchers_negative) =
+        build_watchers(&watch, working_problem.num_vars);
     let mut level = vec![0usize; problem.num_vars + 1];
     let mut reason: Vec<Option<usize>> = vec![None; problem.num_vars + 1];
     let mut trail: Vec<usize> = Vec::new();
@@ -1360,7 +1362,8 @@ fn run_loop<R: Rng>(
 
         let confl = propagate(
             &working_problem.clauses,
-            &lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut x,
             &mut trail,
@@ -1426,6 +1429,8 @@ fn run_loop<R: Rng>(
                 lbd,
                 &mut working_problem.clauses,
                 &mut lists,
+                &mut watchers_positive,
+                &mut watchers_negative,
                 &mut watch,
                 &level,
                 &mut clause_activity,
@@ -1486,6 +1491,8 @@ fn run_loop<R: Rng>(
                 reduce_clause_database(
                     &mut working_problem.clauses,
                     &mut lists,
+                    &mut watchers_positive,
+                    &mut watchers_negative,
                     &mut watch,
                     &mut clause_activity,
                     &mut clause_lbd,
@@ -1509,6 +1516,8 @@ fn run_loop<R: Rng>(
                 num_conflicts,
                 &mut working_problem.clauses,
                 &mut lists,
+                &mut watchers_positive,
+                &mut watchers_negative,
                 &mut watch,
                 &x,
                 &mut clause_activity,
@@ -1675,6 +1684,63 @@ fn assign_literal(
     }
 }
 
+/// Records that clause index `c` is now one of `lit`'s watchers, in
+/// whichever of `positive`/`negative` (both indexed by variable
+/// number, mirroring [`Lists`]' own `positive`/`negative` shape)
+/// actually corresponds to `lit`'s sign. A plain function taking both
+/// slices explicitly (rather than a method on some combined watcher
+/// state) for the same reason `propagate` itself takes independent
+/// `&mut` parameters instead of `&mut self` -- see its own doc
+/// comment.
+fn append_watcher(
+    positive: &mut [Vec<usize>],
+    negative: &mut [Vec<usize>],
+    lit: Literal,
+    c: usize,
+) {
+    let v = cnf::literal_var(lit);
+    if cnf::literal_is_negative(lit) {
+        negative[v].push(c);
+    } else {
+        positive[v].push(c);
+    }
+}
+
+/// Returns a mutable reference to the slice of clause indices
+/// currently watching `lit` (`positive[lit.var()]` or
+/// `negative[lit.var()]`, matching [`append_watcher`]'s own
+/// `positive`/`negative` convention), so callers can push to or
+/// compact it in place.
+fn watchers_for<'a>(
+    positive: &'a mut [Vec<usize>],
+    negative: &'a mut [Vec<usize>],
+    lit: Literal,
+) -> &'a mut Vec<usize> {
+    let v = cnf::literal_var(lit);
+    if cnf::literal_is_negative(lit) {
+        &mut negative[v]
+    } else {
+        &mut positive[v]
+    }
+}
+
+/// Builds `watchers_positive`/`watchers_negative` from `watch` and
+/// `num_vars`: every clause index appended to both of its two current
+/// watches' watcher lists. Used wherever `watch` is freshly built or
+/// wholesale-rebuilt ([`bootstrap`]'s callers and
+/// [`reduce_clause_database`]), mirroring the same
+/// `occurrence::build`-after-`watch`-is-known pattern [`Lists`] itself
+/// already uses.
+fn build_watchers(watch: &[[Literal; 2]], num_vars: usize) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let mut positive = vec![Vec::new(); num_vars + 1];
+    let mut negative = vec![Vec::new(); num_vars + 1];
+    for (c, w) in watch.iter().enumerate() {
+        append_watcher(&mut positive, &mut negative, w[0], c);
+        append_watcher(&mut positive, &mut negative, w[1], c);
+    }
+    (positive, negative)
+}
+
 /// Applies boolean constraint propagation via watched literals (see
 /// STAGE9.md's `bcp`, which this mirrors closely) starting from
 /// wherever it last left off (`*q_head`), continuing until either the
@@ -1706,10 +1772,52 @@ fn assign_literal(
 /// made things reproducibly *worse*, not better -- see
 /// `reports/REPORT23.md` for why, and for why it's listed there as a
 /// possible future change rather than applied here.
+///
+/// STAGE45.md: from Stage 9 through Stage 44, this loop's own
+/// candidate source was `lists.positive`/`lists.negative` -- the
+/// *full*, static occurrence index (every clause that ever mentions
+/// the falsified literal), filtered down to actual watchers with a
+/// per-candidate check-and-skip (the `else { continue; }` arm below
+/// used to be reachable; it no longer is). `REPORT41.md`'s re-profile
+/// found this loop still dominating at 97.66% of single-threaded CPU
+/// time -- unsurprising in hindsight: reusing the occurrence index
+/// this way meant paying O(occurrences of a literal) work on every
+/// single propagation of it, not O(current watchers of a literal),
+/// which is the entire point of the two-watched-literal scheme in the
+/// first place (Moskewicz et al., Chaff, DAC 2001) and exactly the
+/// gap "a genuinely different watch-list representation"
+/// (`REPORT23.md`/`REPORT38.md`'s own phrasing) was gesturing at
+/// without quite naming. `watchers_positive`/`watchers_negative` are
+/// the fix: a dynamic, per-literal index that shrinks the moment a
+/// watch moves away and grows the moment one moves in, so this loop
+/// now only ever visits clauses genuinely watching the literal that
+/// just became false. `lists` is kept only because
+/// `rephase_from_walksat` (STAGE43.md) still needs a real full
+/// occurrence index for WalkSAT's flip-scoring.
+///
+/// The scan below is MiniSat's own standard in-place compaction
+/// pattern: since a clause whose watch moves away (`choose_watch`
+/// found a replacement) must be removed from this literal's watcher
+/// list, while every other clause visited stays, the list is
+/// compacted in place with two indices -- `scanned` (how many entries
+/// have been read) and `keep` (how many entries, of those scanned,
+/// are being kept in this same list) -- rather than building a fresh
+/// list or doing an O(n) shift per removal. A clause that finds no
+/// replacement always stays a watcher of the literal that just went
+/// false (there's nowhere better for it to watch until some future
+/// backtrack un-falsifies that literal again), which is why "no
+/// replacement" is the only case that writes into the kept prefix. If
+/// a conflict is found mid-scan, the loop stops early (`break`), but
+/// any not-yet-scanned entries are still genuine, valid watchers of
+/// this literal and must be copied into the compacted prefix before
+/// returning -- skipping this step would silently drop clauses from
+/// their own watch list, a correctness bug that would only surface
+/// later, as a missed propagation or a missed conflict, not here.
 #[allow(clippy::too_many_arguments)]
 fn propagate(
     clauses: &[Clause],
-    lists: &Lists,
+    watchers_positive: &mut [Vec<usize>],
+    watchers_negative: &mut [Vec<usize>],
     watch: &mut [[Literal; 2]],
     x: &mut Assignment,
     trail: &mut Vec<usize>,
@@ -1725,31 +1833,45 @@ fn propagate(
         let v = trail[*q_head];
         *q_head += 1;
 
-        let (falsified_literal, candidates): (Literal, &Vec<usize>) = if x[v] == Value::True {
-            (-(v as Literal), &lists.negative[v])
+        let falsified_literal: Literal = if x[v] == Value::True {
+            -(v as Literal)
         } else {
-            (v as Literal, &lists.positive[v])
+            v as Literal
         };
 
-        for &c in candidates {
+        let mut list = std::mem::take(watchers_for(
+            watchers_positive,
+            watchers_negative,
+            falsified_literal,
+        ));
+        let mut keep = 0usize;
+        let mut scanned = 0usize;
+        let mut conflict = None;
+
+        while scanned < list.len() {
+            let c = list[scanned];
+            scanned += 1;
+
             let w = watch[c];
             let (other_watch, falsified_slot) = if w[0] == falsified_literal {
                 (w[1], 0)
-            } else if w[1] == falsified_literal {
-                (w[0], 1)
             } else {
-                continue; // this clause isn't watching the falsified literal
+                (w[0], 1)
             };
 
             if let Some(replacement) = choose_watch(&clauses[c], x, Some(other_watch)) {
                 watch[c][falsified_slot] = replacement;
+                watchers_for(watchers_positive, watchers_negative, replacement).push(c);
                 continue;
             }
 
-            // No replacement: other_watch is the clause's only
-            // literal that isn't currently false.
+            // No replacement available: c keeps watching falsified_literal.
+            list[keep] = c;
+            keep += 1;
+
             if is_false(other_watch, x) {
-                return Some(c); // conflict: clause c is now fully false
+                conflict = Some(c);
+                break;
             }
             let forced_var = cnf::literal_var(other_watch);
             if x[forced_var] == Value::Unassigned {
@@ -1768,6 +1890,17 @@ fn propagate(
             }
             // Otherwise other_watch is already true: the clause is
             // satisfied through it, and there is nothing to do.
+        }
+
+        if scanned < list.len() {
+            list.copy_within(scanned.., keep);
+            keep += list.len() - scanned;
+        }
+        list.truncate(keep);
+        *watchers_for(watchers_positive, watchers_negative, falsified_literal) = list;
+
+        if conflict.is_some() {
+            return conflict;
         }
     }
     None
@@ -2306,6 +2439,8 @@ fn add_learned_clause(
     lbd: usize,
     clauses: &mut Vec<Clause>,
     lists: &mut Lists,
+    watchers_positive: &mut [Vec<usize>],
+    watchers_negative: &mut [Vec<usize>],
     watch: &mut Vec<[Literal; 2]>,
     level: &[usize],
     clause_activity: &mut Vec<f64>,
@@ -2344,6 +2479,8 @@ fn add_learned_clause(
         }
     }
     watch.push([learned[0], learned[best]]);
+    append_watcher(watchers_positive, watchers_negative, learned[0], idx);
+    append_watcher(watchers_positive, watchers_negative, learned[best], idx);
     Some(idx)
 }
 
@@ -2382,6 +2519,8 @@ fn add_learned_clause(
 fn reduce_clause_database(
     clauses: &mut Vec<Clause>,
     lists: &mut Lists,
+    watchers_positive: &mut Vec<Vec<usize>>,
+    watchers_negative: &mut Vec<Vec<usize>>,
     watch: &mut Vec<[Literal; 2]>,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
@@ -2449,6 +2588,18 @@ fn reduce_clause_database(
     *lists = occurrence::build(&temp_problem);
     *clauses = temp_problem.clauses;
     *watch = new_watch;
+    // STAGE45.md: watchers_positive/watchers_negative index by clause
+    // index too, exactly like watch itself, so they need the same
+    // wholesale rebuild-from-new_watch treatment as everything else
+    // above -- patching them in place would mean walking old_to_new
+    // for every entry in every watcher list, no cheaper than just
+    // rebuilding from watch directly, and far more error-prone. Fine
+    // either way: reduce_clause_database only runs when the (optional)
+    // memory limit is actually exceeded, not on every conflict, so
+    // this O(current clauses) rebuild is not the hot path.
+    let (new_watchers_positive, new_watchers_negative) = build_watchers(watch, x.len() - 1);
+    *watchers_positive = new_watchers_positive;
+    *watchers_negative = new_watchers_negative;
     *clause_activity = new_activity;
     *clause_lbd = new_lbd;
 }
@@ -2606,7 +2757,8 @@ mod tests {
         };
         let (working_problem, mut watch, mut x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
-        let lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let mut level = vec![0usize; 4];
         let mut reason: Vec<Option<usize>> = vec![None; 4];
         let mut trail: Vec<usize> = Vec::new();
@@ -2627,7 +2779,8 @@ mod tests {
         );
         let confl = propagate(
             &working_problem.clauses,
-            &lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut x,
             &mut trail,
@@ -2678,7 +2831,8 @@ mod tests {
         };
         let (working_problem, mut watch, mut x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
-        let lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let mut level = vec![0usize; 5];
         let mut reason: Vec<Option<usize>> = vec![None; 5];
         let mut trail: Vec<usize> = Vec::new();
@@ -2701,7 +2855,8 @@ mod tests {
         );
         let confl = propagate(
             &working_problem.clauses,
-            &lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut x,
             &mut trail,
@@ -3030,6 +3185,8 @@ mod tests {
         let (mut working_problem, mut watch, _x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let level = vec![0usize; 3];
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut estimated_bytes = 0i64;
@@ -3041,6 +3198,8 @@ mod tests {
             1,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3061,6 +3220,8 @@ mod tests {
         let (mut working_problem, mut watch, _x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let mut level = vec![0usize; 4];
         level[2] = 1;
         level[3] = 3; // higher than variable 2's level
@@ -3073,6 +3234,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3197,6 +3360,8 @@ mod tests {
         let (mut working_problem, mut watch, mut x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let level = vec![0usize; 6];
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
@@ -3213,6 +3378,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3225,6 +3392,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3237,6 +3406,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3254,6 +3425,8 @@ mod tests {
         reduce_clause_database(
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
@@ -3299,6 +3472,8 @@ mod tests {
         let (mut working_problem, mut watch, mut x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let level = vec![0usize; 3];
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
@@ -3311,6 +3486,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3325,6 +3502,8 @@ mod tests {
         reduce_clause_database(
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
@@ -3353,6 +3532,8 @@ mod tests {
         let (mut working_problem, mut watch, x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let level = vec![0usize; 7];
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
@@ -3366,6 +3547,8 @@ mod tests {
             glue_clause_lbd_threshold,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3378,6 +3561,8 @@ mod tests {
             glue_clause_lbd_threshold + 1,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3390,6 +3575,8 @@ mod tests {
             glue_clause_lbd_threshold + 1,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3405,6 +3592,8 @@ mod tests {
         reduce_clause_database(
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
@@ -3443,6 +3632,8 @@ mod tests {
         let (mut working_problem, mut watch, x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let level = vec![0usize; 5];
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
@@ -3455,6 +3646,8 @@ mod tests {
             10,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3467,6 +3660,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -3481,6 +3676,8 @@ mod tests {
         reduce_clause_database(
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
@@ -3730,7 +3927,8 @@ mod tests {
         };
         let (working_problem, mut watch, mut x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
-        let lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let mut level = vec![0usize; 5];
         let mut reason: Vec<Option<usize>> = vec![None; 5];
         let mut trail: Vec<usize> = Vec::new();
@@ -3753,7 +3951,8 @@ mod tests {
         );
         let confl = propagate(
             &working_problem.clauses,
-            &lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &mut x,
             &mut trail,
@@ -4131,6 +4330,8 @@ mod tests {
         let (mut working_problem, mut watch, mut x) =
             bootstrap(&problem).expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
         let mut level = vec![0usize; 3];
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
@@ -4140,6 +4341,8 @@ mod tests {
             3,
             &mut working_problem.clauses,
             &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
             &mut watch,
             &level,
             &mut clause_activity,
@@ -5017,5 +5220,282 @@ mod tests {
             "num_conflicts = {}, want at most 1 for this trivial problem",
             result.num_conflicts
         );
+    }
+
+    /// Verifies STAGE45.md's invariant directly: immediately after
+    /// bootstrap, every clause's two current watches appear in that
+    /// literal's own watcher list.
+    #[test]
+    fn test_build_watchers_matches_watch() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1, 2, 3], vec![-1, 2, -3], vec![1, -4]],
+        };
+        let (working_problem, watch, _x) = bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+
+        for (c, w) in watch.iter().enumerate() {
+            for &lit in w {
+                assert!(
+                    watchers_for(&mut watchers_positive, &mut watchers_negative, lit).contains(&c),
+                    "clause {c} watches {lit} but does not appear in watchers_for({lit})"
+                );
+            }
+        }
+    }
+
+    /// STAGE45.md's central correctness test: a single `propagate`
+    /// call where, for the literal being falsified, one watcher moves
+    /// away (found a replacement), two more stay (no replacement
+    /// available), and the *last* of those two conflicts --
+    /// deliberately positioned so a real gap already exists in the
+    /// watcher list (from the earlier move-away) by the time the
+    /// conflict is found, and at least one further, not-yet-scanned
+    /// entry exists after it in the original list. Every one of these
+    /// cases has to be handled correctly by the in-place compaction
+    /// for the literal's own watcher list to end up correct
+    /// afterward.
+    ///
+    /// Clauses, by index:
+    ///
+    ///   0 (D): {1, 6, 7} -- 3 literals; watches 1 and 6 initially, so
+    ///     a replacement (7) is available once literal 1 goes false:
+    ///     moves away from watchers_for(+1) to watchers_for(+7).
+    ///   1 (B): {1, 4} -- 2 literals; no replacement possible once
+    ///     literal 1 goes false (only literal 4 remains, and it's
+    ///     unassigned, not a valid *replacement* target since
+    ///     choose_watch only replaces the falsified slot, not both)
+    ///     -- stays a watcher of +1, and forces variable 4 true.
+    ///   2 (A): {1, 2} -- 2 literals; variable 2 is pre-set False (as
+    ///     pure test setup, not via propagate, so nothing else
+    ///     propagates as a side effect), so once literal 1 also goes
+    ///     false, this clause is fully falsified: a conflict, but it
+    ///     still stays a watcher of +1 (the "no replacement" case
+    ///     applies regardless of whether the clause conflicts).
+    ///   3 (C): {1, 3} -- 2 literals; positioned after the conflict
+    ///     in watchers_for(+1)'s scan order, so propagate must never
+    ///     even reach it this call -- it must survive in the watcher
+    ///     list untouched for a future call to find.
+    ///
+    /// All four clauses pick literal 1 as their first watch
+    /// (choose_watch scans each clause left to right at construction,
+    /// and 1 is each clause's first literal), so watchers_for(+1)
+    /// starts as [0, 1, 2, 3] in exactly this order.
+    #[test]
+    fn test_propagate_watcher_list_compaction() {
+        let problem = Problem {
+            num_vars: 7,
+            clauses: vec![
+                vec![1, 6, 7], // D
+                vec![1, 4],    // B
+                vec![1, 2],    // A
+                vec![1, 3],    // C
+            ],
+        };
+        let (working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+
+        assert_eq!(
+            *watchers_for(&mut watchers_positive, &mut watchers_negative, 1),
+            vec![0, 1, 2, 3],
+            "watchers_for(+1) before propagate (test setup assumption violated)"
+        );
+
+        // Pure test setup: variable 2 is false, with no trail entry
+        // and no propagation triggered by it -- isolating this test
+        // to exactly the one propagate() call under test, over
+        // variable 1's own assignment.
+        x[2] = Value::False;
+
+        let mut level = vec![0usize; 8];
+        let mut reason: Vec<Option<usize>> = vec![None; 8];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(7);
+
+        assign_literal(
+            -1,
+            0,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        ); // variable 1 := false
+
+        let conflict = propagate(
+            &working_problem.clauses,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &mut x,
+            &mut trail,
+            &mut q_head,
+            0,
+            &mut level,
+            &mut reason,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        );
+
+        assert_eq!(conflict, Some(2), "expected clause A ({{1 2}}) to conflict");
+
+        assert_eq!(
+            *watchers_for(&mut watchers_positive, &mut watchers_negative, 1),
+            vec![1, 2, 3], // B, A, C -- D moved away
+            "watchers_for(+1) after propagate"
+        );
+        assert_eq!(
+            *watchers_for(&mut watchers_positive, &mut watchers_negative, 7),
+            vec![0], // D, moved in
+            "watchers_for(+7) after propagate (D should have moved here)"
+        );
+        assert!(
+            watch[0] == [7, 6] || watch[0] == [6, 7],
+            "clause 0's (D's) watch = {:?}, want [6, 7] in either order",
+            watch[0]
+        );
+        assert_eq!(
+            x[4],
+            Value::True,
+            "variable 4 should have been forced by clause B ({{1 4}})"
+        );
+        assert_eq!(
+            x[3],
+            Value::Unassigned,
+            "variable 3 (clause C, {{1 3}}) must never have been scanned this call"
+        );
+    }
+
+    /// Verifies that a freshly learned clause's two initial watches
+    /// are recorded in watchers_positive/watchers_negative, not just
+    /// in watch itself -- otherwise a future propagate() would never
+    /// find this clause at all.
+    #[test]
+    fn test_add_learned_clause_updates_watcher_lists() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1, 2, 3, 4]],
+        };
+        let (mut working_problem, mut watch, _x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+        let mut level = vec![0usize; 5];
+        level[3] = 2;
+        level[4] = 5; // higher level than 3, so add_learned_clause's own "watch the highest-level other literal" tiebreak picks literal 4 (best)
+        let mut clause_activity: Vec<f64> = vec![0.0; working_problem.clauses.len()];
+        let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
+        let mut estimated_bytes: i64 = 0;
+
+        let idx = add_learned_clause(
+            &vec![-1, 3, 4],
+            2,
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &level,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+        )
+        .expect("expected a stored clause for a length-3 learned clause");
+
+        assert!(
+            watchers_for(&mut watchers_positive, &mut watchers_negative, -1).contains(&idx),
+            "watchers_for(-1) should contain the new clause {idx}"
+        );
+        assert!(
+            watchers_for(&mut watchers_positive, &mut watchers_negative, 4).contains(&idx),
+            "watchers_for(4) should contain the new clause {idx}"
+        );
+        assert_eq!(watch[idx], [-1, 4]);
+    }
+
+    /// Verifies that after a reduction pass deletes and renumbers
+    /// clauses, watchers_positive/watchers_negative are rebuilt
+    /// consistently with the new watch array -- every remaining
+    /// clause's current watches must appear in the corresponding
+    /// (renumbered) watcher lists, and nothing should reference a
+    /// clause index that no longer exists.
+    #[test]
+    fn test_reduce_clause_database_rebuilds_watcher_lists() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+        let level = vec![0usize; 3];
+        let mut clause_activity: Vec<f64> = vec![0.0; working_problem.clauses.len()];
+        let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
+        let mut estimated_bytes: i64 = 0;
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let num_original_clauses = working_problem.clauses.len();
+        let glue_threshold = params::default().cdcl.glue_clause_lbd_threshold;
+
+        // Learn enough distinct, unlocked, non-glue (LBD > threshold)
+        // clauses that reduce_clause_database actually has something
+        // eligible to delete.
+        for _ in 0..6 {
+            add_learned_clause(
+                &vec![1, 2],
+                glue_threshold + 1,
+                &mut working_problem.clauses,
+                &mut lists,
+                &mut watchers_positive,
+                &mut watchers_negative,
+                &mut watch,
+                &level,
+                &mut clause_activity,
+                &mut clause_lbd,
+                &mut estimated_bytes,
+            );
+        }
+        reduce_clause_database(
+            &mut working_problem.clauses,
+            &mut lists,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &mut clause_activity,
+            &mut clause_lbd,
+            &mut estimated_bytes,
+            &x,
+            &mut reason,
+            num_original_clauses,
+            glue_threshold,
+        );
+
+        for (c, w) in watch.iter().enumerate() {
+            for &lit in w {
+                assert!(
+                    watchers_for(&mut watchers_positive, &mut watchers_negative, lit).contains(&c),
+                    "after reduce_clause_database: clause {c} watches {lit} but is missing from watchers_for({lit})"
+                );
+            }
+        }
+        for lit in [1, -1, 2, -2] {
+            for &c in watchers_for(&mut watchers_positive, &mut watchers_negative, lit).iter() {
+                assert!(
+                    c < working_problem.clauses.len(),
+                    "watchers_for({lit}) contains out-of-range clause index {c} (len = {})",
+                    working_problem.clauses.len()
+                );
+            }
+        }
     }
 }

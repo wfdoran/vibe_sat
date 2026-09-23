@@ -40,6 +40,17 @@ the clauses that could plausibly have changed status" — the single
 biggest reason `dfs` and `cdcl` can handle formulas with thousands of
 clauses at all.
 
+`dfs`'s own BCP (`internal/dfs/watch.go`) still finds its candidate
+clauses via the full occurrence index (every clause that ever mentions
+the literal), the same design `cdcl`'s own BCP used from Stage 9
+through Stage 44 — see "A genuine watch-list, not just watched
+literals" under CDCL below for why that turned out to leave real
+performance on the table, and why `cdcl`'s own version no longer works
+this way. `dfs` hasn't been changed to match; per `STAGE11.md`'s
+original instruction to leave it as its own separate implementation,
+this is a real, live opportunity for a future stage, not something
+this project has evaluated the cost of yet.
+
 ## CDCL
 
 `--algorithm=cdcl` starts from the same DPLL skeleton as `dfs` but adds
@@ -74,6 +85,47 @@ branching heuristics (VSIDS/LRB) and restarts were added on top —
 "bare" CDCL is a known weak spot in the literature on structureless
 random instances specifically, and this project reproduced that
 finding directly before fixing it.
+
+### A genuine watch-list, not just watched literals
+
+`cdcl`'s BCP correctly implements the two-watched-literal *invariant*
+(every clause always watches exactly two not-yet-falsified literals,
+lazily updated) from Stage 9 onward — but from Stage 9 through Stage
+44, it found *which clauses to check* when a literal became false by
+scanning that literal's full occurrence index (every clause that ever
+mentions it, the same static index `hc`/`ws`'s local search and
+`dfs`'s own BCP still use) and skipping past whichever candidates
+turned out not to actually be watching that literal right now. That's
+a real, different thing from a genuine watch list, and the difference
+matters: propagating a literal cost `O(occurrences)` work this way,
+not `O(current watchers)` — the entire efficiency argument behind
+watched literals in the first place (Moskewicz et al., Chaff, DAC
+2001) never fully applied to `cdcl` here, even though the watch
+*bookkeeping* itself (`chooseWatch`, lazy updates) was always correct.
+
+Three separate CPU profiles (Stage 23, Stage 38, Stage 41 — the last
+finding `propagate`/`chooseWatch` at 97.66% of single-threaded CPU
+time) kept confirming the same hot function without anyone pinning
+down *why* it stayed so expensive even as other, real inefficiencies
+around it got fixed. `STAGE45.md` found the actual gap: a second,
+genuinely dynamic per-literal index (`watchersPositive`/
+`watchersNegative`) that only ever holds clauses currently watching
+that literal, maintained incrementally every time a watch actually
+moves (an entry is removed the instant `chooseWatch` finds a
+replacement, added the instant one is chosen). Measured directly on
+this project's own hard benchmark instance
+(`benchmark/uuf250-1065/uuf250-01.cnf`, the same file profiled three
+times before): roughly 25-40% faster wall-clock time depending on
+measurement method, and on a 30-file sample of the 250-variable random
+set specifically (the instance class `REPORT40.md` found `vibe_sat`
+losing on against `minisat`/`cryptominisat5`), the fixed version
+solved more files within the same time budget and averaged
+meaningfully faster among the ones both versions solved — see
+`reports/REPORT45.md` for the full numbers. `lists` (the original
+occurrence index) is still kept around for one real remaining
+consumer: WalkSAT rephasing (`STAGE43.md`) genuinely needs every
+clause mentioning a variable, not just its current watchers, to score
+a flip correctly.
 
 ## WalkSAT
 
@@ -388,6 +440,16 @@ side — proving unsatisfiability needs the whole search space
 genuinely covered, so a clause one thread learns can save a lot of
 duplicated work elsewhere; a satisfying assignment, needing only one
 lucky path, benefits much less.
+
+`STAGE45.md`'s watch-list rewrite (see "A genuine watch-list" above)
+briefly put this at real risk: an imported clause's watch entry was
+being recorded without also registering it in the new watcher lists
+`propagate` actually reads, which would have silently made every
+imported clause invisible to the search until (if ever) a memory-
+limit-triggered database reduction rebuilt it in — with no memory
+limit set by default, potentially never. Caught and fixed the same
+stage, with a dedicated regression test in both languages; see
+`reports/REPORT45.md`.
 
 ## Testing, at every stage
 
