@@ -243,7 +243,6 @@ func runWalkSat(problem *cnf.Problem, preResult *preprocess.Result, originalNumV
 // reconstructed back to originalNumVars variables before being
 // written out.
 func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars int, args *cliargs.Args) {
-	lists := occurrence.Build(problem)
 	rng := newSeededRand()
 
 	var timeLimit *time.Duration
@@ -257,7 +256,7 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 		variant = dfs.SelectVarVariant(*args.AlgParams[0])
 	}
 
-	result := dfs.RunParallel(problem, lists, timeLimit, variant, args.NumThreads, rng, args.Verbose)
+	result := dfs.RunParallel(problem, timeLimit, variant, args.NumThreads, rng, args.Verbose)
 
 	if result.Satisfiable {
 		writeSolution(reconstructedAssignment(result.Assignment, preResult), originalNumVars, args)

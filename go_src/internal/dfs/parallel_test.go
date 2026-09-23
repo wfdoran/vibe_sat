@@ -8,7 +8,6 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
-	"vibe_sat/internal/occurrence"
 )
 
 // TestRunParallelWithOneThreadMatchesRun verifies STAGE18.md's core
@@ -20,10 +19,9 @@ import (
 // machinery at all.
 func TestRunParallelWithOneThreadMatchesRun(t *testing.T) {
 	problem := pigeonholeProblem(t, 4, 3)
-	lists := occurrence.Build(problem)
 
-	want := Run(problem, lists, nil, SelectVarWeighted, rand.New(rand.NewPCG(31, 31)), 0)
-	got := RunParallel(problem, lists, nil, SelectVarWeighted, 1, rand.New(rand.NewPCG(31, 31)), 0)
+	want := Run(problem, nil, SelectVarWeighted, rand.New(rand.NewPCG(31, 31)), 0)
+	got := RunParallel(problem, nil, SelectVarWeighted, 1, rand.New(rand.NewPCG(31, 31)), 0)
 
 	if got.Satisfiable != want.Satisfiable || got.NumNodes != want.NumNodes || got.TimedOut != want.TimedOut {
 		t.Fatalf("RunParallel(numThreads=1) = %+v, want identical to Run() = %+v", got, want)
@@ -45,11 +43,10 @@ func TestRunParallelFindsSatisfiableFormula(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-3)},
 		},
 	}
-	lists := occurrence.Build(problem)
 
 	for _, numThreads := range []int{2, 4, 8, 32} {
 		rng := rand.New(rand.NewPCG(uint64(numThreads), uint64(numThreads)))
-		result := RunParallel(problem, lists, nil, SelectVarWeighted, numThreads, rng, 0)
+		result := RunParallel(problem, nil, SelectVarWeighted, numThreads, rng, 0)
 
 		if !result.Satisfiable {
 			t.Fatalf("numThreads=%d: expected Satisfiable = true", numThreads)
@@ -75,11 +72,10 @@ func TestRunParallelFindsSatisfiableFormula(t *testing.T) {
 // Run's own single-threaded test uses.
 func TestRunParallelProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(t, 4, 3)
-	lists := occurrence.Build(problem)
 
 	for _, numThreads := range []int{2, 4, 8, 16} {
 		rng := rand.New(rand.NewPCG(uint64(numThreads)+100, uint64(numThreads)+100))
-		result := RunParallel(problem, lists, nil, SelectVarWeighted, numThreads, rng, 0)
+		result := RunParallel(problem, nil, SelectVarWeighted, numThreads, rng, 0)
 
 		if result.Satisfiable {
 			t.Fatalf("numThreads=%d: expected Satisfiable = false for an unsatisfiable pigeonhole instance", numThreads)
@@ -101,10 +97,9 @@ func TestRunParallelProvesUnsatisfiablePigeonhole(t *testing.T) {
 // STAGE18.md's actual requirement (128 or more).
 func TestRunParallelProvesUnsatisfiableLargerPigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(t, 6, 5)
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(77, 77))
 
-	result := RunParallel(problem, lists, nil, SelectVarWeighted, 64, rng, 0)
+	result := RunParallel(problem, nil, SelectVarWeighted, 64, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatal("expected Satisfiable = false for an unsatisfiable pigeonhole instance")
@@ -138,13 +133,12 @@ func TestRunParallelProvesUnsatisfiableLargerPigeonhole(t *testing.T) {
 // work in.
 func TestShedFrameMaterializesUntriedSiblingForStealing(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)}}}
-	lists := occurrence.Build(problem)
 	clauses, root, ok := bootstrap(problem)
 	if !ok {
 		t.Fatalf("bootstrap reported UNSAT unexpectedly")
 	}
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
-	state := startSearch(clauses, lists, workingProblem, root, SelectVarFast, nil)
+	state := startSearch(clauses, workingProblem, root, SelectVarFast, nil)
 
 	calls := 0
 	checkPause := func(int) bool {
@@ -183,7 +177,7 @@ func TestShedFrameMaterializesUntriedSiblingForStealing(t *testing.T) {
 
 	// The shed snapshot must be independently explorable to a correct
 	// verdict, exactly like any other searchNode.
-	shedState := startSearch(clauses, lists, workingProblem, shed, SelectVarFast, nil)
+	shedState := startSearch(clauses, workingProblem, shed, SelectVarFast, nil)
 	shedOutcome, _ := shedState.step(workingProblem, SelectVarFast, nil, nil)
 	if shedOutcome != stepSAT {
 		t.Fatalf("exploring the shed snapshot to completion gave %v, want stepSAT (var 1 = True alone already satisfies the only clause)", shedOutcome)
@@ -224,14 +218,13 @@ func TestBFSSeedReturnsSATDirectlyWithoutSpawningWorkers(t *testing.T) {
 		NumVars: 2,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(2)}},
 	}
-	lists := occurrence.Build(problem)
 	clauses, root, ok := bootstrap(problem)
 	if !ok {
 		t.Fatal("bootstrap reported UNSAT unexpectedly")
 	}
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
-	result := bfsSeed(clauses, lists, workingProblem, root, 8, SelectVarWeighted, rand.New(rand.NewPCG(1, 1)), nil, time.Now())
+	result := bfsSeed(clauses, workingProblem, root, 8, SelectVarWeighted, rand.New(rand.NewPCG(1, 1)), nil, time.Now())
 
 	if result.verdict != bfsSAT {
 		t.Fatalf("verdict = %d, want bfsSAT", result.verdict)
@@ -259,7 +252,6 @@ func TestBFSSeedReturnsUNSATDirectlyWithoutSpawningWorkers(t *testing.T) {
 		NumVars: 1,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
 	}
-	lists := occurrence.Build(problem)
 	clauses, root, ok := bootstrap(problem)
 	if !ok {
 		// The bootstrap's own unit propagation may already catch this
@@ -268,7 +260,7 @@ func TestBFSSeedReturnsUNSATDirectlyWithoutSpawningWorkers(t *testing.T) {
 	}
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
-	result := bfsSeed(clauses, lists, workingProblem, root, 8, SelectVarWeighted, rand.New(rand.NewPCG(2, 2)), nil, time.Now())
+	result := bfsSeed(clauses, workingProblem, root, 8, SelectVarWeighted, rand.New(rand.NewPCG(2, 2)), nil, time.Now())
 
 	if result.verdict != bfsUNSAT {
 		t.Fatalf("verdict = %d, want bfsUNSAT", result.verdict)
@@ -286,12 +278,11 @@ func TestBFSSeedProducesFewerSeedsThanThreadsForASmallTree(t *testing.T) {
 		NumVars: 2,
 		Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}, {cnf.Literal(-1), cnf.Literal(-2)}},
 	}
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(3, 3))
 
 	// 2 variables can produce at most a handful of live branches, far
 	// fewer than 50 requested threads.
-	result := RunParallel(problem, lists, nil, SelectVarWeighted, 50, rng, 0)
+	result := RunParallel(problem, nil, SelectVarWeighted, 50, rng, 0)
 
 	if !result.Satisfiable {
 		t.Fatalf("expected Satisfiable = true (score irrelevant here, just must not hang/error)")
@@ -623,11 +614,10 @@ func TestWorkerStateMarkIdleIsIdempotent(t *testing.T) {
 // not finish instantly, split across several threads.
 func TestRunParallelRespectsTimeLimit(t *testing.T) {
 	problem := pigeonholeProblem(t, 9, 8)
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(9, 9))
 	tiny := time.Duration(1)
 
-	result := RunParallel(problem, lists, &tiny, SelectVarWeighted, 4, rng, 0)
+	result := RunParallel(problem, &tiny, SelectVarWeighted, 4, rng, 0)
 
 	if !result.TimedOut {
 		t.Error("expected TimedOut = true with a 1ns time limit")
@@ -652,11 +642,10 @@ func TestRunParallelReportsExactlyOneWinner(t *testing.T) {
 			{cnf.Literal(4)}, {cnf.Literal(5)}, {cnf.Literal(6)},
 		},
 	}
-	lists := occurrence.Build(problem)
 
 	for trial := 0; trial < 20; trial++ {
 		rng := rand.New(rand.NewPCG(uint64(trial), uint64(trial)+1))
-		result := RunParallel(problem, lists, nil, SelectVarWeighted, 16, rng, 0)
+		result := RunParallel(problem, nil, SelectVarWeighted, 16, rng, 0)
 		if !result.Satisfiable {
 			t.Fatalf("trial %d: expected Satisfiable = true", trial)
 		}

@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"vibe_sat/internal/cnf"
-	"vibe_sat/internal/occurrence"
 )
 
 // STAGE24.md: extending the profiling-benchmark infrastructure
@@ -28,14 +27,14 @@ import (
 //	go test ./internal/dfs/ -bench=BenchmarkRunHard -benchtime=1x \
 //	  -cpuprofile=/tmp/dfs_cpu.prof
 //	go tool pprof -top /tmp/dfs_cpu.prof
-func hardBenchmarkProblem(b *testing.B) (*cnf.Problem, *occurrence.Lists) {
+func hardBenchmarkProblem(b *testing.B) *cnf.Problem {
 	b.Helper()
 	path := filepath.Join("..", "..", "..", "benchmark", "uuf175-753", "uuf175-083.cnf")
 	problem, err := cnf.ReadDIMACS(path, 0)
 	if err != nil {
 		b.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
 	}
-	return problem, occurrence.Build(problem)
+	return problem
 }
 
 // BenchmarkRunHardSingleThreaded profiles the single-threaded search
@@ -43,10 +42,10 @@ func hardBenchmarkProblem(b *testing.B) (*cnf.Problem, *occurrence.Lists) {
 // Stage 9 watch-state cloning per branch) with no threading machinery
 // reachable at all.
 func BenchmarkRunHardSingleThreaded(b *testing.B) {
-	problem, lists := hardBenchmarkProblem(b)
+	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
+		result := Run(problem, nil, SelectVarWeighted, rng, 0)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}
@@ -57,10 +56,10 @@ func BenchmarkRunHardSingleThreaded(b *testing.B) {
 // BFS-seeding and work-stealing deque are now live for the whole run,
 // not just briefly exercised in a unit test.
 func BenchmarkRunHardParallel8(b *testing.B) {
-	problem, lists := hardBenchmarkProblem(b)
+	problem := hardBenchmarkProblem(b)
 	for i := 0; i < b.N; i++ {
 		rng := rand.New(rand.NewPCG(1, 2))
-		result := RunParallel(problem, lists, nil, SelectVarWeighted, 8, rng, 0)
+		result := RunParallel(problem, nil, SelectVarWeighted, 8, rng, 0)
 		if result.Satisfiable {
 			b.Fatal("expected unsatisfiable")
 		}

@@ -28,24 +28,15 @@ use rand::rngs::StdRng;
 
 use vibe_sat::cnf::read_dimacs;
 use vibe_sat::dfs::{SelectVarVariant, run, run_parallel};
-use vibe_sat::occurrence;
 
 fn main() {
     let path = "../benchmark/uuf175-753/uuf175-083.cnf";
     let problem = read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
-    let lists = occurrence::build(&problem);
 
     {
         let start = Instant::now();
         let mut rng = StdRng::seed_from_u64(0x0102);
-        let result = black_box(run(
-            &problem,
-            &lists,
-            None,
-            SelectVarVariant::Weighted,
-            &mut rng,
-            0,
-        ));
+        let result = black_box(run(&problem, None, SelectVarVariant::Weighted, &mut rng, 0));
         assert!(!result.satisfiable, "expected unsatisfiable");
         println!("BenchmarkRunHardSingleThreaded: {:?}", start.elapsed());
     }
@@ -55,7 +46,6 @@ fn main() {
         let mut rng = StdRng::seed_from_u64(0x0102);
         let result = black_box(run_parallel(
             &problem,
-            &lists,
             None,
             SelectVarVariant::Weighted,
             8,

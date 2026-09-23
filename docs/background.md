@@ -40,16 +40,42 @@ the clauses that could plausibly have changed status" — the single
 biggest reason `dfs` and `cdcl` can handle formulas with thousands of
 clauses at all.
 
-`dfs`'s own BCP (`internal/dfs/watch.go`) still finds its candidate
-clauses via the full occurrence index (every clause that ever mentions
-the literal), the same design `cdcl`'s own BCP used from Stage 9
-through Stage 44 — see "A genuine watch-list, not just watched
-literals" under CDCL below for why that turned out to leave real
-performance on the table, and why `cdcl`'s own version no longer works
-this way. `dfs` hasn't been changed to match; per `STAGE11.md`'s
-original instruction to leave it as its own separate implementation,
-this is a real, live opportunity for a future stage, not something
-this project has evaluated the cost of yet.
+`dfs`'s own BCP (`internal/dfs/watch.go`) got the identical fix
+`STAGE45.md` applied to `cdcl` (see "A genuine watch-list, not just
+watched literals" under CDCL below), one stage later: a genuine,
+dynamic per-literal watcher index instead of the full occurrence index
+(every clause that ever mentions the literal) both algorithms
+originally shared. Unlike `cdcl`, `dfs` had no other consumer of the
+occurrence index once BCP stopped needing it — no WalkSAT-style
+rephasing reuses it here — so `internal/occurrence.Lists` is no longer
+threaded through `dfs`'s public API at all (`Run`, `RunParallel`, and
+everything between).
+
+The measured payoff was real but much smaller than `cdcl`'s: on this
+project's own standing hard `dfs` benchmark instance, wall-clock time
+dropped only about 4% with the default weighted `SelectVar` heuristic,
+rising to about 11% with the cheaper static-order heuristic
+(`--alg-params val1=1`). A CPU profile explains why directly: `dfs`'s
+default heuristic itself dominates at roughly 81-83% of CPU time on
+this instance (it rescans every not-yet-satisfied clause on every
+node — see `SelectVar`'s own description above), leaving BCP only
+8-10% of the total to begin with, versus `cdcl`'s VSIDS-driven
+decisions costing next to nothing per node and `propagate` dominating
+at 97%+. The same architectural fix helps in direct proportion to how
+much of the total cost BCP itself actually is — a real, if less
+dramatic, illustration of "measure, don't assume" this project has
+returned to more than once.
+
+`dfs`'s watch state is also genuinely cloned in two real places
+(`bfsSeed`'s per-worker seeds, `shedFrame`'s stolen snapshots) that
+`cdcl`'s solver never needs, since `cdcl` is never cloned — the new
+watcher lists (slices of slices, unlike the plain fixed-size watch
+values) needed a real, element-by-element deep copy on clone, not
+just a copy of the outer slice, or two branches sharing a clone would
+silently corrupt each other's watcher lists the moment either one's
+BCP call compacted its own. Verified directly: a dedicated test
+confirmed to actually fail when the deep copy was deliberately
+weakened to a shallow one, and pass with the real fix restored.
 
 ## CDCL
 
@@ -541,6 +567,20 @@ identical work. A few concrete things fell out of that comparison:
   adversarial stress tests — closed most of that gap in practice, but
   needed to be built and run explicitly; Rust got the same guarantee
   for free from the compiler on every build.
+- **Rust's `Vec<Vec<T>>` made a whole class of cloning bug structurally
+  impossible** that Go's `[][]int` left the programmer responsible
+  for (`STAGE46.md`): Go's `cloneWatchState` needs a manual,
+  element-by-element deep copy of its slice-of-slices watcher-list
+  fields, since a shallow copy of the outer slice leaves clone and
+  original sharing the same inner backing arrays — a real, subtle
+  correctness risk verified directly by deliberately reintroducing the
+  shallow-copy bug and confirming a dedicated test catches it. Rust's
+  equivalent `Vec<Vec<usize>>` field needed no such care at all:
+  `Vec::clone` always allocates fresh storage recursively, so a plain
+  `#[derive(Clone)]` on the containing struct was already correct —
+  not a matter of Rust's ownership *checker* catching a mistake at
+  compile time (as in the case above), but of the type itself making
+  the shallow-copy failure mode unrepresentable in the first place.
 - **Go's standard library sufficed for everything** the project asked
   of it (`PROMPT.md`'s "no external packages" constraint for Go), while
   Rust reached for a small, deliberately general-purpose set of crates

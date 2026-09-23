@@ -302,7 +302,6 @@ fn run_dfs(
     original_num_vars: usize,
     args: &Args,
 ) -> Result<(), String> {
-    let lists = occurrence::build(problem);
     let mut rng = StdRng::from_rng(&mut rand::rng());
 
     let time_limit = args
@@ -316,7 +315,6 @@ fn run_dfs(
 
     let result = dfs::run_parallel(
         problem,
-        &lists,
         time_limit,
         variant,
         args.num_threads,

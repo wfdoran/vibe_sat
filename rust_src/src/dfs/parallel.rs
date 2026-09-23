@@ -57,7 +57,6 @@ use super::{
 };
 use crate::assignment::{self, Value};
 use crate::cnf::{Clause, Problem};
-use crate::occurrence::Lists;
 
 /// What [`bfs_seed`] concluded.
 enum BfsResult {
@@ -79,16 +78,15 @@ enum BfsResult {
 }
 
 /// Performs the breadth-first seeding phase described in the module
-/// doc comment, starting from `root`. `clauses`/`lists`/
-/// `working_problem`/`variant`/`rng` are exactly what [`super::run`]'s
-/// own loop already needs for the same purpose (branch selection and
-/// BCP); `time_limit`/`start_time` let it respect the overall
-/// deadline during seeding too, since a pathological formula could in
-/// principle take a while to even reach `num_threads` seeds.
+/// doc comment, starting from `root`. `clauses`/`working_problem`/
+/// `variant`/`rng` are exactly what [`super::run`]'s own loop already
+/// needs for the same purpose (branch selection and BCP); `time_limit`/
+/// `start_time` let it respect the overall deadline during seeding
+/// too, since a pathological formula could in principle take a while
+/// to even reach `num_threads` seeds.
 #[allow(clippy::too_many_arguments)]
 fn bfs_seed<R: Rng>(
     clauses: &[Clause],
-    lists: &Lists,
     working_problem: &Problem,
     root: SearchNode,
     num_threads: usize,
@@ -137,14 +135,7 @@ fn bfs_seed<R: Rng>(
             branch_assignment[i] = v;
             let mut branch_watch = node.watch.clone();
 
-            match bcp(
-                clauses,
-                lists,
-                &mut branch_watch,
-                &mut branch_assignment,
-                i,
-                None,
-            ) {
+            match bcp(clauses, &mut branch_watch, &mut branch_assignment, i, None) {
                 Status::Contra => continue,
                 Status::Done => {
                     return BfsResult::Sat(Box::new(SolveResult {
@@ -190,7 +181,6 @@ fn bfs_seed<R: Rng>(
 /// expended, matching Stage 17's convention for `starts`.
 pub fn run_parallel<R: Rng>(
     problem: &Problem,
-    lists: &Lists,
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
     num_threads: usize,
@@ -198,7 +188,7 @@ pub fn run_parallel<R: Rng>(
     verbose: i32,
 ) -> SolveResult {
     if num_threads <= 1 {
-        return super::run(problem, lists, time_limit, variant, rng, verbose);
+        return super::run(problem, time_limit, variant, rng, verbose);
     }
 
     if verbose >= 1 {
@@ -243,7 +233,6 @@ pub fn run_parallel<R: Rng>(
 
     let seeding = bfs_seed(
         &working_problem.clauses,
-        lists,
         &working_problem,
         root,
         num_threads,
@@ -337,7 +326,6 @@ pub fn run_parallel<R: Rng>(
                         worker,
                         stealers,
                         clauses,
-                        lists,
                         working_problem,
                         variant,
                         rng: sub_rng,
@@ -419,7 +407,6 @@ struct DfsWorkerConfig<'a> {
     worker: Worker<SearchNode>,
     stealers: &'a [Stealer<SearchNode>],
     clauses: &'a [Clause],
-    lists: &'a Lists,
     working_problem: &'a Problem,
     variant: SelectVarVariant,
     rng: &'a mut StdRng,
@@ -493,7 +480,6 @@ fn dfs_worker(cfg: DfsWorkerConfig) -> SolveResult {
         worker,
         stealers,
         clauses,
-        lists,
         working_problem,
         variant,
         rng,
@@ -564,7 +550,7 @@ fn dfs_worker(cfg: DfsWorkerConfig) -> SolveResult {
     let Some(node) = find_work() else {
         return empty_result(num_nodes, false);
     };
-    let mut search = start_search(clauses, lists, working_problem, node, variant, rng);
+    let mut search = start_search(clauses, working_problem, node, variant, rng);
     num_nodes += 1; // this node's own first frame, matching run's "root frame counts as node 1" convention
 
     loop {
@@ -637,7 +623,7 @@ fn dfs_worker(cfg: DfsWorkerConfig) -> SolveResult {
                 let Some(node) = find_work() else {
                     return empty_result(num_nodes, false);
                 };
-                search = start_search(clauses, lists, working_problem, node, variant, rng);
+                search = start_search(clauses, working_problem, node, variant, rng);
                 num_nodes += 1; // this node's own first frame
             }
         }
@@ -857,11 +843,9 @@ mod tests {
     #[test]
     fn test_run_parallel_with_one_thread_matches_run() {
         let problem = pigeonhole_problem(4, 3);
-        let lists = crate::occurrence::build(&problem);
 
         let want = super::super::run(
             &problem,
-            &lists,
             None,
             SelectVarVariant::Weighted,
             &mut StdRng::seed_from_u64(31),
@@ -869,7 +853,6 @@ mod tests {
         );
         let got = run_parallel(
             &problem,
-            &lists,
             None,
             SelectVarVariant::Weighted,
             1,
@@ -894,13 +877,11 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
-        let lists = crate::occurrence::build(&problem);
 
         for num_threads in [2usize, 4, 8, 32] {
             let mut rng = StdRng::seed_from_u64(num_threads as u64);
             let result = run_parallel(
                 &problem,
-                &lists,
                 None,
                 SelectVarVariant::Weighted,
                 num_threads,
@@ -931,13 +912,11 @@ mod tests {
     #[test]
     fn test_run_parallel_proves_unsatisfiable_pigeonhole() {
         let problem = pigeonhole_problem(4, 3);
-        let lists = crate::occurrence::build(&problem);
 
         for num_threads in [2usize, 4, 8, 16] {
             let mut rng = StdRng::seed_from_u64(num_threads as u64 + 100);
             let result = run_parallel(
                 &problem,
-                &lists,
                 None,
                 SelectVarVariant::Weighted,
                 num_threads,
@@ -968,18 +947,9 @@ mod tests {
     #[test]
     fn test_run_parallel_proves_unsatisfiable_larger_pigeonhole() {
         let problem = pigeonhole_problem(6, 5);
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(77);
 
-        let result = run_parallel(
-            &problem,
-            &lists,
-            None,
-            SelectVarVariant::Weighted,
-            64,
-            &mut rng,
-            0,
-        );
+        let result = run_parallel(&problem, None, SelectVarVariant::Weighted, 64, &mut rng, 0);
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -1012,7 +982,6 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2, 3]],
         };
-        let lists = crate::occurrence::build(&problem);
         let (clauses, root) = bootstrap(&problem).expect("bootstrap reported UNSAT unexpectedly");
         let working_problem = Problem {
             num_vars: problem.num_vars,
@@ -1021,7 +990,6 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0); // unused by SelectVarVariant::Fast
         let mut state = start_search(
             &clauses,
-            &lists,
             &working_problem,
             root,
             SelectVarVariant::Fast,
@@ -1062,7 +1030,6 @@ mod tests {
         // correct verdict, exactly like any other SearchNode.
         let mut shed_state = start_search(
             &clauses,
-            &lists,
             &working_problem,
             shed,
             SelectVarVariant::Fast,
@@ -1089,7 +1056,6 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1], vec![2]],
         };
-        let lists = crate::occurrence::build(&problem);
         let (clauses, root) = bootstrap(&problem).expect("bootstrap reported UNSAT unexpectedly");
         let working_problem = Problem {
             num_vars: problem.num_vars,
@@ -1098,7 +1064,6 @@ mod tests {
 
         let result = bfs_seed(
             &clauses,
-            &lists,
             &working_problem,
             root,
             8,
@@ -1131,7 +1096,6 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        let lists = crate::occurrence::build(&problem);
         let Some((clauses, root)) = bootstrap(&problem) else {
             // The bootstrap's own unit propagation may already catch
             // this particular contradiction; either way is a correct
@@ -1145,7 +1109,6 @@ mod tests {
 
         let result = bfs_seed(
             &clauses,
-            &lists,
             &working_problem,
             root,
             8,
@@ -1169,20 +1132,11 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2], vec![-1, -2]],
         };
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(3);
 
         // 2 variables can produce at most a handful of live branches,
         // far fewer than 50 requested threads.
-        let result = run_parallel(
-            &problem,
-            &lists,
-            None,
-            SelectVarVariant::Weighted,
-            50,
-            &mut rng,
-            0,
-        );
+        let result = run_parallel(&problem, None, SelectVarVariant::Weighted, 50, &mut rng, 0);
 
         assert!(result.satisfiable);
     }
@@ -1242,13 +1196,11 @@ mod tests {
     #[test]
     fn test_run_parallel_respects_time_limit() {
         let problem = pigeonhole_problem(9, 8);
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(9);
         let tiny = Duration::from_nanos(1);
 
         let result = run_parallel(
             &problem,
-            &lists,
             Some(tiny),
             SelectVarVariant::Weighted,
             4,
@@ -1276,19 +1228,10 @@ mod tests {
             num_vars: 6,
             clauses: vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6]],
         };
-        let lists = crate::occurrence::build(&problem);
 
         for trial in 0u64..20 {
             let mut rng = StdRng::seed_from_u64(trial);
-            let result = run_parallel(
-                &problem,
-                &lists,
-                None,
-                SelectVarVariant::Weighted,
-                16,
-                &mut rng,
-                0,
-            );
+            let result = run_parallel(&problem, None, SelectVarVariant::Weighted, 16, &mut rng, 0);
             assert!(result.satisfiable, "trial {trial}: expected satisfiable");
             for (ci, clause) in problem.clauses.iter().enumerate() {
                 let satisfied = clause

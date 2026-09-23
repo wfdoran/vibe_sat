@@ -53,7 +53,6 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
-	"vibe_sat/internal/occurrence"
 )
 
 // bfsVerdict identifies what bfsSeed concluded.
@@ -83,13 +82,13 @@ type bfsResult struct {
 }
 
 // bfsSeed performs the breadth-first seeding phase described in the
-// package doc comment, starting from root. clauses/lists/
-// workingProblem/variant/rng are exactly what Run's own loop already
-// needed for the same purpose (branch selection and BCP); timeLimit/
-// startTime let it respect the overall deadline during seeding too,
-// since a pathological formula could in principle take a while to
-// even reach numThreads seeds.
-func bfsSeed(clauses []cnf.Clause, lists *occurrence.Lists, workingProblem *cnf.Problem, root searchNode, numThreads int, variant SelectVarVariant, rng *rand.Rand, timeLimit *time.Duration, startTime time.Time) bfsResult {
+// package doc comment, starting from root. clauses/workingProblem/
+// variant/rng are exactly what Run's own loop already needed for the
+// same purpose (branch selection and BCP); timeLimit/startTime let it
+// respect the overall deadline during seeding too, since a
+// pathological formula could in principle take a while to even reach
+// numThreads seeds.
+func bfsSeed(clauses []cnf.Clause, workingProblem *cnf.Problem, root searchNode, numThreads int, variant SelectVarVariant, rng *rand.Rand, timeLimit *time.Duration, startTime time.Time) bfsResult {
 	if allAssigned(root.assignment) {
 		// Bootstrap's own unit propagation alone already fully solved
 		// the formula; see allAssigned's doc comment for why this
@@ -126,7 +125,7 @@ func bfsSeed(clauses []cnf.Clause, lists *occurrence.Lists, workingProblem *cnf.
 			branchAssignment[i] = v
 			branchWatch := cloneWatchState(node.watch)
 
-			switch BCP(clauses, lists, branchWatch, branchAssignment, i, nil) {
+			switch BCP(clauses, branchWatch, branchAssignment, i, nil) {
 			case Contra:
 				continue
 			case Done:
@@ -161,9 +160,9 @@ func bfsSeed(clauses []cnf.Clause, lists *occurrence.Lists, workingProblem *cnf.
 // phase's own node count plus the sum of every spawned worker's own
 // count, win or lose -- the total search effort expended, matching
 // Stage 17's convention for Result.Starts.
-func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration, variant SelectVarVariant, numThreads int, rng *rand.Rand, verbose int) Result {
+func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, numThreads int, rng *rand.Rand, verbose int) Result {
 	if numThreads <= 1 {
-		return Run(problem, lists, timeLimit, variant, rng, verbose)
+		return Run(problem, timeLimit, variant, rng, verbose)
 	}
 
 	if verbose >= 1 {
@@ -191,7 +190,7 @@ func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.
 	}
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
-	seeding := bfsSeed(clauses, lists, workingProblem, root, numThreads, variant, rng, timeLimit, startTime)
+	seeding := bfsSeed(clauses, workingProblem, root, numThreads, variant, rng, timeLimit, startTime)
 
 	if seeding.timedOut {
 		if verbose >= 1 {
@@ -243,7 +242,6 @@ func RunParallel(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.
 				self:           i,
 				deques:         deques,
 				clauses:        clauses,
-				lists:          lists,
 				workingProblem: workingProblem,
 				variant:        variant,
 				rng:            subRands[i],
@@ -293,7 +291,6 @@ type dfsWorkerConfig struct {
 	self           int
 	deques         []*deque
 	clauses        []cnf.Clause
-	lists          *occurrence.Lists
 	workingProblem *cnf.Problem
 	variant        SelectVarVariant
 	rng            *rand.Rand
@@ -445,7 +442,7 @@ func dfsWorker(cfg dfsWorkerConfig) Result {
 	if !ok {
 		return Result{NumNodes: numNodes}
 	}
-	search := startSearch(cfg.clauses, cfg.lists, cfg.workingProblem, node, cfg.variant, cfg.rng)
+	search := startSearch(cfg.clauses, cfg.workingProblem, node, cfg.variant, cfg.rng)
 	numNodes++ // this node's own first frame, matching Run's "root frame counts as node 1" convention
 
 	for {
@@ -479,7 +476,7 @@ func dfsWorker(cfg dfsWorkerConfig) Result {
 			if !ok {
 				return Result{NumNodes: numNodes}
 			}
-			search = startSearch(cfg.clauses, cfg.lists, cfg.workingProblem, node, cfg.variant, cfg.rng)
+			search = startSearch(cfg.clauses, cfg.workingProblem, node, cfg.variant, cfg.rng)
 			numNodes++ // this node's own first frame
 		}
 	}

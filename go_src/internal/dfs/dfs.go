@@ -17,7 +17,6 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
-	"vibe_sat/internal/occurrence"
 	"vibe_sat/internal/preprocess"
 )
 
@@ -141,7 +140,6 @@ const (
 // one per branch.
 type searchState struct {
 	clauses []cnf.Clause
-	lists   *occurrence.Lists
 	x       assign.Assignment
 	ws      *watchState
 	trail   []int
@@ -153,10 +151,9 @@ type searchState struct {
 // must not read or mutate either afterward), matching the old
 // per-branch clone's ownership convention except there is now exactly
 // one live copy for the whole exploration, not one per node.
-func newSearchState(clauses []cnf.Clause, lists *occurrence.Lists, root searchNode) *searchState {
+func newSearchState(clauses []cnf.Clause, root searchNode) *searchState {
 	return &searchState{
 		clauses: clauses,
-		lists:   lists,
 		x:       root.assignment,
 		ws:      root.watch,
 		trail:   make([]int, 0, 64),
@@ -170,8 +167,8 @@ func newSearchState(clauses []cnf.Clause, lists *occurrence.Lists, root searchNo
 // Both Run and dfsWorker use this, the latter both for its initial
 // seed and for every subsequent node it pops or steals after
 // exhausting one search.
-func startSearch(clauses []cnf.Clause, lists *occurrence.Lists, workingProblem *cnf.Problem, root searchNode, variant SelectVarVariant, rng *rand.Rand) *searchState {
-	state := newSearchState(clauses, lists, root)
+func startSearch(clauses []cnf.Clause, workingProblem *cnf.Problem, root searchNode, variant SelectVarVariant, rng *rand.Rand) *searchState {
+	state := newSearchState(clauses, root)
 	var v int
 	if variant == SelectVarFast {
 		v = SelectVarFastPick(workingProblem, state.x)
@@ -231,7 +228,7 @@ func (s *searchState) step(workingProblem *cnf.Problem, variant SelectVarVariant
 		s.trail = append(s.trail, top.variable)
 		top.next++
 
-		switch BCP(s.clauses, s.lists, s.ws, s.x, top.variable, &s.trail) {
+		switch BCP(s.clauses, s.ws, s.x, top.variable, &s.trail) {
 		case Contra:
 			continue // top is unchanged; next iteration retries it (next value, or exhausted)
 		case Done:
@@ -294,7 +291,7 @@ func (s *searchState) shedFrame(deque *deque) (outcome shedOutcome, satisfyingAs
 		snapWatch := cloneWatchState(s.ws)
 
 		f.next = frameExhausted
-		switch BCP(s.clauses, s.lists, snapWatch, snapAssignment, f.variable, nil) {
+		switch BCP(s.clauses, snapWatch, snapAssignment, f.variable, nil) {
 		case Done:
 			return shedSAT, snapAssignment
 		case OK:
@@ -377,7 +374,10 @@ func allAssigned(x assign.Assignment) bool {
 // progress output: at verbose >= 1, "dfs" and the configured time
 // limit (if any) are printed before searching, and "SAT", "UNSAT", or
 // "UNKNOWN" (on timeout) are printed after.
-func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration, variant SelectVarVariant, rng *rand.Rand, verbose int) Result {
+//
+// STAGE46.md: Run no longer takes an *occurrence.Lists -- see
+// watch.go's package doc comment for why BCP stopped needing one.
+func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVariant, rng *rand.Rand, verbose int) Result {
 	if verbose >= 1 {
 		fmt.Println("dfs:", describeParams(timeLimit, variant))
 	}
@@ -427,7 +427,7 @@ func Run(problem *cnf.Problem, lists *occurrence.Lists, timeLimit *time.Duration
 	// clauses and variable count, not the original Problem value.
 	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
 
-	state := startSearch(clauses, lists, workingProblem, root, variant, rng)
+	state := startSearch(clauses, workingProblem, root, variant, rng)
 
 	// STAGE35.md: the time limit is checked on every single node, not
 	// periodically (previously gated by a now-removed timeCheckInterval

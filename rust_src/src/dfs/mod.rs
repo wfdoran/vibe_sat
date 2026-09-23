@@ -21,7 +21,6 @@ use rand::{Rng, RngExt};
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
-use crate::occurrence::Lists;
 use crate::preprocess;
 
 /// The outcome of a single call to [`bcp`].
@@ -96,9 +95,61 @@ pub enum SelectVarVariant {
 /// every clause to have at least 2 literals; callers must guarantee
 /// this (via an initial round of unit propagation removing any unit
 /// or empty clauses) before calling [`new_watch_state`].
+///
+/// STAGE46.md: `watchers_positive[v]`/`watchers_negative[v]` are the
+/// genuine, dynamic per-literal watch index [`bcp`] actually needs --
+/// clause indices currently watching literal `+v`/`-v` right now, not
+/// merely mentioning it. See `bcp`'s own doc comment for the full
+/// diagnosis (the identical gap `reports/REPORT45.md` found and fixed
+/// in `cdcl::propagate` first). Deriving [`Clone`] here already gives
+/// a correct *deep* copy of these two fields for free: `Vec<T>::clone`
+/// always allocates its own backing storage, recursively for
+/// `Vec<Vec<usize>>` too, unlike a shallow pointer/slice-header copy
+/// -- there is no equivalent here of the manual element-by-element
+/// deep copy Go's `cloneWatchState` needs for its own `[][]int`
+/// fields.
 #[derive(Clone)]
 struct WatchState {
     watch: Vec<[Literal; 2]>,
+    watchers_positive: Vec<Vec<usize>>,
+    watchers_negative: Vec<Vec<usize>>,
+}
+
+/// Records that clause index `c` is now one of `lit`'s watchers, in
+/// whichever of `positive`/`negative` actually corresponds to `lit`'s
+/// sign -- mirrors `cdcl::append_watcher` exactly (kept as a separate,
+/// duplicated function here rather than shared, per STAGE11.md's "dfs
+/// is left as its own, separate implementation").
+fn append_watcher(
+    positive: &mut [Vec<usize>],
+    negative: &mut [Vec<usize>],
+    lit: Literal,
+    c: usize,
+) {
+    let v = cnf::literal_var(lit);
+    if cnf::literal_is_negative(lit) {
+        negative[v].push(c);
+    } else {
+        positive[v].push(c);
+    }
+}
+
+/// Returns a mutable reference to the slice of clause indices
+/// currently watching `lit` (`positive[lit.var()]` or
+/// `negative[lit.var()]`, matching [`append_watcher`]'s own
+/// `positive`/`negative` convention), so callers can push to or
+/// compact it in place. Mirrors `cdcl::watchers_for` exactly.
+fn watchers_for<'a>(
+    positive: &'a mut [Vec<usize>],
+    negative: &'a mut [Vec<usize>],
+    lit: Literal,
+) -> &'a mut Vec<usize> {
+    let v = cnf::literal_var(lit);
+    if cnf::literal_is_negative(lit) {
+        &mut negative[v]
+    } else {
+        &mut positive[v]
+    }
 }
 
 /// Builds a [`WatchState`] for `clauses`, choosing for every clause
@@ -108,12 +159,20 @@ struct WatchState {
 /// assumed).
 fn new_watch_state(clauses: &[Clause], assignment: &Assignment) -> Option<WatchState> {
     let mut watch = Vec::with_capacity(clauses.len());
-    for clause in clauses {
+    let mut watchers_positive = vec![Vec::new(); assignment.len()];
+    let mut watchers_negative = vec![Vec::new(); assignment.len()];
+    for (c, clause) in clauses.iter().enumerate() {
         let first = choose_watch(clause, assignment, None)?;
         let second = choose_watch(clause, assignment, Some(first))?;
         watch.push([first, second]);
+        append_watcher(&mut watchers_positive, &mut watchers_negative, first, c);
+        append_watcher(&mut watchers_positive, &mut watchers_negative, second, c);
     }
-    Some(WatchState { watch })
+    Some(WatchState {
+        watch,
+        watchers_positive,
+        watchers_negative,
+    })
 }
 
 /// Scans `clause` for a literal that is not false under `assignment`
@@ -234,7 +293,6 @@ enum StepOutcome {
 /// branch.
 struct SearchState<'a> {
     clauses: &'a [Clause],
-    lists: &'a Lists,
     x: Assignment,
     ws: WatchState,
     trail: Vec<usize>,
@@ -247,10 +305,9 @@ impl<'a> SearchState<'a> {
     /// the old per-branch clone's ownership convention except there is
     /// now exactly one live copy for the whole exploration, not one
     /// per node.
-    fn new(clauses: &'a [Clause], lists: &'a Lists, root: SearchNode) -> Self {
+    fn new(clauses: &'a [Clause], root: SearchNode) -> Self {
         SearchState {
             clauses,
-            lists,
             x: root.assignment,
             ws: root.watch,
             trail: Vec::with_capacity(64),
@@ -321,7 +378,6 @@ impl<'a> SearchState<'a> {
 
             match bcp(
                 self.clauses,
-                self.lists,
                 &mut self.ws,
                 &mut self.x,
                 top.variable,
@@ -386,7 +442,6 @@ impl<'a> SearchState<'a> {
             self.frames[i].next = FrameNext::Exhausted;
             match bcp(
                 self.clauses,
-                self.lists,
                 &mut snap_watch,
                 &mut snap_assignment,
                 f.variable,
@@ -414,13 +469,12 @@ impl<'a> SearchState<'a> {
 /// it pops or steals after exhausting one search.
 fn start_search<'a, R: Rng>(
     clauses: &'a [Clause],
-    lists: &'a Lists,
     working_problem: &Problem,
     root: SearchNode,
     variant: SelectVarVariant,
     rng: &mut R,
 ) -> SearchState<'a> {
-    let mut state = SearchState::new(clauses, lists, root);
+    let mut state = SearchState::new(clauses, root);
     let v = match variant {
         SelectVarVariant::Fast => select_var_fast_pick(working_problem, &state.x),
         SelectVarVariant::Weighted => select_var(working_problem, &state.x, rng),
@@ -517,7 +571,6 @@ pub struct SolveResult {
 /// "UNKNOWN" (on timeout) are printed after.
 pub fn run<R: Rng>(
     problem: &Problem,
-    lists: &Lists,
     time_limit: Option<Duration>,
     variant: SelectVarVariant,
     rng: &mut R,
@@ -593,7 +646,6 @@ pub fn run<R: Rng>(
 
     let mut state = start_search(
         &working_problem.clauses,
-        lists,
         &working_problem,
         root,
         variant,
@@ -670,14 +722,33 @@ pub fn run<R: Rng>(
 
 /// Applies boolean constraint propagation to partial assignment `x`,
 /// which must already have variable `i` set to its just-chosen branch
-/// value, using `ws`'s watched literals to find only the clauses that
-/// might need attention as a result. `x` and `ws` are both modified
-/// in place. `lists` is the static (never mutated) per-variable
-/// occurrence index from Stage 2, used here only to enumerate the
-/// *candidate* clauses to examine when a literal becomes false --
-/// most of them are dismissed in O(1) because they are not currently
-/// watching that literal; only the ones that are get the deeper look
-/// a plain occurrence-list scan would have given every candidate.
+/// value, using `ws`'s `watchers_positive`/`watchers_negative` to find
+/// only the clauses genuinely watching a literal that just became
+/// false. `x` and `ws` are both modified in place.
+///
+/// STAGE46.md: the scan below is MiniSat's own standard in-place
+/// watch-list compaction pattern, exactly mirroring
+/// `cdcl::propagate` (see `reports/REPORT45.md`'s fuller explanation
+/// of why this replaced a full-occurrence-index scan): two indices,
+/// `scanned` (entries read) and `keep` (entries kept in this same
+/// list), since a clause whose watch moves away must leave this
+/// literal's watcher list while every other clause visited stays. A
+/// clause that finds no replacement always stays a watcher of the
+/// literal that just went false -- there's nowhere better for it to
+/// watch until some future backtrack un-falsifies that literal again
+/// -- which is why "no replacement" is the only case that writes into
+/// the kept prefix. On a conflict, the loop stops immediately, but any
+/// not-yet-scanned entries are still genuine, valid watchers of this
+/// literal and must be copied into the compacted prefix before
+/// returning -- skipping this would silently drop clauses from their
+/// own watch list, surfacing later as a missed propagation or missed
+/// conflict, not here. `list` is extracted from `ws` via
+/// `std::mem::take` for the duration of the scan (mirroring
+/// `cdcl::propagate`'s identical technique) so that a replacement's
+/// own watcher list -- a different literal, always, since `choose_watch`
+/// never returns an already-false literal and `falsified_literal` is
+/// by definition false -- can be mutated freely in the same loop
+/// without a borrow conflict.
 ///
 /// STAGE32.md/REPORT32.md: `trail`, if `Some`, has every variable
 /// `bcp` itself assigns (by forced propagation, not counting `i`,
@@ -689,7 +760,6 @@ pub fn run<R: Rng>(
 /// this stage.
 fn bcp(
     clauses: &[Clause],
-    lists: &Lists,
     ws: &mut WatchState,
     x: &mut Assignment,
     i: usize,
@@ -701,39 +771,50 @@ fn bcp(
         let v = queue[head];
         head += 1;
 
-        // falsified_literal is the literal on v that just became
-        // false because of v's new assignment; candidates lists every
-        // clause that mentions it (only some of which are actually
-        // watching it right now).
-        let (falsified_literal, candidates) = if x[v] == Value::True {
-            (-(v as Literal), &lists.negative[v])
+        let falsified_literal: Literal = if x[v] == Value::True {
+            -(v as Literal)
         } else {
-            (v as Literal, &lists.positive[v])
+            v as Literal
         };
 
-        for &c in candidates {
+        let mut list = std::mem::take(watchers_for(
+            &mut ws.watchers_positive,
+            &mut ws.watchers_negative,
+            falsified_literal,
+        ));
+        let mut keep = 0usize;
+        let mut scanned = 0usize;
+        let mut conflict = false;
+
+        while scanned < list.len() {
+            let c = list[scanned];
+            scanned += 1;
+
             let watch = ws.watch[c];
-            let other_watch = if watch[0] == falsified_literal {
-                watch[1]
-            } else if watch[1] == falsified_literal {
-                watch[0]
+            let (other_watch, falsified_slot) = if watch[0] == falsified_literal {
+                (watch[1], 0)
             } else {
-                continue; // this clause isn't watching the falsified literal
+                (watch[0], 1)
             };
 
             if let Some(replacement) = choose_watch(&clauses[c], x, Some(other_watch)) {
-                if watch[0] == falsified_literal {
-                    ws.watch[c][0] = replacement;
-                } else {
-                    ws.watch[c][1] = replacement;
-                }
+                ws.watch[c][falsified_slot] = replacement;
+                watchers_for(
+                    &mut ws.watchers_positive,
+                    &mut ws.watchers_negative,
+                    replacement,
+                )
+                .push(c);
                 continue;
             }
 
-            // No replacement: other_watch is the clause's only
-            // literal that isn't currently false.
+            // No replacement: c keeps watching falsified_literal.
+            list[keep] = c;
+            keep += 1;
+
             if is_false(other_watch, x) {
-                return Status::Contra;
+                conflict = true;
+                break;
             }
             let forced_var = cnf::literal_var(other_watch);
             if x[forced_var] == Value::Unassigned {
@@ -749,6 +830,21 @@ fn bcp(
             }
             // Otherwise other_watch is already true: the clause is
             // satisfied through it, and there is nothing to do.
+        }
+
+        if scanned < list.len() {
+            list.copy_within(scanned.., keep);
+            keep += list.len() - scanned;
+        }
+        list.truncate(keep);
+        *watchers_for(
+            &mut ws.watchers_positive,
+            &mut ws.watchers_negative,
+            falsified_literal,
+        ) = list;
+
+        if conflict {
+            return Status::Contra;
         }
     }
 
@@ -921,10 +1017,6 @@ mod tests {
     #[test]
     fn test_bcp_moves_watch_away_from_falsified_literal() {
         let clauses = vec![vec![1, 2, 3]];
-        let lists = crate::occurrence::build(&Problem {
-            num_vars: 3,
-            clauses: clauses.clone(),
-        });
         let mut x = assignment::new(3);
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         // Force the clause to watch {1, 2} explicitly, then falsify 1;
@@ -932,10 +1024,153 @@ mod tests {
         ws.watch[0] = [1, 2];
         x[1] = Value::False;
 
-        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1, None), Status::Ok);
+        assert_eq!(bcp(&clauses, &mut ws, &mut x, 1, None), Status::Ok);
         assert!(ws.watch[0].contains(&3));
         assert_eq!(x[2], Value::Unassigned);
         assert_eq!(x[3], Value::Unassigned);
+    }
+
+    /// STAGE46.md: verifies directly that, immediately after
+    /// construction, every clause's two current watches appear in
+    /// that literal's own watcher list -- mirrors
+    /// `cdcl::test_build_watchers_matches_watch` exactly.
+    #[test]
+    fn test_new_watch_state_populates_watcher_lists() {
+        let clauses = vec![vec![1, 2, 3], vec![-1, 2, -3], vec![1, -4]];
+        let x = assignment::new(4);
+        let ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        for (c, w) in ws.watch.iter().enumerate() {
+            for &lit in w {
+                let v = cnf::literal_var(lit);
+                let list = if cnf::literal_is_negative(lit) {
+                    &ws.watchers_negative[v]
+                } else {
+                    &ws.watchers_positive[v]
+                };
+                assert!(
+                    list.contains(&c),
+                    "clause {c} watches {lit} but does not appear in its watcher list"
+                );
+            }
+        }
+    }
+
+    /// STAGE46.md's central correctness test, mirroring
+    /// `cdcl::test_propagate_watcher_list_compaction` exactly (same
+    /// clause structure, same reasoning): a single `bcp` call where,
+    /// for the literal being falsified, one watcher moves away, two
+    /// more stay (the second of which conflicts), and a fourth,
+    /// positioned after the conflict in scan order, must survive
+    /// completely untouched.
+    ///
+    /// Clauses, by index: 0 (D): `{1,6,7}`, moves away to watch +7
+    /// instead. 1 (B): `{1,4}`, stays, forces variable 4 true. 2 (A):
+    /// `{1,2}`, stays, conflicts (variable 2 is pre-set `False` as
+    /// pure test setup). 3 (C): `{1,3}`, positioned after the
+    /// conflict, must never be scanned.
+    #[test]
+    fn test_bcp_watcher_list_compaction() {
+        let clauses = vec![
+            vec![1, 6, 7], // D
+            vec![1, 4],    // B
+            vec![1, 2],    // A
+            vec![1, 3],    // C
+        ];
+        let mut x = assignment::new(7);
+        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        assert_eq!(
+            *watchers_for(&mut ws.watchers_positive, &mut ws.watchers_negative, 1),
+            vec![0, 1, 2, 3],
+            "watchers_for(+1) before bcp (test setup assumption violated)"
+        );
+
+        // Pure test setup: variable 2 is false, with no propagation
+        // triggered by it -- isolating this test to exactly the one
+        // bcp() call under test, over variable 1's own assignment.
+        x[2] = Value::False;
+        x[1] = Value::False; // the branch variable bcp is about to be called for
+
+        let status = bcp(&clauses, &mut ws, &mut x, 1, None);
+
+        assert_eq!(
+            status,
+            Status::Contra,
+            "expected clause A ({{1 2}}) to conflict"
+        );
+        assert_eq!(
+            *watchers_for(&mut ws.watchers_positive, &mut ws.watchers_negative, 1),
+            vec![1, 2, 3], // B, A, C -- D moved away
+            "watchers_for(+1) after bcp"
+        );
+        assert_eq!(
+            *watchers_for(&mut ws.watchers_positive, &mut ws.watchers_negative, 7),
+            vec![0], // D, moved in
+            "watchers_for(+7) after bcp (D should have moved here)"
+        );
+        assert!(
+            ws.watch[0] == [7, 6] || ws.watch[0] == [6, 7],
+            "clause 0's (D's) watch = {:?}, want [6, 7] in either order",
+            ws.watch[0]
+        );
+        assert_eq!(
+            x[4],
+            Value::True,
+            "variable 4 should have been forced by clause B ({{1 4}})"
+        );
+        assert_eq!(
+            x[3],
+            Value::Unassigned,
+            "variable 3 (clause C, {{1 3}}) must never have been scanned this call"
+        );
+    }
+
+    /// dfs-specific (`cdcl` has nothing analogous, since `cdcl`'s
+    /// solver is never cloned): `WatchState` is genuinely cloned in
+    /// two real places (`bfs_seed`'s per-worker seeds,
+    /// `SearchState::shed_frame`'s stolen snapshots), so
+    /// `watchers_positive`/`watchers_negative` must be independent
+    /// after `clone()` -- unlike Go's `[][]int`, `Vec<Vec<usize>>`'s
+    /// derived `Clone` already deep-copies correctly (see
+    /// `WatchState`'s own doc comment), so this is primarily a
+    /// regression guard against that assumption ever becoming false
+    /// (e.g. if `WatchState` ever switched to `Rc`/`Arc`-shared
+    /// storage for these fields without updating this test). Needs at
+    /// least one clause to actually stay in the compacted list
+    /// (triggering a value write into the shared-if-shallow backing
+    /// storage) to be a meaningful check at all -- reusing the same
+    /// two-clause structure as `test_bcp_watcher_list_compaction`'s
+    /// setup, with D moving away and B staying.
+    #[test]
+    fn test_clone_watch_state_watchers_are_independent() {
+        let clauses = vec![
+            vec![1, 6, 7], // D: moves away when literal 1 is falsified
+            vec![1, 4],    // B: stays, writing into the compacted list at index 0
+        ];
+        let x = assignment::new(7);
+        let original = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let original_watchers_of_1_before = original.watchers_positive[1].clone();
+        assert_eq!(
+            original_watchers_of_1_before,
+            vec![0, 1],
+            "watchers_for(+1) before bcp (test setup assumption violated)"
+        );
+
+        let mut clone = original.clone();
+        let mut clone_x = x.clone();
+        clone_x[1] = Value::False;
+
+        let status = bcp(&clauses, &mut clone, &mut clone_x, 1, None);
+        assert_eq!(status, Status::Ok);
+
+        assert_eq!(
+            original.watchers_positive[1], original_watchers_of_1_before,
+            "original's watchers_for(+1) changed after mutating only the clone"
+        );
+        assert_eq!(
+            x[4],
+            Value::Unassigned,
+            "original assignment x[4] should be untouched (only clone_x should have been touched)"
+        );
     }
 
     #[test]
@@ -943,17 +1178,12 @@ mod tests {
         // 1 forces -2 true (via clause {-1, -2}) which forces 3 true
         // (via clause {2, 3}), completing the assignment.
         let clauses = vec![vec![-1, -2], vec![2, 3]];
-        let problem = Problem {
-            num_vars: 3,
-            clauses: clauses.clone(),
-        };
-        let lists = crate::occurrence::build(&problem);
         let mut x = assignment::new(3);
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::True;
 
         let mut trail = Vec::new();
-        let status = bcp(&clauses, &lists, &mut ws, &mut x, 1, Some(&mut trail));
+        let status = bcp(&clauses, &mut ws, &mut x, 1, Some(&mut trail));
         assert_eq!(status, Status::Done);
         assert_eq!(x[2], Value::False);
         assert_eq!(x[3], Value::True);
@@ -974,34 +1204,21 @@ mod tests {
         // least two literals, satisfying new_watch_state's
         // precondition).
         let clauses = vec![vec![-1, -2], vec![2, 3], vec![-3, -4], vec![-3, 4]];
-        let problem = Problem {
-            num_vars: 4,
-            clauses: clauses.clone(),
-        };
-        let lists = crate::occurrence::build(&problem);
         let mut x = assignment::new(4);
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::True;
 
-        assert_eq!(
-            bcp(&clauses, &lists, &mut ws, &mut x, 1, None),
-            Status::Contra
-        );
+        assert_eq!(bcp(&clauses, &mut ws, &mut x, 1, None), Status::Contra);
     }
 
     #[test]
     fn test_bcp_leaves_partial_assignment_ok() {
         let clauses = vec![vec![1, 2, 3]];
-        let problem = Problem {
-            num_vars: 3,
-            clauses: clauses.clone(),
-        };
-        let lists = crate::occurrence::build(&problem);
         let mut x = assignment::new(3);
         let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
         x[1] = Value::False;
 
-        assert_eq!(bcp(&clauses, &lists, &mut ws, &mut x, 1, None), Status::Ok);
+        assert_eq!(bcp(&clauses, &mut ws, &mut x, 1, None), Status::Ok);
         assert_eq!(x[2], Value::Unassigned);
         assert_eq!(x[3], Value::Unassigned);
     }
@@ -1072,10 +1289,9 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(8);
 
-        let result = run(&problem, &lists, None, SelectVarVariant::Fast, &mut rng, 0);
+        let result = run(&problem, None, SelectVarVariant::Fast, &mut rng, 0);
 
         assert!(result.satisfiable);
         for (ci, clause) in problem.clauses.iter().enumerate() {
@@ -1089,10 +1305,9 @@ mod tests {
     #[test]
     fn test_run_with_fast_select_var_proves_unsatisfiable_pigeonhole() {
         let problem = pigeonhole_problem(4, 3);
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(9);
 
-        let result = run(&problem, &lists, None, SelectVarVariant::Fast, &mut rng, 0);
+        let result = run(&problem, None, SelectVarVariant::Fast, &mut rng, 0);
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -1104,17 +1319,9 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(3);
 
-        let result = run(
-            &problem,
-            &lists,
-            None,
-            SelectVarVariant::Weighted,
-            &mut rng,
-            0,
-        );
+        let result = run(&problem, None, SelectVarVariant::Weighted, &mut rng, 0);
 
         assert!(result.satisfiable);
         for (ci, clause) in problem.clauses.iter().enumerate() {
@@ -1132,17 +1339,9 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(4);
 
-        let result = run(
-            &problem,
-            &lists,
-            None,
-            SelectVarVariant::Weighted,
-            &mut rng,
-            0,
-        );
+        let result = run(&problem, None, SelectVarVariant::Weighted, &mut rng, 0);
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -1176,17 +1375,9 @@ mod tests {
     #[test]
     fn test_run_proves_unsatisfiable_pigeonhole() {
         let problem = pigeonhole_problem(4, 3);
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(5);
 
-        let result = run(
-            &problem,
-            &lists,
-            None,
-            SelectVarVariant::Weighted,
-            &mut rng,
-            0,
-        );
+        let result = run(&problem, None, SelectVarVariant::Weighted, &mut rng, 0);
 
         assert!(!result.satisfiable);
         assert!(!result.timed_out);
@@ -1200,14 +1391,7 @@ mod tests {
             num_vars: 0,
             clauses: vec![],
         };
-        let result = run(
-            &sat_problem,
-            &crate::occurrence::build(&sat_problem),
-            None,
-            SelectVarVariant::Weighted,
-            &mut rng,
-            0,
-        );
+        let result = run(&sat_problem, None, SelectVarVariant::Weighted, &mut rng, 0);
         assert!(result.satisfiable);
 
         let unsat_problem = Problem {
@@ -1216,7 +1400,6 @@ mod tests {
         };
         let result = run(
             &unsat_problem,
-            &crate::occurrence::build(&unsat_problem),
             None,
             SelectVarVariant::Weighted,
             &mut rng,
@@ -1228,13 +1411,11 @@ mod tests {
     #[test]
     fn test_run_respects_time_limit() {
         let problem = pigeonhole_problem(9, 8);
-        let lists = crate::occurrence::build(&problem);
         let mut rng = StdRng::seed_from_u64(7);
         let tiny = Duration::from_nanos(1);
 
         let result = run(
             &problem,
-            &lists,
             Some(tiny),
             SelectVarVariant::Weighted,
             &mut rng,

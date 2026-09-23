@@ -8,7 +8,6 @@ import (
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
-	"vibe_sat/internal/occurrence"
 )
 
 // TestChooseWatchSkipsFalseLiterals verifies that chooseWatch never
@@ -106,7 +105,6 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 			{cnf.Literal(2), cnf.Literal(3)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	x := assign.New(3)
 	ws, ok := newWatchState(problem.Clauses, x)
 	if !ok {
@@ -115,7 +113,7 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 	x[1] = assign.True
 
 	var trail []int
-	status := BCP(problem.Clauses, lists, ws, x, 1, &trail)
+	status := BCP(problem.Clauses, ws, x, 1, &trail)
 	if status != Done {
 		t.Fatalf("status = %v, want Done", status)
 	}
@@ -152,7 +150,6 @@ func TestBCPDetectsContradiction(t *testing.T) {
 			{cnf.Literal(-3), cnf.Literal(4)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	x := assign.New(4)
 	ws, ok := newWatchState(problem.Clauses, x)
 	if !ok {
@@ -160,7 +157,7 @@ func TestBCPDetectsContradiction(t *testing.T) {
 	}
 	x[1] = assign.True
 
-	if status := BCP(problem.Clauses, lists, ws, x, 1, nil); status != Contra {
+	if status := BCP(problem.Clauses, ws, x, 1, nil); status != Contra {
 		t.Errorf("status = %v, want Contra", status)
 	}
 }
@@ -175,7 +172,6 @@ func TestBCPLeavesPartialAssignmentOK(t *testing.T) {
 			{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	x := assign.New(3)
 	ws, ok := newWatchState(problem.Clauses, x)
 	if !ok {
@@ -183,7 +179,7 @@ func TestBCPLeavesPartialAssignmentOK(t *testing.T) {
 	}
 	x[1] = assign.False
 
-	if status := BCP(problem.Clauses, lists, ws, x, 1, nil); status != OK {
+	if status := BCP(problem.Clauses, ws, x, 1, nil); status != OK {
 		t.Errorf("status = %v, want OK", status)
 	}
 	if x[2] != assign.Unassigned || x[3] != assign.Unassigned {
@@ -202,7 +198,6 @@ func TestBCPMovesWatchAwayFromFalsifiedLiteral(t *testing.T) {
 			{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	x := assign.New(3)
 	ws, ok := newWatchState(problem.Clauses, x)
 	if !ok {
@@ -211,7 +206,7 @@ func TestBCPMovesWatchAwayFromFalsifiedLiteral(t *testing.T) {
 	initialWatch := ws.watch[0]
 
 	x[1] = assign.False
-	if status := BCP(problem.Clauses, lists, ws, x, 1, nil); status != OK {
+	if status := BCP(problem.Clauses, ws, x, 1, nil); status != OK {
 		t.Fatalf("status = %v, want OK", status)
 	}
 
@@ -315,10 +310,9 @@ func TestRunWithFastSelectVarFindsSatisfiableFormula(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-3)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(8, 8))
 
-	result := Run(problem, lists, nil, SelectVarFast, rng, 0)
+	result := Run(problem, nil, SelectVarFast, rng, 0)
 
 	if !result.Satisfiable {
 		t.Fatalf("expected Satisfiable = true")
@@ -343,10 +337,9 @@ func TestRunWithFastSelectVarFindsSatisfiableFormula(t *testing.T) {
 // be sound, even though it typically explores a larger tree).
 func TestRunWithFastSelectVarProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(t, 4, 3)
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(9, 9))
 
-	result := Run(problem, lists, nil, SelectVarFast, rng, 0)
+	result := Run(problem, nil, SelectVarFast, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatalf("expected Satisfiable = false for an unsatisfiable pigeonhole instance")
@@ -368,10 +361,9 @@ func TestRunFindsSatisfiableFormula(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-3)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(3, 3))
 
-	result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
+	result := Run(problem, nil, SelectVarWeighted, rng, 0)
 
 	if !result.Satisfiable {
 		t.Fatalf("expected Satisfiable = true")
@@ -402,10 +394,9 @@ func TestRunProvesUnsatisfiableFormula(t *testing.T) {
 			{cnf.Literal(-1)},
 		},
 	}
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(4, 4))
 
-	result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
+	result := Run(problem, nil, SelectVarWeighted, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatalf("expected Satisfiable = false")
@@ -421,10 +412,9 @@ func TestRunProvesUnsatisfiableFormula(t *testing.T) {
 // resolve, unlike the trivial x1/NOT x1 case above.
 func TestRunProvesUnsatisfiablePigeonhole(t *testing.T) {
 	problem := pigeonholeProblem(t, 4, 3)
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(5, 5))
 
-	result := Run(problem, lists, nil, SelectVarWeighted, rng, 0)
+	result := Run(problem, nil, SelectVarWeighted, rng, 0)
 
 	if result.Satisfiable {
 		t.Fatalf("expected Satisfiable = false for an unsatisfiable pigeonhole instance")
@@ -473,12 +463,12 @@ func TestRunHandlesZeroVariableProblems(t *testing.T) {
 	rng := rand.New(rand.NewPCG(6, 6))
 
 	satProblem := &cnf.Problem{NumVars: 0, Clauses: nil}
-	if result := Run(satProblem, occurrence.Build(satProblem), nil, SelectVarWeighted, rng, 0); !result.Satisfiable {
+	if result := Run(satProblem, nil, SelectVarWeighted, rng, 0); !result.Satisfiable {
 		t.Errorf("expected a 0-variable, 0-clause problem to be Satisfiable")
 	}
 
 	unsatProblem := &cnf.Problem{NumVars: 0, Clauses: []cnf.Clause{{}}}
-	if result := Run(unsatProblem, occurrence.Build(unsatProblem), nil, SelectVarWeighted, rng, 0); result.Satisfiable {
+	if result := Run(unsatProblem, nil, SelectVarWeighted, rng, 0); result.Satisfiable {
 		t.Errorf("expected a 0-variable problem with an empty clause to be unsatisfiable")
 	}
 }
@@ -491,11 +481,10 @@ func TestRunRespectsTimeLimit(t *testing.T) {
 	// unnecessary; a moderately sized unsatisfiable pigeonhole instance
 	// gives the search plenty of tree to explore.
 	problem := pigeonholeProblem(t, 9, 8)
-	lists := occurrence.Build(problem)
 	rng := rand.New(rand.NewPCG(7, 7))
 	tiny := 1 * time.Nanosecond
 
-	result := Run(problem, lists, &tiny, SelectVarWeighted, rng, 0)
+	result := Run(problem, &tiny, SelectVarWeighted, rng, 0)
 
 	if !result.TimedOut {
 		t.Fatalf("expected TimedOut = true with a 1ns time limit")
