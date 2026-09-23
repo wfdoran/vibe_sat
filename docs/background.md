@@ -153,8 +153,9 @@ the current decision stack and starts over from the top — keeping
 every learned clause, which is what makes this a net win rather than
 wasted work.
 
-`vibe_sat` offers four restart schedules (`--alg-params` `val2`,
-`cdcl` only): no restarts, the classic Luby sequence
+`vibe_sat` offers four fixed/data-driven restart schedules
+(`--alg-params` `val2`, `cdcl` only), plus a round-robin "meta" choice
+that cycles through all four: no restarts, the classic Luby sequence
 (1, 1, 2, 1, 1, 2, 4, ...), a quadratic "polynomial" growth schedule,
 and a true geometric schedule (constant ratio between successive
 restart intervals — see [references.md](references.md) for a note on
@@ -168,13 +169,7 @@ has time to settle, turned out to actively hurt. That measurement, not
 the literature's own default, is why `cdcl` defaults to the polynomial
 schedule with one thread.
 
-With more than one thread, the default instead becomes **round-robin**:
-worker 0 gets the polynomial schedule, worker 1 the geometric one,
-worker 2 Luby, worker 3 back to polynomial, and so on — deliberately
-diversifying the portfolio (see "multi-threaded CDCL" below) rather
-than racing several identical searches against each other.
-
-A fifth schedule, **Glucose's own data-driven policy** (`val2=5`;
+A fourth schedule, **Glucose's own data-driven policy** (`val2=4`;
 Audemard & Simon, IJCAI 2009 — see [references.md](references.md)),
 restarts on a signal from the search itself rather than a fixed
 conflict count: it tracks a short-term moving average of the last 50
@@ -188,8 +183,19 @@ sweep (`reports/REPORT35.md`) to 0.6, not Glucose's own published 0.8
 matter on this project's own benchmark mix (roughly halving mean
 solve time at an equal or better solved count), the same pattern
 already found for VSIDS-over-LRB and polynomial-over-Luby above. Not
-(yet) this project's default regardless; see `reports/REPORT34.md`/
+(yet) this project's own default regardless; see `reports/REPORT34.md`/
 `reports/REPORT35.md` for why.
+
+With more than one thread, the default instead becomes **round-robin**
+(`val2=5`): worker 0 gets the polynomial schedule, worker 1 the
+geometric one, worker 2 Luby, worker 3 Glucose, worker 4 back to
+polynomial, and so on — deliberately diversifying the portfolio (see
+"multi-threaded CDCL" below) rather than racing several identical
+searches against each other. `REPORT44.md` moved Glucose into this
+rotation (previously three schedules, and numbered one lower) and,
+separately, moved round-robin itself up a number — keeping the one
+choice that isn't really a "schedule" at the top of the list as the
+schedule count grows.
 
 ## Phase-selection strategies
 
@@ -230,6 +236,16 @@ already does, rather than racing several workers with the identical
 phase source. See `reports/REPORT43.md` for how the three
 single-threaded strategies compared on this project's own benchmark
 set.
+
+This rotation's period (3) is deliberately coprime with restart
+round-robin's (4, once `REPORT44.md` folded Glucose into it): since
+both cycle off the same worker index, every worker up to the twelfth
+(`lcm(3, 4)`) gets a genuinely unique (restart strategy, phase
+strategy) pairing before either rotation repeats, broadening portfolio
+diversity across a reasonably large thread count without needing a
+dedicated benchmark to justify it on its own (`REPORT43.md`'s own open
+question about phase round-robin's diversity value) — see
+`reports/REPORT44.md` for the fuller reasoning.
 
 ## Clause-database management
 

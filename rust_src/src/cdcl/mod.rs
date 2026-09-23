@@ -224,58 +224,82 @@ pub enum RestartStrategy {
     /// `GEOMETRIC_GROWTH_FACTOR` between consecutive restart
     /// intervals, scaled by `GEOMETRIC_BASE_CONFLICTS`.
     Geometric,
+    /// STAGE34.md's addition: Glucose's own data-driven restart policy
+    /// (see the module doc comment and [`glucose_should_restart`]),
+    /// rather than a fixed conflict-count schedule like the three
+    /// strategies above. STAGE44.md moved this variant's `--alg-params`
+    /// numeral to 4 (previously 5) specifically so `RoundRobin` --
+    /// the one "meta" choice that isn't itself a schedule -- keeps the
+    /// highest numeral as the list of real strategies grows, rather
+    /// than sitting in the middle of it.
+    Glucose,
     /// STAGE21.md's addition, meaningful only as a value
     /// [`run_parallel`]/[`run`] resolve away before ever calling
     /// [`run_loop`] -- `run_loop`'s own `restart_strategy` parameter
     /// is never `RoundRobin`, and `restart_threshold` never needs to
     /// handle it. It means: worker i uses
-    /// `ROUND_ROBIN_STRATEGIES[i % 3]` (quadratic, geometric, Luby,
-    /// quadratic, ... -- see [`resolve_restart_strategy`]), so each of
-    /// the three strategies runs on as close to an equal share of
-    /// workers as `num_threads` allows, rather than every worker
-    /// racing with the identical restart cadence.
+    /// `ROUND_ROBIN_STRATEGIES[i % 4]` (quadratic, geometric, Luby,
+    /// Glucose, quadratic, ... -- see [`resolve_restart_strategy`]),
+    /// so each of the four strategies runs on as close to an equal
+    /// share of workers as `num_threads` allows, rather than every
+    /// worker racing with the identical restart cadence. STAGE44.md
+    /// moved this variant's numeral to 5 (previously 4) and folded
+    /// `Glucose` into the rotation (previously three strategies,
+    /// quadratic/geometric/Luby only) -- see `ROUND_ROBIN_STRATEGIES`.
     RoundRobin,
-    /// STAGE34.md's addition: Glucose's own data-driven restart policy
-    /// (see the module doc comment and [`glucose_should_restart`]),
-    /// rather than a fixed conflict-count schedule like the four
-    /// strategies above. Not part of [`RestartStrategy::RoundRobin`]'s
-    /// rotation -- see [`ROUND_ROBIN_STRATEGIES`].
-    Glucose,
 }
 
 /// [`RestartStrategy::RoundRobin`]'s resolution order (see
 /// [`resolve_restart_strategy`]): worker 0 uses quadratic
-/// (`Polynomial`), worker 1 geometric, worker 2 Luby, worker 3 cycles
+/// (`Polynomial`), worker 1 geometric, worker 2 Luby, worker 3 uses
+/// Glucose (folded into the rotation by STAGE44.md), worker 4 cycles
 /// back to quadratic, and so on. Assigning by spawn-order index -- a
 /// plain `usize` [`run_parallel`] already hands every worker thread,
 /// the same way Stage 17/18's winner index and per-worker sub-RNG
 /// already are -- gives an exactly even split with no extra
 /// bookkeeping, which is why this doesn't fall back to randomizing
-/// among the three (something STAGE21.md allowed for in case a
+/// among the four (something STAGE21.md allowed for in case a
 /// deterministic per-thread index turned out to be awkward to get at;
-/// it isn't, in either language).
-const ROUND_ROBIN_STRATEGIES: [RestartStrategy; 3] = [
+/// it isn't, in either language -- though STAGE44.md notes randomizing
+/// may be worth revisiting once this rotation is combined with
+/// `PhaseStrategy::RoundRobin`'s own, see `PHASE_ROUND_ROBIN_STRATEGIES`).
+const ROUND_ROBIN_STRATEGIES: [RestartStrategy; 4] = [
     RestartStrategy::Polynomial,
     RestartStrategy::Geometric,
     RestartStrategy::Luby,
+    RestartStrategy::Glucose,
 ];
 
 /// Returns the concrete restart strategy worker `thread_index` should
 /// actually use: `restart_strategy` unchanged, unless it is
 /// `RestartStrategy::RoundRobin`, in which case it resolves to
-/// `ROUND_ROBIN_STRATEGIES[thread_index % 3]`. Called with
+/// `ROUND_ROBIN_STRATEGIES[thread_index % 4]`. Called with
 /// `thread_index` 0 for [`run`] (so an explicit `--alg-params`
-/// restart=4 with `--num-threads=1` still behaves sensibly -- it
+/// restart=5 with `--num-threads=1` still behaves sensibly -- it
 /// resolves to the same `Polynomial` worker 0 of a round-robin
 /// `run_parallel` run would get, rather than being silently
 /// mishandled) and with each of `run_parallel`'s workers' own spawn
 /// index.
+///
+/// STAGE44.md deliberately keeps this rotation's period (4) coprime
+/// with `PhaseStrategy::RoundRobin`'s (3, see
+/// `PHASE_ROUND_ROBIN_STRATEGIES`): since both resolve from the very
+/// same `thread_index`, `gcd(4, 3) = 1` means the combined (restart
+/// strategy, phase strategy) pair a worker gets is unique for 12
+/// consecutive thread indices (`lcm(4, 3)`) before any repeat, rather
+/// than the two rotations' patterns colliding every 3 threads the way
+/// two same-period-3 rotations would -- a cheap, structural way to
+/// broaden portfolio diversity across a reasonably large thread count
+/// without needing a dedicated benchmark to justify it (see
+/// reports/REPORT43.md's own open question about whether phase
+/// round-robin's diversity value needed independent verification, and
+/// reports/REPORT44.md for the fuller reasoning).
 fn resolve_restart_strategy(
     restart_strategy: RestartStrategy,
     thread_index: usize,
 ) -> RestartStrategy {
     if restart_strategy == RestartStrategy::RoundRobin {
-        ROUND_ROBIN_STRATEGIES[thread_index % 3]
+        ROUND_ROBIN_STRATEGIES[thread_index % 4]
     } else {
         restart_strategy
     }
@@ -2475,13 +2499,15 @@ fn describe_params(
         SelectVarVariant::Vsids => 2,
         SelectVarVariant::Lrb => 3,
     };
+    // STAGE44.md swaps which numeral is which (Glucose 5 -> 4,
+    // RoundRobin 4 -> 5) to match cliargs' own --alg-params mapping.
     let restart_code = match restart_strategy {
         RestartStrategy::None => 0,
         RestartStrategy::Luby => 1,
         RestartStrategy::Polynomial => 2,
         RestartStrategy::Geometric => 3,
-        RestartStrategy::RoundRobin => 4,
-        RestartStrategy::Glucose => 5,
+        RestartStrategy::Glucose => 4,
+        RestartStrategy::RoundRobin => 5,
     };
     let phase_code = match phase_strategy {
         PhaseStrategy::Saving => 0,
@@ -4621,19 +4647,20 @@ mod tests {
         }
     }
 
-    /// Verifies the round-robin resolution order STAGE21.md
-    /// specifies: worker 0 quadratic, worker 1 geometric, worker 2
-    /// Luby, then repeating.
+    /// Verifies the round-robin resolution order STAGE21.md specifies
+    /// (STAGE44.md folded Glucose into the rotation): worker 0
+    /// quadratic, worker 1 geometric, worker 2 Luby, worker 3 Glucose,
+    /// then repeating.
     #[test]
     fn test_resolve_restart_strategy_round_robin() {
         let want = [
             RestartStrategy::Polynomial,
             RestartStrategy::Geometric,
             RestartStrategy::Luby,
+            RestartStrategy::Glucose,
             RestartStrategy::Polynomial,
             RestartStrategy::Geometric,
             RestartStrategy::Luby,
-            RestartStrategy::Polynomial,
         ];
         for (i, &w) in want.iter().enumerate() {
             assert_eq!(resolve_restart_strategy(RestartStrategy::RoundRobin, i), w);
@@ -4652,6 +4679,7 @@ mod tests {
             RestartStrategy::Luby,
             RestartStrategy::Polynomial,
             RestartStrategy::Geometric,
+            RestartStrategy::Glucose,
         ] {
             for thread_index in [0, 1, 2, 5, 127] {
                 assert_eq!(resolve_restart_strategy(strategy, thread_index), strategy);

@@ -41,7 +41,7 @@ flagged explicitly where that happened).
   Solvers," IJCAI 2009 (Glucose). "Literal Block Distance" (LBD)
   scoring for learned clauses — `cdcl`'s glue-clause protection and
   LBD-primary sort in its clause-deletion policy (`--alg-params
-  val2=5`'s restart policy is also this paper's; see "Restarts"
+  val2=4`'s restart policy is also this paper's; see "Restarts"
   below). (`reports/REPORT33.md`, `reports/REPORT34.md`)
 - Sörensson & Biere, "Minimizing Learned Clauses," SAT 2009 (formalizing
   a heuristic MiniSat itself has used since 2005). Recursive
@@ -84,8 +84,9 @@ flagged explicitly where that happened).
   remembering and reusing each variable's last-assigned polarity — is
   unconditionally on in `cdcl`. (`reports/REPORT14.md`)
 - Audemard & Simon, "Predicting Learnt Clauses Quality in Modern SAT
-  Solvers," IJCAI 2009 (Glucose). `cdcl`'s fifth restart strategy
-  (`--alg-params val2=5`): restart when a moving average of recent
+  Solvers," IJCAI 2009 (Glucose). `cdcl`'s fourth restart strategy
+  (`--alg-params val2=4`, previously `5` until `REPORT44.md` moved
+  round-robin above it): restart when a moving average of recent
   learned-clause LBDs looks close to or worse than the all-time
   average, rather than on a fixed conflict-count schedule.
   (`reports/REPORT33.md`, `reports/REPORT34.md`)

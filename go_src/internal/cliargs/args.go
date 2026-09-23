@@ -19,14 +19,26 @@ import (
 
 // Args holds the parsed command line arguments for vibe_sat.
 type Args struct {
-	Help            bool    // --help / -h : print usage information and exit
-	InputFile       string  // --input / -i : path to the DIMACS CNF file to read (required, unless ResetInternalParams)
-	Verbose         int     // --verbose / -v : verbosity level, default 0
-	Algorithm       string  // --algorithm / -a : solving algorithm to use (required, unless ResetInternalParams; "hc", "ws", "dfs", or "cdcl")
-	OutputFile      string  // --output / -o : where to write the solution, if any ("" means unset)
-	TimeLimitSecs   *int    // --time-limit-secs / -t : optional search time limit, in seconds
-	AlgParams       []int64 // --alg-params / -p : 1 to 4 algorithm-specific integer parameters
-	NoPreprocessing bool    // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
+	Help          bool   // --help / -h : print usage information and exit
+	InputFile     string // --input / -i : path to the DIMACS CNF file to read (required, unless ResetInternalParams)
+	Verbose       int    // --verbose / -v : verbosity level, default 0
+	Algorithm     string // --algorithm / -a : solving algorithm to use (required, unless ResetInternalParams; "hc", "ws", "dfs", or "cdcl")
+	OutputFile    string // --output / -o : where to write the solution, if any ("" means unset)
+	TimeLimitSecs *int   // --time-limit-secs / -t : optional search time limit, in seconds
+
+	// AlgParams is --alg-params / -p : 1 to 4 algorithm-specific
+	// integer parameters. Each element is nil if and only if that
+	// position was given as "_" (STAGE44.md's underscore syntax,
+	// meaning "use this slot's own default" without needing to know or
+	// spell out what that default actually is) -- distinct from a
+	// position simply not being present at all (a shorter slice), but
+	// every consumer treats the two identically: "fall through to
+	// whatever this slot's own default logic already does." This is
+	// what lets a caller reach a later slot (e.g. cdcl's val4) without
+	// committing to a real value for an earlier one they don't care
+	// about (e.g. "--alg-params _ _ _ 3" sets only the phase strategy).
+	AlgParams       []*int64
+	NoPreprocessing bool // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
 
 	// InternalParamsPath is --internal-params/-c (STAGE39.md): an
 	// explicit path to a JSON file of runtime-configurable internal
@@ -238,6 +250,26 @@ func tokenize(argv []string) (map[string][]string, error) {
 	return rawValues, nil
 }
 
+// parseAlgParamValue parses one plain-integer --alg-params value
+// token: "_" (STAGE44.md) returns (nil, nil) -- "use this slot's own
+// default," represented as a nil pointer rather than any particular
+// sentinel integer, since every slot's actual default value differs
+// (and, for cdcl's restart/phase strategies, depends on --num-threads,
+// which buildArgs can't assume has already been parsed at this point
+// anyway) -- so the real default is resolved later, by whichever
+// consumer already resolves "not given at all." Anything else must be
+// a base-10 integer.
+func parseAlgParamValue(s string) (*int64, error) {
+	if s == "_" {
+		return nil, nil
+	}
+	p, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid value for --alg-params: %q", s)
+	}
+	return &p, nil
+}
+
 // parseByteSize parses s as a byte count (STAGE12.md): either a plain
 // non-negative integer (a number of bytes), or such an integer
 // immediately followed by one of "k", "kb", "m", "mb", "g", or "gb"
@@ -308,35 +340,40 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		// --algorithm=cdcl's third --alg-params value is a memory size
 		// (STAGE12.md), not a plain integer like every other
 		// --alg-params value in this program, so it needs its own
-		// parsing path rather than the uniform strconv.ParseInt loop
-		// below; this is why buildArgs (usually algorithm-agnostic)
-		// branches on args.Algorithm here. Per STAGE15.md, the second
-		// value (restart strategy) is a plain integer, appended to
-		// AlgParams just like the first.
+		// parsing path rather than the uniform loop below; this is why
+		// buildArgs (usually algorithm-agnostic) branches on
+		// args.Algorithm here. Per STAGE15.md, the second value
+		// (restart strategy) is a plain integer, appended to AlgParams
+		// just like the first.
 		if args.Algorithm == "cdcl" {
 			if len(values) > 4 {
 				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most four values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)")
 			}
 			if len(values) >= 1 {
-				p, err := strconv.ParseInt(values[0], 10, 64)
+				p, err := parseAlgParamValue(values[0])
 				if err != nil {
-					return nil, fmt.Errorf("invalid value for --alg-params: %q", values[0])
+					return nil, err
 				}
 				args.AlgParams = append(args.AlgParams, p)
 			}
 			if len(values) >= 2 {
-				p, err := strconv.ParseInt(values[1], 10, 64)
+				p, err := parseAlgParamValue(values[1])
 				if err != nil {
-					return nil, fmt.Errorf("invalid value for --alg-params: %q", values[1])
+					return nil, err
 				}
 				args.AlgParams = append(args.AlgParams, p)
 			}
 			if len(values) >= 3 {
-				limit, err := parseByteSize(values[2])
-				if err != nil {
-					return nil, fmt.Errorf("invalid memory limit for --alg-params: %w", err)
+				// "_" (STAGE44.md) leaves MemoryLimitBytes nil, exactly
+				// as if val3 had never been given at all -- unbounded,
+				// the same default every other unset slot falls back to.
+				if values[2] != "_" {
+					limit, err := parseByteSize(values[2])
+					if err != nil {
+						return nil, fmt.Errorf("invalid memory limit for --alg-params: %w", err)
+					}
+					args.MemoryLimitBytes = &limit
 				}
-				args.MemoryLimitBytes = &limit
 			}
 			if len(values) == 4 {
 				// STAGE43.md's phase-selection strategy: a plain integer,
@@ -345,23 +382,23 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 				// raw --alg-params token -- MemoryLimitBytes (the third
 				// token) is parsed into its own field above, not into
 				// AlgParams, so AlgParams itself only ever holds
-				// SelectVar/restart/phase, never the memory limit. A
-				// known wrinkle of this positional design (already true
-				// of val2/val3): selecting a phase strategy from the
-				// command line requires also giving an explicit memory
-				// limit value as val3, even for a caller who wants no
-				// real memory cap.
-				p, err := strconv.ParseInt(values[3], 10, 64)
+				// SelectVar/restart/phase, never the memory limit.
+				// STAGE44.md's underscore syntax is what actually fixes
+				// the old wrinkle noted here (selecting a phase strategy
+				// used to require also giving a *real* memory limit as
+				// val3): "--alg-params _ _ _ 3" now reaches val4 while
+				// leaving val1/val2/val3 all at their own defaults.
+				p, err := parseAlgParamValue(values[3])
 				if err != nil {
-					return nil, fmt.Errorf("invalid value for --alg-params: %q", values[3])
+					return nil, err
 				}
 				args.AlgParams = append(args.AlgParams, p)
 			}
 		} else {
 			for _, value := range values {
-				p, err := strconv.ParseInt(value, 10, 64)
+				p, err := parseAlgParamValue(value)
 				if err != nil {
-					return nil, fmt.Errorf("invalid value for --alg-params: %q", value)
+					return nil, err
 				}
 				args.AlgParams = append(args.AlgParams, p)
 			}
@@ -419,7 +456,7 @@ func validate(args *Args, rawValues map[string][]string) error {
 		if args.TimeLimitSecs == nil && len(args.AlgParams) == 0 {
 			return fmt.Errorf("for --algorithm=hc, either --time-limit-secs or --alg-params (number of starts) must be given")
 		}
-		if len(args.AlgParams) == 1 && args.AlgParams[0] < 1 {
+		if len(args.AlgParams) == 1 && args.AlgParams[0] != nil && *args.AlgParams[0] < 1 {
 			return fmt.Errorf("for --algorithm=hc, the number of starts given via --alg-params must be a positive integer")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
@@ -430,13 +467,13 @@ func validate(args *Args, rawValues map[string][]string) error {
 		if args.TimeLimitSecs == nil && len(args.AlgParams) == 0 {
 			return fmt.Errorf("for --algorithm=ws, either --time-limit-secs or --alg-params (number of tries) must be given")
 		}
-		if len(args.AlgParams) >= 1 && args.AlgParams[0] < 1 {
+		if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil && *args.AlgParams[0] < 1 {
 			return fmt.Errorf("for --algorithm=ws, the number of tries given via --alg-params must be a positive integer")
 		}
-		if len(args.AlgParams) >= 2 && args.AlgParams[1] < 1 {
+		if len(args.AlgParams) >= 2 && args.AlgParams[1] != nil && *args.AlgParams[1] < 1 {
 			return fmt.Errorf("for --algorithm=ws, the max-flips-per-try value given via --alg-params must be a positive integer")
 		}
-		if len(args.AlgParams) >= 3 && (args.AlgParams[2] < 0 || args.AlgParams[2] > 100) {
+		if len(args.AlgParams) >= 3 && args.AlgParams[2] != nil && (*args.AlgParams[2] < 0 || *args.AlgParams[2] > 100) {
 			return fmt.Errorf("for --algorithm=ws, the noise-percent value given via --alg-params must be between 0 and 100")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
@@ -447,7 +484,7 @@ func validate(args *Args, rawValues map[string][]string) error {
 		if len(args.AlgParams) > 1 {
 			return fmt.Errorf("for --algorithm=dfs, --alg-params accepts at most one value (0 or 1, selecting which SelectVar heuristic to use)")
 		}
-		if len(args.AlgParams) == 1 && args.AlgParams[0] != 0 && args.AlgParams[0] != 1 {
+		if len(args.AlgParams) == 1 && args.AlgParams[0] != nil && *args.AlgParams[0] != 0 && *args.AlgParams[0] != 1 {
 			return fmt.Errorf("for --algorithm=dfs, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {
@@ -455,34 +492,41 @@ func validate(args *Args, rawValues map[string][]string) error {
 		}
 
 	case "cdcl":
-		// The at-most-three-values check and the memory limit's own
+		// The at-most-four-values check and the memory limit's own
 		// syntax (plain integer, optionally with a k/kb/m/mb/g/gb
 		// suffix) were already enforced in buildArgs, since that's
 		// where the raw tokens are available; only the remaining
 		// business rules (variant is 0-3; restart strategy is 0-5;
-		// the limit, if given, is positive) are checked here.
+		// the limit, if given, is positive; phase strategy is 0-3) are
+		// checked here -- each skipped (nil, "_") if the caller used
+		// STAGE44.md's underscore syntax for that slot, since there's
+		// nothing to range-check about "use the default."
 		// STAGE13.md extends the first value's range from dfs's 0/1
 		// (Weighted/Fast) to also allow 2 (VSIDS) and 3 (LRB), both
 		// cdcl-only. STAGE15.md adds the second value (restart
 		// strategy: 0 = none, 1 = Luby, 2 = polynomial, 3 = geometric).
-		// STAGE21.md adds a fourth restart-strategy value (4 = round-
-		// robin across quadratic/geometric/Luby by worker index,
-		// meaningful with --num-threads > 1; see cdcl.RestartRoundRobin).
-		// STAGE34.md adds a fifth restart-strategy value (5 = Glucose's
-		// own data-driven policy based on LBD; see cdcl.RestartGlucose).
+		// STAGE21.md adds a fourth restart-strategy value (round-robin
+		// across the fixed-schedule strategies by worker index, see
+		// cdcl.RestartRoundRobin) and STAGE34.md a fifth (Glucose's own
+		// data-driven policy based on LBD, see cdcl.RestartGlucose);
+		// STAGE44.md swaps which numeral is which (4 = Glucose, 5 =
+		// round-robin, now spanning all four fixed/data-driven
+		// strategies) so that round-robin -- the "meta" choice -- keeps
+		// the highest number as the strategy list grows, rather than
+		// sitting in the middle of it.
 		// STAGE43.md adds a fourth AlgParams element (phase strategy:
 		// 0 = saving, 1 = target, 2 = WalkSAT rephasing, 3 = round-robin
 		// across all three by worker index; see cdcl.PhaseStrategy).
-		if len(args.AlgParams) >= 1 && (args.AlgParams[0] < 0 || args.AlgParams[0] > 3) {
+		if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil && (*args.AlgParams[0] < 0 || *args.AlgParams[0] > 3) {
 			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)")
 		}
-		if len(args.AlgParams) >= 2 && (args.AlgParams[1] < 0 || args.AlgParams[1] > 5) {
+		if len(args.AlgParams) >= 2 && args.AlgParams[1] != nil && (*args.AlgParams[1] < 0 || *args.AlgParams[1] > 5) {
 			return fmt.Errorf("for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, 3, 4, or 5 (selecting the restart strategy)")
 		}
 		if args.MemoryLimitBytes != nil && *args.MemoryLimitBytes < 1 {
 			return fmt.Errorf("for --algorithm=cdcl, the memory limit given via --alg-params must be a positive number of bytes")
 		}
-		if len(args.AlgParams) >= 3 && (args.AlgParams[2] < 0 || args.AlgParams[2] > 3) {
+		if len(args.AlgParams) >= 3 && args.AlgParams[2] != nil && (*args.AlgParams[2] < 0 || *args.AlgParams[2] > 3) {
 			return fmt.Errorf("for --algorithm=cdcl, the fourth --alg-params value must be 0, 1, 2, or 3 (selecting the phase-selection strategy)")
 		}
 		if args.TimeLimitSecs != nil && *args.TimeLimitSecs < 1 {

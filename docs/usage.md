@@ -154,7 +154,11 @@ Print the built-in help text and exit.
 Up to four positional, algorithm-specific values. At least one of
 `--alg-params` or `--time-limit-secs` is required for `hc`/`ws`. The
 values are positional — to set the second value you must also supply
-the first, even if it's just the default.
+the first — but any value may be given as `_` instead of a real number
+to mean "use this slot's own default," without needing to know or
+spell out what that default actually is: `--alg-params _ _ _ 3` (see
+`cdcl` below) sets only the fourth value, leaving the first three at
+their defaults.
 
 ### `hc`
 
@@ -181,7 +185,7 @@ the first, even if it's just the default.
 | Value | Meaning |
 |---|---|
 | `val1` | Variable-selection heuristic. `0`/`1`: same as `dfs`'s `val1`. `2` (default): VSIDS — scores variables by how often they've recently appeared while resolving a conflict, decayed over time. `3`: LRB — scores variables by how often they've recently *participated* in producing a learned clause, per conflict they've been assigned for. |
-| `val2` | Restart strategy. `0`: no restarts. `1`: the Luby sequence. `2` (default with `--num-threads=1`): a quadratic "polynomial" growth sequence. `3`: a true geometric growth sequence (constant ratio between restart intervals). `4` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{2, 3, 1}` in turn, so no two threads restart on the same cadence. `5`: Glucose's data-driven policy — restart when a moving average of recent learned-clause LBDs looks close to or worse than the all-time average, rather than on a fixed conflict-count schedule. |
+| `val2` | Restart strategy. `0`: no restarts. `1`: the Luby sequence. `2` (default with `--num-threads=1`): a quadratic "polynomial" growth sequence. `3`: a true geometric growth sequence (constant ratio between restart intervals). `4`: Glucose's data-driven policy — restart when a moving average of recent learned-clause LBDs looks close to or worse than the all-time average, rather than on a fixed conflict-count schedule. `5` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{2, 3, 1, 4}` in turn, so no two threads restart on the same cadence. |
 | `val3` | Learned-clause database memory limit. Either a plain integer (bytes) or an integer with a `k`/`kb`/`m`/`mb`/`g`/`gb` suffix (case-insensitive), e.g. `100MB`. Unbounded by default. |
 | `val4` | Phase-selection strategy: which technique to use for guessing a newly-decided variable's polarity. `0` (default with `--num-threads=1`): phase saving — guess the polarity the variable last held before becoming unassigned. `1`: target phase — guess the polarity recorded at the search's deepest trail so far, tracked separately from phase saving. `2`: periodic WalkSAT rephasing — like phase saving, except every so many restarts a short WalkSAT burst runs and its result overwrites the saved phase wholesale (if that burst happens to fully solve the problem on its own, that solution is reported directly). `3` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{0, 1, 2}` in turn. |
 
@@ -190,9 +194,15 @@ Luby, plain phase saving) were chosen from real measurement on this
 project's own benchmark set, not just the literature — see
 [references.md](references.md) and `reports/REPORT13.md`/
 `reports/REPORT15.md`/`reports/REPORT43.md` for the numbers. `val1`,
-`val2`, and `val3` must all be given (even if `val3` is just an
-otherwise-unwanted memory limit) to reach `val4` — every value here is
-positional.
+`val2`, and `val3` must all be given to reach `val4` — use `_` for any
+of them you don't otherwise want to set, e.g. `--alg-params _ _ _ 3`.
+
+Restart round-robin (`val2=5`) cycles through 4 strategies and phase
+round-robin (`val4=3`) cycles through 3 — deliberately coprime cycle
+lengths, so with both defaulted in multi-threaded mode, every worker
+up to the twelfth (`lcm(4, 3)`) gets a genuinely unique combination of
+the two before any repeat, rather than the two rotations colliding on
+the same pairing every three workers (`reports/REPORT44.md`).
 
 ## Exit status
 

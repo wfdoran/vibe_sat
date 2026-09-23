@@ -13,6 +13,22 @@ func baseHCArgs(extra ...string) []string {
 	return append(args, extra...)
 }
 
+// formatAlgParams renders an AlgParams slice for test failure
+// messages: "_" for a nil (STAGE44.md underscore) element, the plain
+// integer otherwise -- printing args.AlgParams directly with %v would
+// show pointer addresses instead, once it became []*int64.
+func formatAlgParams(params []*int64) string {
+	parts := make([]string, len(params))
+	for i, p := range params {
+		if p == nil {
+			parts[i] = "_"
+		} else {
+			parts[i] = strconv.FormatInt(*p, 10)
+		}
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
 // TestParseHelpLongForm verifies that --help alone sets Args.Help,
 // without requiring any other argument.
 func TestParseHelpLongForm(t *testing.T) {
@@ -95,8 +111,8 @@ func TestParseShortForm(t *testing.T) {
 	if args.Verbose != 3 {
 		t.Errorf("Verbose = %d, want 3", args.Verbose)
 	}
-	if len(args.AlgParams) != 1 || args.AlgParams[0] != 10 {
-		t.Errorf("AlgParams = %v, want [10]", args.AlgParams)
+	if len(args.AlgParams) != 1 || *args.AlgParams[0] != 10 {
+		t.Errorf("AlgParams = %v, want [10]", formatAlgParams(args.AlgParams))
 	}
 }
 
@@ -168,7 +184,7 @@ func TestParseHCWithTimeLimitOnly(t *testing.T) {
 		t.Errorf("TimeLimitSecs = %v, want 30", args.TimeLimitSecs)
 	}
 	if len(args.AlgParams) != 0 {
-		t.Errorf("AlgParams = %v, want empty", args.AlgParams)
+		t.Errorf("AlgParams = %v, want empty", formatAlgParams(args.AlgParams))
 	}
 }
 
@@ -179,8 +195,8 @@ func TestParseHCWithBothStartsAndTimeLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse returned unexpected error: %v", err)
 	}
-	if len(args.AlgParams) != 1 || args.AlgParams[0] != 5 {
-		t.Errorf("AlgParams = %v, want [5]", args.AlgParams)
+	if len(args.AlgParams) != 1 || *args.AlgParams[0] != 5 {
+		t.Errorf("AlgParams = %v, want [5]", formatAlgParams(args.AlgParams))
 	}
 	if args.TimeLimitSecs == nil || *args.TimeLimitSecs != 30 {
 		t.Errorf("TimeLimitSecs = %v, want 30", args.TimeLimitSecs)
@@ -216,7 +232,7 @@ func TestParseWSWithTimeLimitOnly(t *testing.T) {
 		t.Fatalf("Parse returned unexpected error: %v", err)
 	}
 	if len(args.AlgParams) != 0 {
-		t.Errorf("AlgParams = %v, want empty", args.AlgParams)
+		t.Errorf("AlgParams = %v, want empty", formatAlgParams(args.AlgParams))
 	}
 }
 
@@ -228,8 +244,8 @@ func TestParseWSAcceptsThreeAlgParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse returned unexpected error: %v", err)
 	}
-	if len(args.AlgParams) != 3 || args.AlgParams[0] != 5 || args.AlgParams[1] != 2000 || args.AlgParams[2] != 40 {
-		t.Errorf("AlgParams = %v, want [5 2000 40]", args.AlgParams)
+	if len(args.AlgParams) != 3 || *args.AlgParams[0] != 5 || *args.AlgParams[1] != 2000 || *args.AlgParams[2] != 40 {
+		t.Errorf("AlgParams = %v, want [5 2000 40]", formatAlgParams(args.AlgParams))
 	}
 }
 
@@ -296,8 +312,8 @@ func TestParseDFSAcceptsSelectVarVariant(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse returned unexpected error for --alg-params=%d: %v", variant, err)
 		}
-		if len(args.AlgParams) != 1 || args.AlgParams[0] != variant {
-			t.Errorf("AlgParams = %v, want [%d]", args.AlgParams, variant)
+		if len(args.AlgParams) != 1 || *args.AlgParams[0] != variant {
+			t.Errorf("AlgParams = %v, want [%d]", formatAlgParams(args.AlgParams), variant)
 		}
 	}
 }
@@ -346,8 +362,8 @@ func TestParseCDCLAcceptsSelectVarVariant(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse returned unexpected error for --alg-params=%d: %v", variant, err)
 		}
-		if len(args.AlgParams) != 1 || args.AlgParams[0] != variant {
-			t.Errorf("AlgParams = %v, want [%d]", args.AlgParams, variant)
+		if len(args.AlgParams) != 1 || *args.AlgParams[0] != variant {
+			t.Errorf("AlgParams = %v, want [%d]", formatAlgParams(args.AlgParams), variant)
 		}
 	}
 }
@@ -384,8 +400,8 @@ func TestParseCDCLAcceptsPhaseStrategy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse returned unexpected error for --alg-params 2 2 100MB %d: %v", phase, err)
 		}
-		if len(args.AlgParams) != 3 || args.AlgParams[2] != phase {
-			t.Errorf("AlgParams = %v, want [2 2 %d]", args.AlgParams, phase)
+		if len(args.AlgParams) != 3 || *args.AlgParams[2] != phase {
+			t.Errorf("AlgParams = %v, want [2 2 %d]", formatAlgParams(args.AlgParams), phase)
 		}
 	}
 }
@@ -412,8 +428,8 @@ func TestParseCDCLAcceptsRestartStrategy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse returned unexpected error for --alg-params 2 %d: %v", restart, err)
 		}
-		if len(args.AlgParams) != 2 || args.AlgParams[1] != restart {
-			t.Errorf("AlgParams = %v, want [2 %d]", args.AlgParams, restart)
+		if len(args.AlgParams) != 2 || *args.AlgParams[1] != restart {
+			t.Errorf("AlgParams = %v, want [2 %d]", formatAlgParams(args.AlgParams), restart)
 		}
 	}
 }
@@ -431,29 +447,31 @@ func TestParseCDCLRejectsOutOfRangeRestartStrategy(t *testing.T) {
 	}
 }
 
-// TestParseCDCLAcceptsRoundRobinRestartStrategy verifies that
-// --algorithm=cdcl accepts 4 (round-robin, STAGE21.md) as a second
-// --alg-params value.
-func TestParseCDCLAcceptsRoundRobinRestartStrategy(t *testing.T) {
+// TestParseCDCLAcceptsGlucoseRestartStrategy verifies that
+// --algorithm=cdcl accepts 4 (Glucose's data-driven policy,
+// STAGE34.md; moved from 5 by STAGE44.md) as a second --alg-params
+// value.
+func TestParseCDCLAcceptsGlucoseRestartStrategy(t *testing.T) {
 	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", "4"})
 	if err != nil {
 		t.Fatalf("Parse() with --alg-params 2 4 returned error: %v", err)
 	}
-	if len(args.AlgParams) != 2 || args.AlgParams[1] != 4 {
-		t.Errorf("AlgParams = %v, want [2 4]", args.AlgParams)
+	if len(args.AlgParams) != 2 || *args.AlgParams[1] != 4 {
+		t.Errorf("AlgParams = %v, want [2 4]", formatAlgParams(args.AlgParams))
 	}
 }
 
-// TestParseCDCLAcceptsGlucoseRestartStrategy verifies that
-// --algorithm=cdcl accepts 5 (Glucose's data-driven policy,
-// STAGE34.md) as a second --alg-params value.
-func TestParseCDCLAcceptsGlucoseRestartStrategy(t *testing.T) {
+// TestParseCDCLAcceptsRoundRobinRestartStrategy verifies that
+// --algorithm=cdcl accepts 5 (round-robin, STAGE21.md; moved from 4 by
+// STAGE44.md, now spanning all four fixed/data-driven strategies) as a
+// second --alg-params value.
+func TestParseCDCLAcceptsRoundRobinRestartStrategy(t *testing.T) {
 	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", "5"})
 	if err != nil {
 		t.Fatalf("Parse() with --alg-params 2 5 returned error: %v", err)
 	}
-	if len(args.AlgParams) != 2 || args.AlgParams[1] != 5 {
-		t.Errorf("AlgParams = %v, want [2 5]", args.AlgParams)
+	if len(args.AlgParams) != 2 || *args.AlgParams[1] != 5 {
+		t.Errorf("AlgParams = %v, want [2 5]", formatAlgParams(args.AlgParams))
 	}
 }
 
@@ -590,8 +608,8 @@ func TestParseNoPreprocessingDoesNotConsumeFollowingFlag(t *testing.T) {
 	if !args.NoPreprocessing {
 		t.Errorf("NoPreprocessing = false, want true")
 	}
-	if len(args.AlgParams) != 1 || args.AlgParams[0] != 10 {
-		t.Errorf("AlgParams = %v, want [10]", args.AlgParams)
+	if len(args.AlgParams) != 1 || *args.AlgParams[0] != 10 {
+		t.Errorf("AlgParams = %v, want [10]", formatAlgParams(args.AlgParams))
 	}
 }
 
@@ -669,5 +687,65 @@ func TestParseUnexpectedPositionalArgument(t *testing.T) {
 	_, err := Parse(append(baseHCArgs(), "stray"))
 	if err == nil {
 		t.Fatalf("expected error for unexpected positional argument")
+	}
+}
+
+// TestParseUnderscoreSkipsSlot verifies STAGE44.md's underscore
+// syntax: "_" in any --alg-params position produces a nil element
+// (not a parse error), leaving that slot unset for downstream default
+// resolution, exactly as if it had never been given.
+func TestParseUnderscoreSkipsSlot(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "_", "5"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if len(args.AlgParams) != 2 || args.AlgParams[0] != nil || *args.AlgParams[1] != 5 {
+		t.Errorf("AlgParams = %v, want [_ 5]", formatAlgParams(args.AlgParams))
+	}
+}
+
+// TestParseUnderscoreReachesLaterCDCLSlot verifies the concrete case
+// STAGE43.md flagged and STAGE44.md fixes: reaching cdcl's val4 (phase
+// strategy) without committing to a real val1/val2/val3.
+func TestParseUnderscoreReachesLaterCDCLSlot(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "_", "_", "_", "3"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if len(args.AlgParams) != 3 || args.AlgParams[0] != nil || args.AlgParams[1] != nil || *args.AlgParams[2] != 3 {
+		t.Errorf("AlgParams = %v, want [_ _ 3]", formatAlgParams(args.AlgParams))
+	}
+	if args.MemoryLimitBytes != nil {
+		t.Errorf("MemoryLimitBytes = %v, want nil (val3 was \"_\")", args.MemoryLimitBytes)
+	}
+}
+
+// TestParseUnderscoreForMemoryLimit verifies that "_" in cdcl's val3
+// position leaves MemoryLimitBytes nil (unbounded), the same as val3
+// never being given at all.
+func TestParseUnderscoreForMemoryLimit(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=cdcl", "--alg-params", "2", "2", "_"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if args.MemoryLimitBytes != nil {
+		t.Errorf("MemoryLimitBytes = %v, want nil", args.MemoryLimitBytes)
+	}
+	if len(args.AlgParams) != 2 || *args.AlgParams[0] != 2 || *args.AlgParams[1] != 2 {
+		t.Errorf("AlgParams = %v, want [2 2]", formatAlgParams(args.AlgParams))
+	}
+}
+
+// TestParseUnderscoreAloneSatisfiesHCRequirement verifies that
+// "--alg-params _" still counts as "--alg-params was given" for hc's
+// "at least one of --alg-params or --time-limit-secs" requirement,
+// even though the resulting slot is nil.
+func TestParseUnderscoreAloneSatisfiesHCRequirement(t *testing.T) {
+	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=hc", "--alg-params", "_"})
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if len(args.AlgParams) != 1 || args.AlgParams[0] != nil {
+		t.Errorf("AlgParams = %v, want [_]", formatAlgParams(args.AlgParams))
 	}
 }

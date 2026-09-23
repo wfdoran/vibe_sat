@@ -49,7 +49,14 @@ Options:
   --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
         Algorithm-specific parameters (1 to 4 integer values); at
         least one of --alg-params or --time-limit-secs is required for
-        "hc"/"ws". The meaning of each value depends on --algorithm:
+        "hc"/"ws". Every value is positional -- to set val2 you must
+        also supply val1, to set val3 you must also supply val1 and
+        val2, and so on -- but any value may be given as "_"
+        (STAGE44.md) instead of a real number to mean "use this slot's
+        own default," without needing to know or spell out what that
+        default actually is: "--alg-params _ _ _ 3" (cdcl) sets only
+        the phase strategy, leaving val1/val2/val3 all at their
+        defaults. The meaning of each value depends on --algorithm:
           hc   val1 = number of random restarts to perform.
           ws   val1 = number of random restarts ("tries") to perform.
                val2 = max flips per try before giving up and starting
@@ -59,8 +66,6 @@ Options:
                       unsatisfied clause instead of the one that
                       breaks the fewest other clauses (default 50 if
                       omitted).
-               Values are positional: to set val2 or val3 you must
-               also supply every value before it.
           dfs  val1 = which SelectVar heuristic to use (STAGE6.md):
                  0 = the default weighted heuristic from STAGE5.md
                      (looks at every not-yet-satisfied clause on every
@@ -111,13 +116,7 @@ Options:
                      means in the SAT literature (val2=2's sequence
                      was originally, incorrectly, called "geometric";
                      see reports/REPORT15.md).
-                 4 = round-robin (STAGE21.md, --num-threads > 1 only):
-                     worker 0 uses quadratic, worker 1 geometric,
-                     worker 2 Luby, worker 3 quadratic again, and so
-                     on, so each strategy runs on close to an equal
-                     share of the workers instead of every worker
-                     racing with the same restart cadence.
-                 5 = Glucose's own data-driven policy (STAGE34.md):
+                 4 = Glucose's own data-driven policy (STAGE34.md):
                      restarts not on a fixed conflict-count schedule
                      but whenever the moving average LBD ("Literal
                      Block Distance", Audemard & Simon 2009) of the
@@ -125,17 +124,30 @@ Options:
                      the all-time average LBD -- a sign the search has
                      drifted into learning less useful clauses than
                      its own history and is better off restarting.
+                 5 = round-robin (STAGE21.md, --num-threads > 1 only;
+                     STAGE44.md folded Glucose into the rotation):
+                     worker 0 uses quadratic, worker 1 geometric,
+                     worker 2 Luby, worker 3 Glucose, worker 4
+                     quadratic again, and so on, so each of the four
+                     strategies runs on close to an equal share of the
+                     workers instead of every worker racing with the
+                     same restart cadence. STAGE44.md numbers this 5
+                     (moved from 4) so round-robin -- the one "meta"
+                     choice above, not itself a schedule -- keeps the
+                     highest numeral as the list of real strategies
+                     grows.
                Optional; defaults to 2 (polynomial) with --num-threads=1
                (this project's own benchmark comparison,
                reports/REPORT15.md, found the polynomial schedule
                clearly ahead of no restarts and of Luby on this
                project's actual benchmark set, especially for proving
-               UNSAT), or to 4 (round-robin) with --num-threads > 1
+               UNSAT), or to 5 (round-robin) with --num-threads > 1
                (reports/REPORT20.md/REPORT21.md). An explicit val2,
                including 0, is always honored by every worker exactly
                as given, regardless of --num-threads. Note: val1 must
                be given to set val2, even if val1 is just the default
-               (2).
+               (2) -- or use "_" (see below) to mean exactly that
+               without needing to know it.
                val3 = an optional learned-clause database memory
                      limit (STAGE12.md; this was val2 before
                      STAGE15.md added the restart strategy above):
@@ -148,8 +160,8 @@ Options:
                      (case-insensitive), e.g. "--alg-params 2 1 100MB".
                      Omitted by default, in which case the database
                      grows without bound. Note: val1 and val2 must
-                     both be given to set val3, even if they are just
-                     the defaults (2 and 1).
+                     both be given to set val3 -- use "_" for either
+                     (or both) if you want their defaults.
                val4 = phase-selection strategy (STAGE43.md): which
                      technique decide uses to guess a newly-decided
                      variable's polarity.
@@ -173,15 +185,21 @@ Options:
                      uses phase saving, worker 1 target phase, worker
                      2 WalkSAT rephasing, worker 3 phase saving again,
                      and so on, diversifying strategy across the
-                     portfolio the same way val2=4 diversifies restart
-                     schedules.
+                     portfolio the same way val2=5 diversifies restart
+                     schedules. STAGE44.md deliberately keeps this
+                     rotation's period (3) coprime with restart round-
+                     robin's (4): since both cycle off the same worker
+                     index, every worker up to the twelfth (lcm(3, 4))
+                     gets a genuinely unique (restart, phase) pairing
+                     before any repeat, rather than the two rotations
+                     colliding on the same pattern every three workers.
                Optional; defaults to 0 (phase saving) with
                --num-threads=1, or to 3 (round-robin) with
                --num-threads > 1, matching val2's own default
                convention. Note: val1, val2, and val3 must all be
-               given to set val4, even if val3 is a memory limit you
-               don't otherwise want (--alg-params's values are
-               positional).
+               given to set val4 -- use "_" (see above) for any of
+               them you don't otherwise want to set, e.g.
+               "--alg-params _ _ _ 3".
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -224,7 +242,7 @@ Options:
                  stops. The only thing threads share is learned
                  clauses, continuously, through a lock-free per-thread
                  export buffer every other thread drains -- see
-                 --alg-params val2=4 above for how each thread's
+                 --alg-params val2=5 above for how each thread's
                  restart schedule is chosen.
         For every algorithm that honors it, a value larger than the
         machine's core count is allowed (oversubscription); a warning

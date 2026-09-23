@@ -172,8 +172,8 @@ func runHillClimb(problem *cnf.Problem, preResult *preprocess.Result, originalNu
 	rng := newSeededRand()
 
 	params := hillclimb.Params{}
-	if len(args.AlgParams) == 1 {
-		numStarts := int(args.AlgParams[0])
+	if len(args.AlgParams) == 1 && args.AlgParams[0] != nil {
+		numStarts := int(*args.AlgParams[0])
 		params.NumStarts = &numStarts
 	}
 	if args.TimeLimitSecs != nil {
@@ -206,15 +206,15 @@ func runWalkSat(problem *cnf.Problem, preResult *preprocess.Result, originalNumV
 		MaxFlipsPerTry: hillclimb.DefaultMaxFlipsPerTry,
 		NoisePercent:   hillclimb.DefaultNoisePercent,
 	}
-	if len(args.AlgParams) >= 1 {
-		numTries := int(args.AlgParams[0])
+	if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil {
+		numTries := int(*args.AlgParams[0])
 		params.NumTries = &numTries
 	}
-	if len(args.AlgParams) >= 2 {
-		params.MaxFlipsPerTry = int(args.AlgParams[1])
+	if len(args.AlgParams) >= 2 && args.AlgParams[1] != nil {
+		params.MaxFlipsPerTry = int(*args.AlgParams[1])
 	}
-	if len(args.AlgParams) >= 3 {
-		params.NoisePercent = int(args.AlgParams[2])
+	if len(args.AlgParams) >= 3 && args.AlgParams[2] != nil {
+		params.NoisePercent = int(*args.AlgParams[2])
 	}
 	if args.TimeLimitSecs != nil {
 		limit := time.Duration(*args.TimeLimitSecs) * time.Second
@@ -253,8 +253,8 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 	}
 
 	variant := dfs.SelectVarWeighted
-	if len(args.AlgParams) == 1 {
-		variant = dfs.SelectVarVariant(args.AlgParams[0])
+	if len(args.AlgParams) == 1 && args.AlgParams[0] != nil {
+		variant = dfs.SelectVarVariant(*args.AlgParams[0])
 	}
 
 	result := dfs.RunParallel(problem, lists, timeLimit, variant, args.NumThreads, rng, args.Verbose)
@@ -305,8 +305,8 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 	// priori literature reasoning, so VSIDS is the default here
 	// (unlike dfs, which keeps its own Weighted default).
 	variant := cdcl.SelectVarVsids
-	if len(args.AlgParams) >= 1 {
-		variant = cdcl.SelectVarVariant(args.AlgParams[0])
+	if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil {
+		variant = cdcl.SelectVarVariant(*args.AlgParams[0])
 	}
 
 	// STAGE15.md leaves the default restart strategy up to this
@@ -319,8 +319,8 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 	// racing every worker with the identical restart cadence (see
 	// cdcl.RunParallel's doc comment).
 	restartStrategy := cdcl.RestartPolynomial
-	if len(args.AlgParams) >= 2 {
-		restartStrategy = cdcl.RestartStrategy(args.AlgParams[1])
+	if len(args.AlgParams) >= 2 && args.AlgParams[1] != nil {
+		restartStrategy = cdcl.RestartStrategy(*args.AlgParams[1])
 	} else if args.NumThreads > 1 {
 		restartStrategy = cdcl.RestartRoundRobin
 	}
@@ -339,8 +339,8 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 	// own: whichever worker's strategy actually helps on a given
 	// problem tends to also be the one that finishes first).
 	phaseStrategy := cdcl.PhaseSaving
-	if len(args.AlgParams) >= 3 {
-		phaseStrategy = cdcl.PhaseStrategy(args.AlgParams[2])
+	if len(args.AlgParams) >= 3 && args.AlgParams[2] != nil {
+		phaseStrategy = cdcl.PhaseStrategy(*args.AlgParams[2])
 	} else if args.NumThreads > 1 {
 		phaseStrategy = cdcl.PhaseRoundRobin
 	}

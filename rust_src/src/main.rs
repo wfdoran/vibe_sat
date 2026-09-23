@@ -204,7 +204,7 @@ fn run_hill_climb(
 
     let params = hillclimb::Params {
         num_starts: match &args.alg_params {
-            Some(values) if values.len() == 1 => Some(values[0] as usize),
+            Some(values) if values.len() == 1 => values[0].map(|v| v as usize),
             _ => None,
         },
         time_limit: args
@@ -251,13 +251,13 @@ fn run_walksat(
 
     let mut params = hillclimb::walksat::WalkSatParams::default();
     if let Some(values) = &args.alg_params {
-        if let Some(&tries) = values.first() {
+        if let Some(&Some(tries)) = values.first() {
             params.num_tries = Some(tries as usize);
         }
-        if let Some(&max_flips) = values.get(1) {
+        if let Some(&Some(max_flips)) = values.get(1) {
             params.max_flips_per_try = max_flips as usize;
         }
-        if let Some(&noise) = values.get(2) {
+        if let Some(&Some(noise)) = values.get(2) {
             params.noise_percent = noise as u32;
         }
     }
@@ -310,7 +310,7 @@ fn run_dfs(
         .map(|secs| Duration::from_secs(secs as u64));
 
     let variant = match args.alg_params.as_deref() {
-        Some([1]) => dfs::SelectVarVariant::Fast,
+        Some([Some(1)]) => dfs::SelectVarVariant::Fast,
         _ => dfs::SelectVarVariant::Weighted,
     };
 
@@ -380,10 +380,10 @@ fn run_cdcl(
     // VSIDS is the default here (unlike dfs, which keeps its own
     // Weighted default).
     let variant = match args.alg_params.as_deref() {
-        Some([0, ..]) => cdcl::SelectVarVariant::Weighted,
-        Some([1, ..]) => cdcl::SelectVarVariant::Fast,
-        Some([2, ..]) => cdcl::SelectVarVariant::Vsids,
-        Some([3, ..]) => cdcl::SelectVarVariant::Lrb,
+        Some([Some(0), ..]) => cdcl::SelectVarVariant::Weighted,
+        Some([Some(1), ..]) => cdcl::SelectVarVariant::Fast,
+        Some([Some(2), ..]) => cdcl::SelectVarVariant::Vsids,
+        Some([Some(3), ..]) => cdcl::SelectVarVariant::Lrb,
         _ => cdcl::SelectVarVariant::Vsids,
     };
 
@@ -397,13 +397,17 @@ fn run_cdcl(
     // Luby evenly across the workers rather than racing every worker
     // with the identical restart cadence (see cdcl::run_parallel's
     // doc comment).
+    // STAGE44.md swaps which numeral is which (4 = Glucose, previously
+    // 5; 5 = RoundRobin, previously 4, now spanning all four fixed/
+    // data-driven strategies) so that round-robin -- the "meta" choice
+    // -- keeps the highest number as the strategy list grows.
     let restart_strategy = match args.alg_params.as_deref() {
-        Some([_, 0, ..]) => cdcl::RestartStrategy::None,
-        Some([_, 1, ..]) => cdcl::RestartStrategy::Luby,
-        Some([_, 2, ..]) => cdcl::RestartStrategy::Polynomial,
-        Some([_, 3, ..]) => cdcl::RestartStrategy::Geometric,
-        Some([_, 4, ..]) => cdcl::RestartStrategy::RoundRobin,
-        Some([_, 5, ..]) => cdcl::RestartStrategy::Glucose,
+        Some([_, Some(0), ..]) => cdcl::RestartStrategy::None,
+        Some([_, Some(1), ..]) => cdcl::RestartStrategy::Luby,
+        Some([_, Some(2), ..]) => cdcl::RestartStrategy::Polynomial,
+        Some([_, Some(3), ..]) => cdcl::RestartStrategy::Geometric,
+        Some([_, Some(4), ..]) => cdcl::RestartStrategy::Glucose,
+        Some([_, Some(5), ..]) => cdcl::RestartStrategy::RoundRobin,
         _ if args.num_threads > 1 => cdcl::RestartStrategy::RoundRobin,
         _ => cdcl::RestartStrategy::Polynomial,
     };
@@ -419,10 +423,10 @@ fn run_cdcl(
     // strategy across the portfolio's workers rather than racing every
     // worker with the identical phase source.
     let phase_strategy = match args.alg_params.as_deref() {
-        Some([_, _, 0, ..]) => cdcl::PhaseStrategy::Saving,
-        Some([_, _, 1, ..]) => cdcl::PhaseStrategy::Target,
-        Some([_, _, 2, ..]) => cdcl::PhaseStrategy::RephaseWalkSAT,
-        Some([_, _, 3, ..]) => cdcl::PhaseStrategy::RoundRobin,
+        Some([_, _, Some(0), ..]) => cdcl::PhaseStrategy::Saving,
+        Some([_, _, Some(1), ..]) => cdcl::PhaseStrategy::Target,
+        Some([_, _, Some(2), ..]) => cdcl::PhaseStrategy::RephaseWalkSAT,
+        Some([_, _, Some(3), ..]) => cdcl::PhaseStrategy::RoundRobin,
         _ if args.num_threads > 1 => cdcl::PhaseStrategy::RoundRobin,
         _ => cdcl::PhaseStrategy::Saving,
     };

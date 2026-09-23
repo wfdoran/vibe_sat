@@ -89,7 +89,19 @@ pub struct Args {
     /// STAGE43.md) values, in that order -- the third (a memory limit)
     /// is parsed separately into `memory_limit_bytes`, since it isn't
     /// a plain integer.
-    pub alg_params: Option<Vec<i64>>,
+    ///
+    /// Each element is `None` if and only if that position was given
+    /// as `"_"` (STAGE44.md's underscore syntax, meaning "use this
+    /// slot's own default" without needing to know or spell out what
+    /// that default actually is) -- distinct from a position simply
+    /// not being present at all (a shorter `Vec`, or `alg_params`
+    /// itself being `None`), but every consumer treats the two
+    /// identically: "fall through to whatever this slot's own default
+    /// logic already does." This is what lets a caller reach a later
+    /// slot (e.g. cdcl's fourth value) without committing to a real
+    /// value for an earlier one they don't care about (e.g.
+    /// `--alg-params _ _ _ 3` sets only the phase strategy).
+    pub alg_params: Option<Vec<Option<i64>>>,
 
     /// Skip preprocessing (STAGE8.md); default is to run it.
     pub no_preprocessing: bool,
@@ -242,7 +254,14 @@ Options:
   --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
         Algorithm-specific parameters (1 to 4 integer values); at
         least one of --alg-params or --time-limit-secs is required for
-        "hc"/"ws". The meaning of each value depends on --algorithm:
+        "hc"/"ws". Every value is positional -- to set val2 you must
+        also supply val1, to set val3 you must also supply val1 and
+        val2, and so on -- but any value may be given as "_"
+        (STAGE44.md) instead of a real number to mean "use this slot's
+        own default," without needing to know or spell out what that
+        default actually is: "--alg-params _ _ _ 3" (cdcl) sets only
+        the phase strategy, leaving val1/val2/val3 all at their
+        defaults. The meaning of each value depends on --algorithm:
           hc   val1 = number of random restarts to perform.
           ws   val1 = number of random restarts ("tries") to perform.
                val2 = max flips per try before giving up and starting
@@ -252,8 +271,6 @@ Options:
                       unsatisfied clause instead of the one that
                       breaks the fewest other clauses (default 50 if
                       omitted).
-               Values are positional: to set val2 or val3 you must
-               also supply every value before it.
           dfs  val1 = which SelectVar heuristic to use (STAGE6.md):
                  0 = the default weighted heuristic from STAGE5.md
                      (looks at every not-yet-satisfied clause on every
@@ -304,13 +321,7 @@ Options:
                      means in the SAT literature (val2=2's sequence
                      was originally, incorrectly, called "geometric";
                      see reports/REPORT15.md).
-                 4 = round-robin (STAGE21.md, --num-threads > 1 only):
-                     worker 0 uses quadratic, worker 1 geometric,
-                     worker 2 Luby, worker 3 quadratic again, and so
-                     on, so each strategy runs on close to an equal
-                     share of the workers instead of every worker
-                     racing with the same restart cadence.
-                 5 = Glucose's own data-driven policy (STAGE34.md):
+                 4 = Glucose's own data-driven policy (STAGE34.md):
                      restarts not on a fixed conflict-count schedule
                      but whenever the moving average LBD ("Literal
                      Block Distance", Audemard & Simon 2009) of the
@@ -318,17 +329,30 @@ Options:
                      the all-time average LBD -- a sign the search has
                      drifted into learning less useful clauses than
                      its own history and is better off restarting.
+                 5 = round-robin (STAGE21.md, --num-threads > 1 only;
+                     STAGE44.md folded Glucose into the rotation):
+                     worker 0 uses quadratic, worker 1 geometric,
+                     worker 2 Luby, worker 3 Glucose, worker 4
+                     quadratic again, and so on, so each of the four
+                     strategies runs on close to an equal share of the
+                     workers instead of every worker racing with the
+                     same restart cadence. STAGE44.md numbers this 5
+                     (moved from 4) so round-robin -- the one "meta"
+                     choice above, not itself a schedule -- keeps the
+                     highest numeral as the list of real strategies
+                     grows.
                Optional; defaults to 2 (polynomial) with --num-threads=1
                (this project's own benchmark comparison,
                reports/REPORT15.md, found the polynomial schedule
                clearly ahead of no restarts and of Luby on this
                project's actual benchmark set, especially for proving
-               UNSAT), or to 4 (round-robin) with --num-threads > 1
+               UNSAT), or to 5 (round-robin) with --num-threads > 1
                (reports/REPORT20.md/REPORT21.md). An explicit val2,
                including 0, is always honored by every worker exactly
                as given, regardless of --num-threads. Note: val1 must
                be given to set val2, even if val1 is just the default
-               (2).
+               (2) -- or use "_" (see above) to mean exactly that
+               without needing to know it.
                val3 = an optional learned-clause database memory
                      limit (STAGE12.md; this was val2 before
                      STAGE15.md added the restart strategy above):
@@ -341,8 +365,8 @@ Options:
                      (case-insensitive), e.g. "--alg-params 2 1 100MB".
                      Omitted by default, in which case the database
                      grows without bound. Note: val1 and val2 must
-                     both be given to set val3, even if they are just
-                     the defaults (2 and 1).
+                     both be given to set val3 -- use "_" for either
+                     (or both) if you want their defaults.
                val4 = phase-selection strategy (STAGE43.md): which
                      technique guesses a newly-decided variable's
                      polarity.
@@ -366,15 +390,21 @@ Options:
                      uses phase saving, worker 1 target phase, worker
                      2 WalkSAT rephasing, worker 3 phase saving again,
                      and so on, diversifying strategy across the
-                     portfolio the same way val2=4 diversifies restart
-                     schedules.
+                     portfolio the same way val2=5 diversifies restart
+                     schedules. STAGE44.md deliberately keeps this
+                     rotation's period (3) coprime with restart round-
+                     robin's (4): since both cycle off the same worker
+                     index, every worker up to the twelfth (lcm(3, 4))
+                     gets a genuinely unique (restart, phase) pairing
+                     before any repeat, rather than the two rotations
+                     colliding on the same pattern every three workers.
                Optional; defaults to 0 (phase saving) with
                --num-threads=1, or to 3 (round-robin) with
                --num-threads > 1, matching val2's own default
                convention. Note: val1, val2, and val3 must all be
-               given to set val4, even if val3 is a memory limit you
-               don't otherwise want (--alg-params's values are
-               positional).
+               given to set val4 -- use "_" (see above) for any of
+               them you don't otherwise want to set, e.g.
+               "--alg-params _ _ _ 3".
 
   --no-preprocessing, -x
         Skip preprocessing (STAGE8.md: unit propagation, pure literal
@@ -417,7 +447,7 @@ Options:
                  stops. The only thing threads share is learned
                  clauses, continuously, through a lock-free per-thread
                  export buffer every other thread drains -- see
-                 --alg-params val2=4 above for how each thread's
+                 --alg-params val2=5 above for how each thread's
                  restart schedule is chosen.
         For every algorithm that honors it, a value larger than the
         machine's core count is allowed (oversubscription); a warning
@@ -482,7 +512,7 @@ impl Args {
 /// value, a plain integer appended to `alg_params` just like the
 /// first.
 fn build_args(raw: RawArgs) -> Result<Args, String> {
-    let mut alg_params: Vec<i64> = Vec::new();
+    let mut alg_params: Vec<Option<i64>> = Vec::new();
     let mut memory_limit_bytes: Option<i64> = None;
 
     if let Some(values) = &raw.alg_params {
@@ -494,21 +524,21 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
                 );
             }
             if let Some(first) = values.first() {
-                let p = first
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid value for --alg-params: \"{first}\""))?;
-                alg_params.push(p);
+                alg_params.push(parse_alg_param_value(first)?);
             }
             if let Some(second) = values.get(1) {
-                let p = second
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid value for --alg-params: \"{second}\""))?;
-                alg_params.push(p);
+                alg_params.push(parse_alg_param_value(second)?);
             }
             if let Some(third) = values.get(2) {
-                let limit = parse_byte_size(third)
-                    .map_err(|e| format!("invalid memory limit for --alg-params: {e}"))?;
-                memory_limit_bytes = Some(limit);
+                // "_" (STAGE44.md) leaves memory_limit_bytes None,
+                // exactly as if the third value had never been given
+                // at all -- unbounded, the same default every other
+                // unset slot falls back to.
+                if third != "_" {
+                    let limit = parse_byte_size(third)
+                        .map_err(|e| format!("invalid memory limit for --alg-params: {e}"))?;
+                    memory_limit_bytes = Some(limit);
+                }
             }
             if let Some(fourth) = values.get(3) {
                 // STAGE43.md's phase-selection strategy: a plain
@@ -518,23 +548,18 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
                 // memory_limit_bytes (the third token) is parsed into
                 // its own field above, not into alg_params, so
                 // alg_params itself only ever holds select_var/
-                // restart/phase, never the memory limit. A known
-                // wrinkle of this positional design (already true of
-                // the second/third values): selecting a phase strategy
-                // from the command line requires also giving an
-                // explicit memory limit value as the third value, even
-                // for a caller who wants no real memory cap.
-                let p = fourth
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid value for --alg-params: \"{fourth}\""))?;
-                alg_params.push(p);
+                // restart/phase, never the memory limit.
+                // STAGE44.md's underscore syntax is what actually
+                // fixes the old wrinkle noted here (selecting a phase
+                // strategy used to require also giving a *real* memory
+                // limit as the third value): "--alg-params _ _ _ 3"
+                // now reaches the fourth value while leaving the first
+                // three all at their own defaults.
+                alg_params.push(parse_alg_param_value(fourth)?);
             }
         } else {
             for value in values {
-                let p = value
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid value for --alg-params: \"{value}\""))?;
-                alg_params.push(p);
+                alg_params.push(parse_alg_param_value(value)?);
             }
         }
     }
@@ -555,6 +580,24 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         num_threads: raw.num_threads,
         internal_params_path: raw.internal_params_path,
     })
+}
+
+/// Parses one plain-integer `--alg-params` value token: `"_"`
+/// (STAGE44.md) returns `Ok(None)` -- "use this slot's own default,"
+/// represented as `None` rather than any particular sentinel integer,
+/// since every slot's actual default value differs (and, for cdcl's
+/// restart/phase strategies, depends on `--num-threads`, which
+/// `build_args` can't assume has already been parsed at this point
+/// anyway) -- so the real default is resolved later, by whichever
+/// consumer already resolves "not given at all." Anything else must
+/// be a base-10 integer.
+fn parse_alg_param_value(s: &str) -> Result<Option<i64>, String> {
+    if s == "_" {
+        return Ok(None);
+    }
+    s.parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("invalid value for --alg-params: \"{s}\""))
 }
 
 /// Parses `s` as a byte count (STAGE12.md): either a plain
@@ -608,7 +651,9 @@ fn validate(args: &Args) -> Result<(), String> {
                             .to_string(),
                     );
                 }
-                if params[0] < 1 {
+                if let Some(starts) = params[0]
+                    && starts < 1
+                {
                     return Err(
                         "for --algorithm=hc, the number of starts given via --alg-params must be a positive integer"
                             .to_string(),
@@ -631,13 +676,15 @@ fn validate(args: &Args) -> Result<(), String> {
 
         "ws" => {
             if let Some(params) = &args.alg_params {
-                if params[0] < 1 {
+                if let Some(tries) = params[0]
+                    && tries < 1
+                {
                     return Err(
                         "for --algorithm=ws, the number of tries given via --alg-params must be a positive integer"
                             .to_string(),
                     );
                 }
-                if let Some(&max_flips) = params.get(1)
+                if let Some(&Some(max_flips)) = params.get(1)
                     && max_flips < 1
                 {
                     return Err(
@@ -645,7 +692,7 @@ fn validate(args: &Args) -> Result<(), String> {
                             .to_string(),
                     );
                 }
-                if let Some(&noise) = params.get(2)
+                if let Some(&Some(noise)) = params.get(2)
                     && !(0..=100).contains(&noise)
                 {
                     return Err(
@@ -676,7 +723,10 @@ fn validate(args: &Args) -> Result<(), String> {
                             .to_string(),
                     );
                 }
-                if params[0] != 0 && params[0] != 1 {
+                if let Some(variant) = params[0]
+                    && variant != 0
+                    && variant != 1
+                {
                     return Err(
                         "for --algorithm=dfs, the --alg-params value must be 0 or 1 (selecting which SelectVar heuristic to use)"
                             .to_string(),
@@ -692,26 +742,38 @@ fn validate(args: &Args) -> Result<(), String> {
         }
 
         "cdcl" => {
-            // The at-most-three-values check and the memory limit's
+            // The at-most-four-values check and the memory limit's
             // own syntax (plain integer, optionally with a
             // k/kb/m/mb/g/gb suffix) were already enforced in
             // build_args, since that's where the raw tokens are
             // available; only the remaining business rules (variant
             // is 0-3; restart strategy is 0-5; the limit, if given,
-            // is positive) are checked here. STAGE13.md extends the
-            // first value's range from dfs's 0/1 (Weighted/Fast) to
-            // also allow 2 (VSIDS) and 3 (LRB), both cdcl-only.
-            // STAGE15.md adds the second value (restart strategy: 0 =
-            // none, 1 = Luby, 2 = polynomial, 3 = geometric).
-            // STAGE21.md adds a fourth restart-strategy value (4 =
-            // round-robin across quadratic/geometric/Luby by worker
-            // index, meaningful with --num-threads > 1; see
-            // cdcl::RestartStrategy::RoundRobin). STAGE34.md adds a
-            // fifth restart-strategy value (5 = Glucose's own
-            // data-driven policy based on LBD; see
-            // cdcl::RestartStrategy::Glucose).
+            // is positive; phase strategy is 0-3) are checked here --
+            // each skipped (`None`, `"_"`) if the caller used
+            // STAGE44.md's underscore syntax for that slot, since
+            // there's nothing to range-check about "use the default."
+            // STAGE13.md extends the first value's range from dfs's
+            // 0/1 (Weighted/Fast) to also allow 2 (VSIDS) and 3 (LRB),
+            // both cdcl-only. STAGE15.md adds the second value
+            // (restart strategy: 0 = none, 1 = Luby, 2 = polynomial,
+            // 3 = geometric). STAGE21.md adds a fourth restart-
+            // strategy value (round-robin across the fixed-schedule
+            // strategies by worker index, see
+            // cdcl::RestartStrategy::RoundRobin) and STAGE34.md a
+            // fifth (Glucose's own data-driven policy based on LBD,
+            // see cdcl::RestartStrategy::Glucose); STAGE44.md swaps
+            // which numeral is which (4 = Glucose, 5 = round-robin,
+            // now spanning all four fixed/data-driven strategies) so
+            // that round-robin -- the "meta" choice -- keeps the
+            // highest number as the strategy list grows, rather than
+            // sitting in the middle of it.
+            // STAGE43.md adds a fourth alg_params element (phase
+            // strategy: 0 = saving, 1 = target, 2 = WalkSAT rephasing,
+            // 3 = round-robin across all three by worker index; see
+            // cdcl::PhaseStrategy).
             if let Some(params) = &args.alg_params
-                && !(0..=3).contains(&params[0])
+                && let Some(variant) = params[0]
+                && !(0..=3).contains(&variant)
             {
                 return Err(
                     "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)"
@@ -719,7 +781,7 @@ fn validate(args: &Args) -> Result<(), String> {
                 );
             }
             if let Some(params) = &args.alg_params
-                && let Some(&restart) = params.get(1)
+                && let Some(&Some(restart)) = params.get(1)
                 && !(0..=5).contains(&restart)
             {
                 return Err(
@@ -735,12 +797,8 @@ fn validate(args: &Args) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            // STAGE43.md adds a fourth alg_params element (phase
-            // strategy: 0 = saving, 1 = target, 2 = WalkSAT rephasing,
-            // 3 = round-robin across all three by worker index; see
-            // cdcl::PhaseStrategy).
             if let Some(params) = &args.alg_params
-                && let Some(&phase) = params.get(2)
+                && let Some(&Some(phase)) = params.get(2)
                 && !(0..=3).contains(&phase)
             {
                 return Err(
@@ -808,7 +866,7 @@ mod tests {
         .expect("expected successful parse");
         assert_eq!(args.input, "problem.cnf");
         assert_eq!(args.verbose, 3);
-        assert_eq!(args.alg_params, Some(vec![10]));
+        assert_eq!(args.alg_params, Some(vec![Some(10)]));
     }
 
     #[test]
@@ -876,7 +934,7 @@ mod tests {
             "--time-limit-secs=30",
         ])
         .expect("expected successful parse");
-        assert_eq!(args.alg_params, Some(vec![5]));
+        assert_eq!(args.alg_params, Some(vec![Some(5)]));
         assert_eq!(args.time_limit_secs, Some(30));
     }
 
@@ -923,7 +981,7 @@ mod tests {
             "40",
         ])
         .expect("expected successful parse");
-        assert_eq!(args.alg_params, Some(vec![5, 2000, 40]));
+        assert_eq!(args.alg_params, Some(vec![Some(5), Some(2000), Some(40)]));
     }
 
     #[test]
@@ -996,7 +1054,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("Parse returned unexpected error for --alg-params={variant}: {e}")
             });
-            assert_eq!(args.alg_params, Some(vec![variant]));
+            assert_eq!(args.alg_params, Some(vec![Some(variant)]));
         }
     }
 
@@ -1045,7 +1103,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("Parse returned unexpected error for --alg-params={variant}: {e}")
             });
-            assert_eq!(args.alg_params, Some(vec![variant]));
+            assert_eq!(args.alg_params, Some(vec![Some(variant)]));
         }
     }
 
@@ -1100,7 +1158,7 @@ mod tests {
                 &phase.to_string(),
             ])
             .unwrap_or_else(|e| panic!("Parse returned unexpected error for phase={phase}: {e}"));
-            assert_eq!(args.alg_params, Some(vec![2, 2, phase]));
+            assert_eq!(args.alg_params, Some(vec![Some(2), Some(2), Some(phase)]));
             assert_eq!(args.memory_limit_bytes, Some(100 * 1024 * 1024));
         }
     }
@@ -1139,7 +1197,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("Parse returned unexpected error for --alg-params 2 {restart}: {e}")
             });
-            assert_eq!(args.alg_params, Some(vec![2, restart]));
+            assert_eq!(args.alg_params, Some(vec![Some(2), Some(restart)]));
         }
     }
 
@@ -1161,8 +1219,9 @@ mod tests {
         }
     }
 
+    /// STAGE44.md moved Glucose's numeral from 5 to 4.
     #[test]
-    fn test_parse_cdcl_accepts_round_robin_restart_strategy() {
+    fn test_parse_cdcl_accepts_glucose_restart_strategy() {
         let args = Args::parse_from_args([
             "vibe_sat",
             "--input=problem.cnf",
@@ -1172,11 +1231,13 @@ mod tests {
             "4",
         ])
         .expect("Parse with --alg-params 2 4 should succeed");
-        assert_eq!(args.alg_params.as_deref(), Some(&[2, 4][..]));
+        assert_eq!(args.alg_params.as_deref(), Some(&[Some(2), Some(4)][..]));
     }
 
+    /// STAGE44.md moved round-robin's numeral from 4 to 5, now
+    /// spanning all four fixed/data-driven restart strategies.
     #[test]
-    fn test_parse_cdcl_accepts_glucose_restart_strategy() {
+    fn test_parse_cdcl_accepts_round_robin_restart_strategy() {
         let args = Args::parse_from_args([
             "vibe_sat",
             "--input=problem.cnf",
@@ -1186,7 +1247,7 @@ mod tests {
             "5",
         ])
         .expect("Parse with --alg-params 2 5 should succeed");
-        assert_eq!(args.alg_params.as_deref(), Some(&[2, 5][..]));
+        assert_eq!(args.alg_params.as_deref(), Some(&[Some(2), Some(5)][..]));
     }
 
     #[test]
@@ -1561,6 +1622,80 @@ mod tests {
         ])
         .expect("expected successful parse");
         assert!(args.no_preprocessing);
-        assert_eq!(args.alg_params, Some(vec![10]));
+        assert_eq!(args.alg_params, Some(vec![Some(10)]));
+    }
+
+    /// Verifies STAGE44.md's underscore syntax: "_" in any
+    /// `--alg-params` position produces a `None` element (not a parse
+    /// error), leaving that slot unset for downstream default
+    /// resolution, exactly as if it had never been given.
+    #[test]
+    fn test_parse_underscore_skips_slot() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "_",
+            "5",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.alg_params.as_deref(), Some(&[None, Some(5)][..]));
+    }
+
+    /// Verifies the concrete case STAGE43.md flagged and STAGE44.md
+    /// fixes: reaching cdcl's fourth value (phase strategy) without
+    /// committing to a real first/second/third value.
+    #[test]
+    fn test_parse_underscore_reaches_later_cdcl_slot() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "_",
+            "_",
+            "_",
+            "3",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.alg_params.as_deref(), Some(&[None, None, Some(3)][..]));
+        assert_eq!(args.memory_limit_bytes, None);
+    }
+
+    /// Verifies that "_" in cdcl's third position leaves
+    /// `memory_limit_bytes` `None` (unbounded), the same as that value
+    /// never being given at all.
+    #[test]
+    fn test_parse_underscore_for_memory_limit() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=cdcl",
+            "--alg-params",
+            "2",
+            "2",
+            "_",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.memory_limit_bytes, None);
+        assert_eq!(args.alg_params, Some(vec![Some(2), Some(2)]));
+    }
+
+    /// Verifies that "--alg-params _" still counts as "--alg-params
+    /// was given" for hc's "at least one of --alg-params or
+    /// --time-limit-secs" requirement, even though the resulting slot
+    /// is `None`.
+    #[test]
+    fn test_parse_underscore_alone_satisfies_hc_requirement() {
+        let args = Args::parse_from_args([
+            "vibe_sat",
+            "--input=problem.cnf",
+            "--algorithm=hc",
+            "--alg-params",
+            "_",
+        ])
+        .expect("expected successful parse");
+        assert_eq!(args.alg_params, Some(vec![None]));
     }
 }

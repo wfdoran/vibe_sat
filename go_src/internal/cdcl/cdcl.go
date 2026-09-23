@@ -131,19 +131,19 @@
 //     decision levels is disproportionately likely to be useful again
 //     regardless of how recently it fired, which is exactly what LBD
 //     measures and pure activity does not.
-//   - RestartGlucose is a fifth restart schedule (see RestartStrategy),
-//     unlike the four schedule-based ones entirely data-driven: it
-//     restarts whenever the moving average LBD of the last
-//     glucoseWindowSize learned clauses is close to or worse than the
-//     global average LBD since the search began (see
-//     glucoseShouldRestart), the sign Glucose's own authors use for
-//     "the search is currently producing low-quality clauses, a fresh
-//     start is more likely to help than persisting." Selected via
-//     --alg-params val2=5; the default remains RestartPolynomial (see
-//     Run's doc comment for why), since this project's own
-//     benchmark-driven-default convention means RestartGlucose earns
-//     that status only if a future stage's measurement shows it
-//     deserves to, not by literature reputation alone.
+//   - RestartGlucose (STAGE44.md: --alg-params val2=4, previously 5)
+//     is a fourth restart schedule (see RestartStrategy), unlike the
+//     three schedule-based ones entirely data-driven: it restarts
+//     whenever the moving average LBD of the last glucoseWindowSize
+//     learned clauses is close to or worse than the global average LBD
+//     since the search began (see glucoseShouldRestart), the sign
+//     Glucose's own authors use for "the search is currently producing
+//     low-quality clauses, a fresh start is more likely to help than
+//     persisting." The default remains RestartPolynomial (see Run's
+//     doc comment for why), since this project's own benchmark-driven-
+//     default convention means RestartGlucose earns that status only
+//     if a future stage's measurement shows it deserves to, not by
+//     literature reputation alone.
 //
 // STAGE36.md adds learned-clause minimization (Sörensson & Biere,
 // "Minimizing Learned Clauses," SAT 2009 -- formalizing a heuristic
@@ -481,49 +481,71 @@ const (
 	// ratio geometricGrowthFactor between consecutive restart
 	// intervals, scaled by geometricBaseConflicts.
 	RestartGeometric RestartStrategy = 3
+	// RestartGlucose is STAGE34.md's addition: Glucose's own data-driven
+	// restart policy (see the package doc comment and
+	// glucoseShouldRestart), rather than a fixed conflict-count
+	// schedule like the three strategies above. STAGE44.md moved this
+	// to value 4 (previously 5) specifically so RestartRoundRobin --
+	// the one "meta" choice that isn't itself a schedule -- keeps the
+	// highest numeral as the list of real strategies grows, rather than
+	// sitting in the middle of it.
+	RestartGlucose RestartStrategy = 4
 	// RestartRoundRobin is STAGE21.md's addition, meaningful only as a
 	// value RunParallel/Run resolve away before ever constructing a
 	// *solver -- no solver's own restartStrategy field is ever
 	// RestartRoundRobin, and restartThreshold never needs to handle
-	// it. It means: thread i uses roundRobinStrategies[i%3] (quadratic,
-	// geometric, Luby, quadratic, ... -- see resolveRestartStrategy),
-	// so each of the three strategies runs on as close to an equal
-	// share of threads as num_threads allows, rather than every thread
-	// racing with the identical restart cadence.
-	RestartRoundRobin RestartStrategy = 4
-	// RestartGlucose is STAGE34.md's addition: Glucose's own data-driven
-	// restart policy (see the package doc comment and
-	// glucoseShouldRestart), rather than a fixed conflict-count
-	// schedule like the four strategies above. Not part of
-	// RestartRoundRobin's rotation -- see roundRobinStrategies.
-	RestartGlucose RestartStrategy = 5
+	// it. It means: thread i uses roundRobinStrategies[i%4] (quadratic,
+	// geometric, Luby, Glucose, quadratic, ... -- see
+	// resolveRestartStrategy), so each of the four strategies runs on
+	// as close to an equal share of threads as num_threads allows,
+	// rather than every thread racing with the identical restart
+	// cadence. STAGE44.md moved this to value 5 (previously 4) and
+	// folded Glucose into the rotation (previously three strategies,
+	// quadratic/geometric/Luby only) -- see roundRobinStrategies.
+	RestartRoundRobin RestartStrategy = 5
 )
 
 // roundRobinStrategies is RestartRoundRobin's resolution order (see
 // resolveRestartStrategy): thread 0 uses quadratic (RestartPolynomial),
 // thread 1 uses geometric (RestartGeometric), thread 2 uses Luby
-// (RestartLuby), thread 3 cycles back to quadratic, and so on. Assigning
-// by spawn-order index -- a plain int RunParallel already hands every
-// worker goroutine/thread, the same way Stage 17/18's winner index and
-// per-worker sub-RNG already are -- gives an exactly even split with no
-// extra bookkeeping, which is why this doesn't fall back to
-// randomizing among the three (something STAGE21.md allowed for in
-// case a deterministic per-thread index turned out to be awkward to
-// get at in Go; it isn't).
-var roundRobinStrategies = [3]RestartStrategy{RestartPolynomial, RestartGeometric, RestartLuby}
+// (RestartLuby), thread 3 uses Glucose (RestartGlucose, folded into the
+// rotation by STAGE44.md), thread 4 cycles back to quadratic, and so
+// on. Assigning by spawn-order index -- a plain int RunParallel already
+// hands every worker goroutine/thread, the same way Stage 17/18's
+// winner index and per-worker sub-RNG already are -- gives an exactly
+// even split with no extra bookkeeping, which is why this doesn't fall
+// back to randomizing among the four (something STAGE21.md allowed for
+// in case a deterministic per-thread index turned out to be awkward to
+// get at in Go; it isn't -- though STAGE44.md notes randomizing may be
+// worth revisiting once this rotation is combined with PhaseRoundRobin's
+// own, see phaseRoundRobinStrategies).
+var roundRobinStrategies = [4]RestartStrategy{RestartPolynomial, RestartGeometric, RestartLuby, RestartGlucose}
 
 // resolveRestartStrategy returns the concrete restart strategy thread
 // threadIndex should actually use: restartStrategy unchanged, unless
 // it is RestartRoundRobin, in which case it resolves to
-// roundRobinStrategies[threadIndex%3]. Called with threadIndex 0 for
-// Run (so an explicit --alg-params restart=4 with --num-threads=1
+// roundRobinStrategies[threadIndex%4]. Called with threadIndex 0 for
+// Run (so an explicit --alg-params restart=5 with --num-threads=1
 // still behaves sensibly -- it resolves to the same RestartPolynomial
 // thread 0 of a round-robin RunParallel run would get, rather than
 // being silently mishandled) and with the worker's own spawn index for
 // each of RunParallel's workers.
+//
+// STAGE44.md deliberately keeps this rotation's period (4) coprime with
+// PhaseRoundRobin's (3, see phaseRoundRobinStrategies): since both
+// resolve from the very same threadIndex, gcd(4, 3) = 1 means the
+// combined (restart strategy, phase strategy) pair a worker gets is
+// unique for 12 consecutive thread indices (lcm(4, 3)) before any
+// repeat, rather than the two rotations' patterns colliding every 3
+// threads the way two same-period-3 rotations would -- a cheap,
+// structural way to broaden portfolio diversity across a reasonably
+// large thread count without needing a dedicated benchmark to justify
+// it (see reports/REPORT43.md's own open question about whether phase
+// round-robin's diversity value needed independent verification, and
+// reports/REPORT44.md for the fuller reasoning).
 func resolveRestartStrategy(restartStrategy RestartStrategy, threadIndex int) RestartStrategy {
 	if restartStrategy == RestartRoundRobin {
-		return roundRobinStrategies[threadIndex%3]
+		return roundRobinStrategies[threadIndex%4]
 	}
 	return restartStrategy
 }
@@ -967,10 +989,11 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 // walksat/dfs entry points.
 //
 // restartStrategy is resolved per worker via resolveRestartStrategy:
-// RestartRoundRobin (STAGE21.md) assigns worker i
-// roundRobinStrategies[i%3] (an even split of quadratic/geometric/
-// Luby across the workers); any other explicit strategy, including
-// RestartNone, is used unchanged by every worker. Per STAGE21.md,
+// RestartRoundRobin (STAGE21.md; STAGE44.md folded Glucose into the
+// rotation) assigns worker i roundRobinStrategies[i%4] (an even split
+// of quadratic/geometric/Luby/Glucose across the workers); any other
+// explicit strategy, including RestartNone, is used unchanged by every
+// worker. Per STAGE21.md,
 // callers (see main.go's runCDCL) are expected to pass
 // RestartRoundRobin as the default restart strategy whenever
 // numThreads > 1 and the caller didn't explicitly ask for something

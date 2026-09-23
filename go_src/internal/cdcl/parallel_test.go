@@ -157,13 +157,13 @@ func TestRunParallelReportsExactlyOneWinner(t *testing.T) {
 }
 
 // TestResolveRestartStrategyRoundRobin verifies the round-robin
-// resolution order STAGE21.md specifies: thread 0 quadratic, thread 1
-// geometric, thread 2 Luby, then repeating.
+// resolution order STAGE21.md specifies (STAGE44.md folded Glucose
+// into the rotation): thread 0 quadratic, thread 1 geometric, thread 2
+// Luby, thread 3 Glucose, then repeating.
 func TestResolveRestartStrategyRoundRobin(t *testing.T) {
 	want := []RestartStrategy{
+		RestartPolynomial, RestartGeometric, RestartLuby, RestartGlucose,
 		RestartPolynomial, RestartGeometric, RestartLuby,
-		RestartPolynomial, RestartGeometric, RestartLuby,
-		RestartPolynomial,
 	}
 	for i, w := range want {
 		if got := resolveRestartStrategy(RestartRoundRobin, i); got != w {
@@ -178,7 +178,7 @@ func TestResolveRestartStrategyRoundRobin(t *testing.T) {
 // STAGE21.md: "If the user explicitly sets a different restart
 // strategy, even 0, all threads will use that."
 func TestResolveRestartStrategyPassesExplicitValueThrough(t *testing.T) {
-	for _, strategy := range []RestartStrategy{RestartNone, RestartLuby, RestartPolynomial, RestartGeometric} {
+	for _, strategy := range []RestartStrategy{RestartNone, RestartLuby, RestartPolynomial, RestartGeometric, RestartGlucose} {
 		for _, threadIndex := range []int{0, 1, 2, 5, 127} {
 			if got := resolveRestartStrategy(strategy, threadIndex); got != strategy {
 				t.Errorf("resolveRestartStrategy(%v, %d) = %v, want %v (unchanged)", strategy, threadIndex, got, strategy)
