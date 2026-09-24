@@ -178,3 +178,41 @@ func TestReduceClauseDatabaseRebuildsWatcherLists(t *testing.T) {
 		}
 	}
 }
+
+// TestPropagateSkipsChooseWatchForBlockingLiteral verifies STAGE48.md's
+// blocking-literal check: when a clause's *other* watch is already
+// true, propagate must not call chooseWatch to find a new watch for
+// the literal that just went false, even though a valid replacement
+// exists -- the clause is already satisfied, so there is nothing to
+// gain from moving the watch. Clause {1, 2, 3}: construction (all
+// unassigned) picks watches {1, 2} in that order (chooseWatch scans
+// left to right); variable 2 is then set True directly (pure test
+// setup, not via propagate, so this alone triggers nothing), and
+// variable 1 is set False via a real propagate() call. Literal 3 is
+// unassigned and would be a valid replacement watch if chooseWatch
+// were called -- the whole point of this test is confirming it is
+// not: watch[0] must still be {1, 2}, unchanged, not moved to {3, 2}.
+func TestPropagateSkipsChooseWatchForBlockingLiteral(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{1, 2, 3}}}
+	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	if s.watch[0] != [2]cnf.Literal{1, 2} {
+		t.Fatalf("watch[0] after construction = %v, want {1 2} (test setup assumption violated)", s.watch[0])
+	}
+
+	s.x[2] = assign.True // pure test setup: makes clause 0 already satisfied via literal 2
+
+	s.assignLiteral(cnf.Literal(-1), 0, noReason) // variable 1 := false
+	if conflict := s.propagate(); conflict != noReason {
+		t.Fatalf("propagate() = %d, want noReason (no conflict, nothing to force)", conflict)
+	}
+
+	if s.watch[0] != [2]cnf.Literal{1, 2} {
+		t.Errorf("watch[0] after propagate() = %v, want unchanged {1 2} (chooseWatch must not have been called, since clause 0 is already satisfied via literal 2)", s.watch[0])
+	}
+	if s.x[3] != assign.Unassigned {
+		t.Errorf("variable 3 = %v, want Unassigned (clause 0 needed no attention at all)", s.x[3])
+	}
+}

@@ -1362,19 +1362,31 @@ func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 // instance, with chooseWatch's linear scan for a replacement watch
 // alone accounting for roughly 45% of it -- unsurprising, since this
 // is the innermost loop of the whole algorithm. One candidate fix was
-// tried and rejected: MiniSat-lineage solvers check whether the
-// *other* watched literal is already true before ever scanning the
-// clause for a new watch, skipping the scan entirely when it is,
-// since a clause satisfied via a true literal needs no attention
-// until some future backtrack. Measured here, this made things
-// worse, not better (27.0s -> ~29.6s on the same hard instance
-// profiled above), reproducibly. The likely reason: this project's
-// benchmark clauses are mostly length 3 (uniform random 3-SAT), so
-// chooseWatch's "expensive" scan is already down to checking a
-// single remaining literal -- there is very little for the added
-// check to skip, and it costs a real branch and an extra
-// Literal.Var() call on every single candidate, on every single call,
-// whether or not it ever pays off.
+// tried and rejected at the time: MiniSat-lineage solvers check
+// whether the *other* watched literal is already true before ever
+// scanning the clause for a new watch (a "blocking literal" check),
+// skipping the scan entirely when it is, since a clause satisfied via
+// a true literal needs no attention until some future backtrack.
+// Measured then, this made things worse, not better (27.0s -> ~29.6s
+// on the same hard instance profiled above), reproducibly -- the
+// likely reason given at the time was that this project's benchmark
+// clauses are mostly length 3, so chooseWatch's "expensive" scan was
+// already down to checking a single remaining literal, leaving very
+// little for the added check to skip.
+//
+// STAGE48.md reversed that conclusion, once re-measured against the
+// candidate source STAGE45.md's fix actually put in place (see next
+// paragraph): with propagate visiting only genuine watchers instead
+// of every occurrence, chooseWatch is no longer a cheap, already-thin
+// scan riding along for free -- a fresh profile found it back up to
+// 49.59% of total CPU time on its own. Skipping it whenever the other
+// watch is already true (see the blocking-literal check below) turned
+// out to help everywhere it was measured this time: ~32% faster on
+// the same hard instance, ~15% faster in mean time across 180 varied
+// smaller files, ~22% faster in mean time across a 250-variable random
+// sample -- the opposite of STAGE23.md's finding, not because the
+// technique changed, but because what it was competing against did.
+// See reports/REPORT48.md for the full numbers.
 //
 // STAGE45.md: from Stage 9 through Stage 44, this loop's own
 // candidate source was s.lists.Positive/Negative -- the *full*,
@@ -1445,6 +1457,20 @@ func (s *solver) propagate() int {
 				otherWatch, falsifiedSlot = watch[1], 0
 			} else {
 				otherWatch, falsifiedSlot = watch[0], 1
+			}
+
+			if isTrue(otherWatch, s.x) {
+				// STAGE48.md's blocking-literal check: the clause is
+				// already satisfied through its other watch, so there is
+				// nothing to gain by scanning it for a new watch -- skip
+				// chooseWatch entirely and just keep watching
+				// falsifiedLiteral until some future backtrack makes it
+				// worth revisiting. See the package doc comment above
+				// for why this measures as a real win now, reversing
+				// STAGE23.md's original rejection of the same idea.
+				list[keep] = c
+				keep++
+				continue scan
 			}
 
 			if replacement, found := chooseWatch(s.clauses[c], s.x, otherWatch); found {
@@ -2300,6 +2326,22 @@ func isFalse(lit cnf.Literal, assignment assign.Assignment) bool {
 		return value == assign.True
 	}
 	return value == assign.False
+}
+
+// isTrue reports whether lit currently evaluates to true under
+// assignment (an Unassigned variable makes every literal on it
+// neither true nor false yet, so this returns false for those).
+// STAGE48.md's blocking-literal check (propagate) is this function's
+// only caller.
+func isTrue(lit cnf.Literal, assignment assign.Assignment) bool {
+	value := assignment[lit.Var()]
+	if value == assign.Unassigned {
+		return false
+	}
+	if lit.IsNegative() {
+		return value == assign.False
+	}
+	return value == assign.True
 }
 
 // describeParams formats the configured time limit and SelectVar

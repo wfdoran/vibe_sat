@@ -153,6 +153,31 @@ consumer: WalkSAT rephasing (`STAGE43.md`) genuinely needs every
 clause mentioning a variable, not just its current watchers, to score
 a flip correctly.
 
+### The blocking-literal check: a rejected optimization, reversed
+
+`STAGE23.md` tried a well-known MiniSat-lineage optimization early on:
+before scanning a clause for a new watch, first check whether its
+*other* watched literal is already true — if so, the clause is already
+satisfied and needs no attention until some future backtrack, so skip
+the scan entirely. Measured against the pre-`STAGE45.md` candidate
+source (the full occurrence index, `chooseWatch`'s own scan already a
+small fraction of total time), this made things *worse*, not better,
+and was reverted.
+
+`STAGE48.md` re-measured the identical idea against the genuine watch
+lists `STAGE45.md` put in place, and found the opposite result. A
+fresh profile showed `chooseWatch` had grown back to roughly half of
+total CPU time on its own, once `propagate`'s own candidate-discovery
+cost stopped dominating everything around it — exactly the condition
+under which skipping `chooseWatch` actually pays for itself. Verified
+directly rather than assumed: ~32% faster on the same standing hard
+benchmark instance, ~15% faster mean time across 180 varied smaller
+files, ~22% faster mean time across a 250-variable random sample, no
+correctness regressions anywhere, in either language. The technique
+didn't change between `STAGE23.md` and `STAGE48.md` — what it was
+being measured against did, and that's the entire reason the same idea
+went from a rejected regression to a clear win.
+
 ## WalkSAT
 
 `--algorithm=ws` is entirely different in spirit from `dfs`/`cdcl`: no
@@ -598,9 +623,16 @@ identical work. A few concrete things fell out of that comparison:
   would have predicted (VSIDS over LRB; a quadratic restart schedule
   over the Luby sequence's own literature-standard base interval; a
   MiniSat-style "blocking literal" optimization that looked obviously
-  correct on paper but measured as a 25-28% *regression* on this
-  project's mostly-short-clause benchmark set, and was reverted rather
-  than kept; a high heap-allocation *share* attributed to `cdcl`'s
+  correct on paper but measured as a real regression on this project's
+  mostly-short-clause benchmark set early on, and was reverted rather
+  than kept — only for a *later* measurement, once `STAGE45.md`
+  changed what the optimization was actually competing against, to
+  reverse that verdict and find the same idea a clear win after all
+  (`STAGE48.md`; see "The blocking-literal check" under CDCL above) —
+  a measurement doesn't just beat an untested literature claim once
+  and stay settled forever, it stays open to being re-checked when the
+  surrounding code changes enough to matter; a high heap-allocation
+  *share* attributed to `cdcl`'s
   `analyze`/`addLearnedClause` — ~91% of all allocation in an 8-thread
   run, per `reports/REPORT23.md` — that looked like an obvious GC-
   pressure problem worth fixing, until `reports/REPORT38.md` actually

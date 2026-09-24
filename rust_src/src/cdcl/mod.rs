@@ -1859,6 +1859,24 @@ fn propagate(
                 (w[0], 1)
             };
 
+            if is_true(other_watch, x) {
+                // STAGE48.md's blocking-literal check: the clause is
+                // already satisfied through its other watch, so there
+                // is nothing to gain by scanning it for a new watch --
+                // skip choose_watch entirely and just keep watching
+                // falsified_literal until some future backtrack makes
+                // it worth revisiting. This reverses an earlier,
+                // narrower-context rejection of the same idea (see
+                // reports/REPORT23.md/REPORT48.md): with propagate now
+                // visiting only genuine watchers (STAGE45.md), rather
+                // than every occurrence, choose_watch's own cost is a
+                // large enough share of the total that skipping it
+                // whenever possible is a clear net win.
+                list[keep] = c;
+                keep += 1;
+                continue;
+            }
+
             if let Some(replacement) = choose_watch(&clauses[c], x, Some(other_watch)) {
                 watch[c][falsified_slot] = replacement;
                 watchers_for(watchers_positive, watchers_negative, replacement).push(c);
@@ -2633,6 +2651,23 @@ fn is_false(literal: Literal, assignment: &Assignment) -> bool {
         value == Value::True
     } else {
         value == Value::False
+    }
+}
+
+/// Returns whether `literal` currently evaluates to true under
+/// `assignment` (an `Unassigned` variable makes every literal on it
+/// neither true nor false yet, so this returns false for those).
+/// STAGE48.md's blocking-literal check (`propagate`) is this
+/// function's only caller.
+fn is_true(literal: Literal, assignment: &Assignment) -> bool {
+    let value = assignment[cnf::literal_var(literal)];
+    if value == Value::Unassigned {
+        return false;
+    }
+    if cnf::literal_is_negative(literal) {
+        value == Value::False
+    } else {
+        value == Value::True
     }
 }
 
@@ -5371,6 +5406,90 @@ mod tests {
             x[3],
             Value::Unassigned,
             "variable 3 (clause C, {{1 3}}) must never have been scanned this call"
+        );
+    }
+
+    /// STAGE48.md: verifies the blocking-literal check directly. When
+    /// a clause's *other* watch is already true, propagate must not
+    /// call choose_watch to find a new watch for the literal that just
+    /// went false, even though a valid replacement exists -- the
+    /// clause is already satisfied, so there is nothing to gain from
+    /// moving the watch. Clause [1, 2, 3]: bootstrap (all unassigned)
+    /// picks watches [1, 2] in that order (choose_watch scans left to
+    /// right); variable 2 is then set true directly (pure test setup,
+    /// not via propagate, so this alone triggers nothing), and
+    /// variable 1 is set false via a real propagate() call. Literal 3
+    /// is unassigned and would be a valid replacement watch if
+    /// choose_watch were called -- the whole point of this test is
+    /// confirming it is not: watch[0] must still be [1, 2], unchanged,
+    /// not moved to [3, 2].
+    #[test]
+    fn test_propagate_skips_choose_watch_for_blocking_literal() {
+        let problem = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2, 3]],
+        };
+        let (working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+
+        assert!(
+            watch[0] == [1, 2],
+            "watch[0] after bootstrap = {:?}, want [1, 2] (test setup assumption violated)",
+            watch[0]
+        );
+
+        x[2] = Value::True; // pure test setup: makes clause 0 already satisfied via literal 2
+
+        let mut level = vec![0usize; 4];
+        let mut reason: Vec<Option<usize>> = vec![None; 4];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(3);
+
+        assign_literal(
+            -1,
+            0,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        ); // variable 1 := false
+
+        let conflict = propagate(
+            &working_problem.clauses,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &mut x,
+            &mut trail,
+            &mut q_head,
+            0,
+            &mut level,
+            &mut reason,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        );
+
+        assert_eq!(
+            conflict, None,
+            "expected no conflict (nothing to force, clause already satisfied)"
+        );
+        assert!(
+            watch[0] == [1, 2],
+            "watch[0] after propagate() = {:?}, want unchanged [1, 2] (choose_watch must not have been called, since clause 0 is already satisfied via literal 2)",
+            watch[0]
+        );
+        assert_eq!(
+            x[3],
+            Value::Unassigned,
+            "variable 3 should be Unassigned (clause 0 needed no attention at all)"
         );
     }
 
