@@ -80,11 +80,17 @@ type Params struct {
 // Default returns the built-in defaults: exactly the values every one
 // of these fields' replaced compile-time constant held before
 // STAGE39.md, so a run with no config file present behaves
-// byte-for-byte identically to every prior stage.
+// byte-for-byte identically to every prior stage -- except
+// LubyBaseConflicts, recalibrated by STAGE49.md's paramtune sweep
+// (see reports/REPORT49.md): the literature-standard 100 (MiniSat's
+// own default, kept as-is by STAGE15.md's original preference for a
+// literature value) measurably underperforms on this project's own
+// benchmark set, exactly as REPORT15.md's own conflict-rate reasoning
+// predicted.
 func Default() Params {
 	return Params{
 		CDCL: CDCL{
-			LubyBaseConflicts:        100,
+			LubyBaseConflicts:        4000,
 			PolynomialBaseConflicts:  18000,
 			GeometricBaseConflicts:   100,
 			GeometricGrowthFactor:    1.5,

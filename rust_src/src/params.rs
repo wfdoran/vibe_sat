@@ -68,11 +68,16 @@ pub struct Params {
 }
 
 /// Returns the built-in defaults: exactly the values every one of
-/// these fields held as a compile-time constant before STAGE39.md.
+/// these fields held as a compile-time constant before STAGE39.md --
+/// except `luby_base_conflicts`, recalibrated by STAGE49.md's
+/// paramtune sweep (see `reports/REPORT49.md`): the literature
+/// standard 100 measurably underperforms on this project's own
+/// benchmark set, exactly as `REPORT15.md`'s own conflict-rate
+/// reasoning predicted.
 pub fn default() -> Params {
     Params {
         cdcl: Cdcl {
-            luby_base_conflicts: 100,
+            luby_base_conflicts: 4000,
             polynomial_base_conflicts: 18000,
             geometric_base_conflicts: 100,
             geometric_growth_factor: 1.5,
@@ -638,7 +643,9 @@ mod tests {
     #[test]
     fn default_matches_pre_stage39_constants() {
         let d = default();
-        assert_eq!(d.cdcl.luby_base_conflicts, 100);
+        // STAGE49.md recalibrated luby_base_conflicts away from its
+        // pre-STAGE39.md value (100) -- see reports/REPORT49.md.
+        assert_eq!(d.cdcl.luby_base_conflicts, 4000);
         assert_eq!(d.cdcl.polynomial_base_conflicts, 18000);
         assert_eq!(d.cdcl.geometric_base_conflicts, 100);
         assert_eq!(d.cdcl.geometric_growth_factor, 1.5);

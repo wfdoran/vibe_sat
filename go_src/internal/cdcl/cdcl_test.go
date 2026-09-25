@@ -675,6 +675,165 @@ func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 	}
 }
 
+// TestBacktrackToUpdatesLrbQIncludesReasonedBonus is
+// TestBacktrackToUpdatesLrbQ's own scenario, extended to verify
+// STAGE49.md's "reason side rate" bonus is actually folded into the
+// reward: with lrbParticipated[1]=3 and lrbReasoned[1]=2, the same
+// numConflicts=5/10 setup should now yield Q = lrbAlpha * (5.0/5.0),
+// and both counters must reset to 0 afterward.
+func TestBacktrackToUpdatesLrbQIncludesReasonedBonus(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
+	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+
+	s.currentLevel = 1
+	s.trailLim = append(s.trailLim, len(s.trail))
+	s.numConflicts = 5
+	s.assignLiteral(cnf.Literal(1), s.currentLevel, noReason)
+	s.lrbParticipated[1] = 3
+	s.lrbReasoned[1] = 2
+	s.numConflicts = 10
+
+	s.backtrackTo(0)
+
+	wantQ := s.params.LRBAlpha * (5.0 / 5.0)
+	if math.Abs(s.lrbQ[1]-wantQ) > 1e-9 {
+		t.Errorf("lrbQ[1] = %v, want %v", s.lrbQ[1], wantQ)
+	}
+	if s.lrbParticipated[1] != 0 {
+		t.Errorf("lrbParticipated[1] = %d, want 0 (reset on unassignment)", s.lrbParticipated[1])
+	}
+	if s.lrbReasoned[1] != 0 {
+		t.Errorf("lrbReasoned[1] = %d, want 0 (reset on unassignment)", s.lrbReasoned[1])
+	}
+}
+
+// TestPropagateBumpsLrbReasonSide is a hand-traced test of
+// bumpReasonSide directly, via a real propagate() call: two clauses,
+// {1, 2, 3} and {6, 1, 3}, both share variables 1 and 3 as watches
+// picked at construction ({1,2} and {6,1} respectively, since
+// chooseWatch always picks a fresh clause's first two literals).
+// Variable 3 is set false (level 1, direct setup) and variable 1 is
+// then set false (level 1, direct setup) -- a single propagate() call
+// then processes both trail entries in order. Variable 3 has no
+// watchers on it (neither clause watches literal 3), so nothing
+// happens for it directly; variable 1 is watched by both clauses, so
+// falsifying it forces variable 2 (via clause 0, {1,2,3}: literal 3 is
+// already false, leaving no replacement) and variable 6 (via clause 1,
+// {6,1,3}: same reasoning) in turn, both genuine unit propagations.
+//
+// Each forcing clause's *other* false literals (1 and 3, in both
+// cases) should have lrbReasoned bumped -- but only once each, not
+// twice, since both propagations happen within the same conflict
+// epoch (s.numConflicts never changes here) and lrbReasonedEpoch must
+// deduplicate across them. The forced variables themselves (2 and 6)
+// must never get lrbReasoned bumped for their own forcing clause.
+func TestPropagateBumpsLrbReasonSide(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 6, Clauses: []cnf.Clause{
+		{1, 2, 3},
+		{6, 1, 3},
+	}}
+	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	if s.watch[0] != [2]cnf.Literal{1, 2} {
+		t.Fatalf("watch[0] after construction = %v, want {1 2} (test setup assumption violated)", s.watch[0])
+	}
+	if s.watch[1] != [2]cnf.Literal{6, 1} {
+		t.Fatalf("watch[1] after construction = %v, want {6 1} (test setup assumption violated)", s.watch[1])
+	}
+
+	s.currentLevel = 1
+	s.trailLim = append(s.trailLim, len(s.trail))
+	s.assignLiteral(cnf.Literal(-3), s.currentLevel, noReason) // variable 3 := false, no watchers on it
+	s.assignLiteral(cnf.Literal(-1), s.currentLevel, noReason) // variable 1 := false, triggers both clauses
+
+	if conflict := s.propagate(); conflict != noReason {
+		t.Fatalf("propagate() = %d, want noReason (both clauses force a literal, neither conflicts)", conflict)
+	}
+
+	if s.x[2] != assign.True {
+		t.Errorf("variable 2 = %v, want assign.True (forced by clause 0, {1 2 3})", s.x[2])
+	}
+	if s.x[6] != assign.True {
+		t.Errorf("variable 6 = %v, want assign.True (forced by clause 1, {6 1 3})", s.x[6])
+	}
+
+	if s.lrbReasoned[1] != 1 {
+		t.Errorf("lrbReasoned[1] = %d, want 1 (reason side of both propagations, deduplicated once per conflict epoch)", s.lrbReasoned[1])
+	}
+	if s.lrbReasoned[3] != 1 {
+		t.Errorf("lrbReasoned[3] = %d, want 1 (reason side of both propagations, deduplicated once per conflict epoch)", s.lrbReasoned[3])
+	}
+	if s.lrbReasoned[2] != 0 {
+		t.Errorf("lrbReasoned[2] = %d, want 0 (the forced variable itself, never its own reason)", s.lrbReasoned[2])
+	}
+	if s.lrbReasoned[6] != 0 {
+		t.Errorf("lrbReasoned[6] = %d, want 0 (the forced variable itself, never its own reason)", s.lrbReasoned[6])
+	}
+}
+
+// TestLearnAndBackjumpDecaysLrbAlpha verifies STAGE49.md's annealed
+// alpha directly: starting from the default LRBAlpha, N conflicts
+// (via N calls to learnAndBackjump) must each subtract exactly
+// lrbAlphaDecayStep, down to (but never below) lrbAlphaFloor.
+func TestLearnAndBackjumpDecaysLrbAlpha(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{
+		{cnf.Literal(1), cnf.Literal(2)},
+		{cnf.Literal(-1), cnf.Literal(3)},
+		{cnf.Literal(-1), cnf.Literal(-3)},
+		{cnf.Literal(-2), cnf.Literal(4)},
+		{cnf.Literal(-2), cnf.Literal(-4)},
+	}}
+	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	startAlpha := s.lrbCurrentAlpha
+	if startAlpha != s.params.LRBAlpha {
+		t.Fatalf("lrbCurrentAlpha at construction = %v, want %v (params.LRBAlpha, the starting value)", startAlpha, s.params.LRBAlpha)
+	}
+
+	s.currentLevel = 1
+	s.trailLim = append(s.trailLim, len(s.trail))
+	s.assignLiteral(cnf.Literal(-1), s.currentLevel, noReason)
+	confl := s.propagate()
+	if confl == noReason {
+		t.Fatalf("propagate() found no conflict; expected clause {-2,-4} to be falsified")
+	}
+	s.learnAndBackjump(confl)
+
+	wantAlpha := startAlpha - lrbAlphaDecayStep
+	if math.Abs(s.lrbCurrentAlpha-wantAlpha) > 1e-15 {
+		t.Errorf("lrbCurrentAlpha after one conflict = %v, want %v (startAlpha - lrbAlphaDecayStep)", s.lrbCurrentAlpha, wantAlpha)
+	}
+
+	// A second, independent solver, with lrbCurrentAlpha forced to
+	// just above the floor (less than one full step away), verifies
+	// learnAndBackjump's own clamp -- not a duplicate of its
+	// arithmetic -- via the same real conflict trace.
+	s2, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	s2.lrbCurrentAlpha = lrbAlphaFloor + lrbAlphaDecayStep/2
+	s2.currentLevel = 1
+	s2.trailLim = append(s2.trailLim, len(s2.trail))
+	s2.assignLiteral(cnf.Literal(-1), s2.currentLevel, noReason)
+	confl2 := s2.propagate()
+	if confl2 == noReason {
+		t.Fatalf("propagate() found no conflict on s2; expected clause {-2,-4} to be falsified")
+	}
+	s2.learnAndBackjump(confl2)
+
+	if s2.lrbCurrentAlpha != lrbAlphaFloor {
+		t.Errorf("lrbCurrentAlpha after decaying past the floor = %v, want exactly lrbAlphaFloor (%v)", s2.lrbCurrentAlpha, lrbAlphaFloor)
+	}
+}
+
 // TestBacktrackToSavesPhase verifies STAGE14.md's core mechanism
 // directly: a variable assigned True and then backtracked over
 // should have its phase saved as True, regardless of SelectVar

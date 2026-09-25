@@ -272,6 +272,19 @@ has time to settle, turned out to actively hurt. That measurement, not
 the literature's own default, is why `cdcl` defaults to the polynomial
 schedule with one thread.
 
+`STAGE49.md` later recalibrated Luby's own base interval directly (a
+`paramtune` sweep, see `reports/REPORT49.md`): the literature value of
+100 measurably solves fewer instances within a fixed time budget than
+every larger candidate tried, confirming `REPORT15.md`'s own
+suspicion that it was simply miscalibrated for this project's much
+higher conflict rate (`polynomialBaseConflicts`'s own default, 18000,
+is calibrated to roughly one second of typical conflict throughput
+here; 100 was never in that neighborhood). The default moved to 4000.
+This changes how Luby itself behaves when explicitly selected
+(`--alg-params val2=1`); it does not revisit which schedule is the
+project's own default, which remains polynomial per the paragraph
+above.
+
 A fourth schedule, **Glucose's own data-driven policy** (`val2=4`;
 Audemard & Simon, IJCAI 2009 — see [references.md](references.md)),
 restarts on a signal from the search itself rather than a fixed
@@ -644,7 +657,19 @@ identical work. A few concrete things fell out of that comparison:
   out to be two different questions with two different answers).
   Treat any specific number in this documentation as a snapshot from
   this project's own particular benchmark set and hardware, not a
-  universal claim about the technique in general.
+  universal claim about the technique in general. `STAGE49.md` adds
+  two further examples in the same spirit: LRB's two published
+  refinements the earlier VSIDS-vs-LRB comparison (`reports/REPORT13.md`)
+  had explicitly left as open questions (a "reason side rate" bonus
+  and an annealed learning-rate weight) were implemented and
+  measured directly rather than left as speculation — they narrowed
+  LRB's own solved-count gap noticeably on the easier (SAT) half of
+  the benchmark sample but barely moved the harder (UNSAT) half, so
+  VSIDS's status as the default was unaffected; and Luby's own
+  literature-standard base interval, quoted just above as part of an
+  earlier restart-schedule comparison, turned out to be recalibratable
+  on its own terms once directly swept, independent of which schedule
+  wins by default (see `reports/REPORT49.md` for both).
 - **Preprocessing, restarts, phase saving, and clause-database
   reduction are all fully deterministic** given the same input and
   thread count — the only genuinely non-deterministic part of

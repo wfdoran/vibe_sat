@@ -50,7 +50,7 @@ type vibeSatParams struct {
 func defaultParams() vibeSatParams {
 	return vibeSatParams{
 		CDCL: cdclParams{
-			LubyBaseConflicts:        100,
+			LubyBaseConflicts:        4000, // STAGE49.md: recalibrated from 100, see reports/REPORT49.md
 			PolynomialBaseConflicts:  18000,
 			GeometricBaseConflicts:   100,
 			GeometricGrowthFactor:    1.5,

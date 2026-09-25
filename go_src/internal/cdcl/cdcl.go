@@ -51,11 +51,12 @@
 //     solved). Every variable's "learning rate" -- how often it has
 //     recently participated in producing a learned clause, per
 //     conflict it has been assigned for -- is tracked and used as its
-//     score instead. This implementation omits the paper's "reason
-//     side rate" bonus and its annealed learning-rate schedule for
-//     the Q-value update itself (kept at a fixed alpha instead); see
-//     backtrackTo's doc comment for exactly what is and isn't
-//     implemented.
+//     score instead. STAGE49.md adds the paper's "reason side rate"
+//     bonus and its annealed learning-rate schedule for the Q-value
+//     update (both were previously omitted); see backtrackTo's and
+//     analyze's doc comments for exactly how each is implemented, and
+//     reports/REPORT49.md for why they didn't change VSIDS's status as
+//     the default (see reports/REPORT13.md for that original finding).
 //
 // Per STAGE13.md, SelectVarVsids is the default for --algorithm=cdcl
 // (see Run's doc comment for why: the paper above favors LRB on SAT
@@ -305,13 +306,21 @@ const (
 // these are two separate fields rather than one shared rate.
 const activityRescaleThreshold = 1e100
 
-// lrbAlpha (STAGE39.md: now params.CDCL.LRBAlpha) is the fixed
+// lrbAlpha (STAGE39.md: now params.CDCL.LRBAlpha) is the *starting*
 // learning-rate weight SelectVarLrb uses when updating a variable's
-// Q-value (see backtrackTo's doc comment): the paper anneals this over
-// the course of the search, starting high and decaying toward a
-// floor; this implementation keeps it fixed at a value from within
-// that range instead, as a documented simplification (see the package
-// doc comment).
+// Q-value (see backtrackTo's doc comment). STAGE49.md implements the
+// paper's annealing schedule: solver.lrbCurrentAlpha begins at this
+// value and is decayed by lrbAlphaDecayStep once per conflict (in
+// learnAndBackjump) down to a floor of lrbAlphaFloor, after which it
+// stays fixed for the rest of the search. The decay step and floor
+// are plain constants, not exposed via params.CDCL, since nothing
+// benchmark-motivated has justified tuning them independently (per
+// STAGE39.md's "only expose what's benchmark-motivated" rationale for
+// what got promoted to params.CDCL and what didn't).
+const (
+	lrbAlphaDecayStep = 1e-6
+	lrbAlphaFloor     = 0.06
+)
 
 // glueClauseLBDThreshold (STAGE39.md: now
 // params.CDCL.GlueClauseLBDThreshold) is Glucose's own "glue clause"
@@ -399,11 +408,28 @@ func (s *solver) minimizeWorkBudget(n int) int {
 // --alg-params, since these apply regardless of which restart
 // strategy --alg-params val2 actually selects.
 //
-// lubyBaseConflicts's default uses MiniSat's own default Luby restart
-// base (its "-rfirst" option, 100 conflicts) -- a genuinely standard
-// value in the literature/practice, inherited unchanged by most
-// MiniSat-lineage solvers (Glucose, CryptoMiniSat, etc.), and exactly
-// the kind of standard STAGE15.md asks to prefer when one exists.
+// lubyBaseConflicts's default originally used MiniSat's own default
+// Luby restart base (its "-rfirst" option, 100 conflicts) -- a
+// genuinely standard value in the literature/practice, inherited
+// unchanged by most MiniSat-lineage solvers (Glucose, CryptoMiniSat,
+// etc.), and exactly the kind of standard STAGE15.md asks to prefer
+// when one exists. REPORT15.md's own benchmark measured Luby
+// restarts performing far worse than the polynomial schedule under
+// that value (3/10 UNSAT solved vs. 10/10), and speculated the
+// literature default might simply be miscalibrated for this
+// project's own, much higher conflict rate (polynomialBaseConflicts's
+// own 18000, right below, is calibrated to roughly one second of
+// this project's typical conflict rate; 100 is not remotely close).
+// STAGE49.md's paramtune sweep confirmed this directly: 100
+// measurably solves fewer instances (in a fixed time budget) than
+// every larger candidate tried, so the default was recalibrated to
+// 4000 -- the value that performed most consistently well across two
+// independent benchmark samples, though the exact optimum within the
+// 500-8000 range tried showed real sample-to-sample variance (see
+// reports/REPORT49.md for the full sweep results and that caveat).
+// This does not change which restart schedule is the default
+// (polynomial remains so; see Run's doc comment) -- only how Luby
+// itself behaves when explicitly selected via --alg-params val2=1.
 //
 // polynomialBaseConflicts has no such standard to inherit: the
 // quadratic sequence STAGE15.md originally specified under the name
@@ -424,8 +450,14 @@ func (s *solver) minimizeWorkBudget(n int) int {
 // these two constants does exist in the literature: MiniSat
 // 1.13/1.14's geometric restart scheme (the scheme Luby restarts later
 // replaced as MiniSat's default) used a base restart interval of 100
-// conflicts -- the same "rfirst" default reused here as
-// lubyBaseConflicts's own default -- and a growth factor of 1.5. That
+// conflicts -- originally the same "rfirst" default lubyBaseConflicts
+// also started from, before STAGE49.md's recalibration above moved
+// Luby's own base to 4000; geometricBaseConflicts keeps the
+// literature value unchanged, since STAGE39.md already made the two
+// independently tunable (they were only ever tied together by
+// definition, not by any measured relationship) and no benchmark
+// evidence has yet been gathered for this schedule specifically -- and
+// a growth factor of 1.5. That
 // 1.5 was itself a practical (not theoretical) choice: a value a bit
 // below the golden ratio (~1.618), the same growth-factor reasoning
 // used when picking dynamic array growth factors to allow memory
@@ -758,9 +790,32 @@ type solver struct {
 	// records numConflicts's value at the moment each variable was
 	// last assigned, so backtrackTo can compute how many conflicts
 	// elapsed while it was assigned.
+	//
+	// lrbReasoned is STAGE49.md's "reason side rate" bonus counter:
+	// every time propagate forces a literal via a genuine unit
+	// propagation (see propagate's doc comment), every *other*
+	// literal in that antecedent clause must already be false --
+	// that's what makes it a forcing unit clause -- so each of their
+	// variables just served as part of the "reason" for this
+	// propagation, and gets lrbReasoned bumped, once per conflict
+	// epoch (lrbReasonedEpoch[v] records the last s.numConflicts
+	// value already credited for v, the same "compare against the
+	// current epoch" trick lrbAssignedAtConflict already uses,
+	// avoiding an O(numVars) reset per conflict; -1 means "never
+	// credited", since s.numConflicts starts at 0). backtrackTo folds
+	// both counters into the same reward.
+	//
+	// lrbCurrentAlpha is STAGE49.md's annealed learning-rate weight:
+	// initialized from params.LRBAlpha (now the *starting* value,
+	// not a fixed one) and decayed once per conflict in
+	// learnAndBackjump down to lrbAlphaFloor, per the paper's own
+	// annealing schedule.
 	lrbQ                  []float64
 	lrbParticipated       []int
+	lrbReasoned           []int
+	lrbReasonedEpoch      []int
 	lrbAssignedAtConflict []int
+	lrbCurrentAlpha       float64
 
 	// savedPhase holds, for every variable, the value it last held
 	// before becoming unassigned (STAGE14.md), sized numVars+1;
@@ -936,6 +991,11 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		reason[v] = noReason
 	}
 
+	lrbReasonedEpoch := make([]int, problem.NumVars+1)
+	for v := range lrbReasonedEpoch {
+		lrbReasonedEpoch[v] = -1
+	}
+
 	return &solver{
 		numVars:                 problem.NumVars,
 		clauses:                 clauses,
@@ -955,7 +1015,10 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		varActivityIncrement:    1.0,
 		lrbQ:                    make([]float64, problem.NumVars+1),
 		lrbParticipated:         make([]int, problem.NumVars+1),
+		lrbReasoned:             make([]int, problem.NumVars+1),
+		lrbReasonedEpoch:        lrbReasonedEpoch,
 		lrbAssignedAtConflict:   make([]int, problem.NumVars+1),
+		lrbCurrentAlpha:         p.LRBAlpha,
 		savedPhase:              make(assign.Assignment, problem.NumVars+1),
 		phaseStrategy:           phaseStrategy,
 		targetPhase:             make(assign.Assignment, problem.NumVars+1),
@@ -1409,6 +1472,12 @@ func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 // visits clauses that are genuinely watching the literal that just
 // became false.
 //
+// STAGE49.md: for SelectVarLrb only, every genuine unit propagation
+// found here (the "forcedVar" branch below) also calls bumpReasonSide
+// to credit the antecedent clause's other, already-false literals with
+// the paper's "reason side rate" bonus -- see bumpReasonSide's own doc
+// comment for why this lives here rather than in analyze.
+//
 // The scan below is MiniSat's own standard in-place compaction
 // pattern, adapted to Go: since a clause whose watch moves away
 // (chooseWatch found a replacement) must be removed from this
@@ -1490,6 +1559,9 @@ func (s *solver) propagate() int {
 			forcedVar := otherWatch.Var()
 			if s.x[forcedVar] == assign.Unassigned {
 				s.assignLiteral(otherWatch, s.currentLevel, c)
+				if s.variant == SelectVarLrb {
+					s.bumpReasonSide(c, otherWatch)
+				}
 			}
 			// Otherwise otherWatch is already true: the clause is
 			// satisfied through it, and there is nothing to do.
@@ -1508,6 +1580,41 @@ func (s *solver) propagate() int {
 	return noReason
 }
 
+// bumpReasonSide implements SelectVarLrb's "reason side rate" bonus
+// (STAGE49.md): called only when propagate has just forced otherWatch
+// true via clause c through genuine unit propagation, at which point
+// every *other* literal in c must already be false -- that is exactly
+// what makes c a forcing unit clause -- so each of their variables
+// just served as part of the "reason" for this propagation, whether
+// or not that propagation ever ends up touched by an actual conflict.
+// This is a deliberately different signal from lrbParticipated (bumped
+// only for variables analyze actually resolves through while deriving
+// a learned clause -- see analyze's doc comment for why there is no
+// meaningfully distinct "reason side" set to find purely within that
+// function): propagations vastly outnumber conflicts, so this rewards
+// variables for being generally useful to BCP, not just to the
+// specific conflicts they happened to participate in resolving.
+//
+// lrbReasonedEpoch deduplicates by s.numConflicts (once per variable
+// per conflict "epoch", regardless of how many propagations occur
+// within it), keeping lrbReasoned on the same conflict-counted scale
+// as lrbParticipated so backtrackTo's reward formula (see its doc
+// comment) can add them together directly instead of one dominating
+// the other by sheer call-count.
+func (s *solver) bumpReasonSide(c int, forced cnf.Literal) {
+	for _, lit := range s.clauses[c] {
+		if lit == forced {
+			continue
+		}
+		v := lit.Var()
+		if s.level[v] == 0 || s.lrbReasonedEpoch[v] == s.numConflicts {
+			continue
+		}
+		s.lrbReasonedEpoch[v] = s.numConflicts
+		s.lrbReasoned[v]++
+	}
+}
+
 // learnAndBackjump handles one conflict discovered by propagate at
 // clause index confl: it derives a learned clause via analyze, jumps
 // back to the decision level analyze computed, adds the learned
@@ -1523,6 +1630,12 @@ func (s *solver) propagate() int {
 // equivalent of decaying every clause's activity individually. If a
 // memory limit was given (STAGE12.md) and the database's estimated
 // size has grown past it, reduceClauseDatabase is triggered.
+//
+// For SelectVarLrb (STAGE49.md), this is also where lrbCurrentAlpha
+// is decayed once per conflict toward lrbAlphaFloor -- the paper's
+// annealed learning rate, mirroring the VSIDS activity-increment
+// growth immediately above in shape (a small per-conflict step, not a
+// per-bump one).
 //
 // Finally (STAGE20.md/STAGE21.md's Option B), if this solver is part
 // of a parallel run (s.peers != nil), maybeImport gives it a chance to
@@ -1551,6 +1664,13 @@ func (s *solver) learnAndBackjump(confl int) {
 				s.varActivity[v] /= activityRescaleThreshold
 			}
 			s.varActivityIncrement /= activityRescaleThreshold
+		}
+	}
+
+	if s.variant == SelectVarLrb && s.lrbCurrentAlpha > lrbAlphaFloor {
+		s.lrbCurrentAlpha -= lrbAlphaDecayStep
+		if s.lrbCurrentAlpha < lrbAlphaFloor {
+			s.lrbCurrentAlpha = lrbAlphaFloor
 		}
 	}
 
@@ -1839,7 +1959,16 @@ func lubyTerm(i int) int {
 // activity, decayed once per conflict in learnAndBackjump); LRB
 // increments lrbParticipated, counting this as one more conflict the
 // variable has contributed to since it was last assigned (see
-// backtrackTo for where that turns into an updated Q-value).
+// backtrackTo for where that turns into an updated Q-value). LRB's
+// "reason side rate" bonus (lrbReasoned) is bumped elsewhere, in
+// propagate, not here -- see propagate's doc comment for why: nearly
+// every variable this loop touches already ends up seen/
+// lrbParticipated by construction (this is a first-UIP scan that
+// marks everything it resolves through), so there is no meaningfully
+// distinct "touched but not bumped" set to reward *within* this
+// function; the paper's actual extra signal is about unit propagation
+// antecedents in general, most of which never take part in any
+// particular conflict's resolution at all.
 //
 // STAGE36.md: before backtrackLevel/lbd are computed, minimizeClause
 // gets a chance to drop any literal from the just-derived learned
@@ -2088,12 +2217,12 @@ func literalAssignedTrue(v int, x assign.Assignment) cnf.Literal {
 // (s.numConflicts now, minus its value when the variable was last
 // assigned, recorded by assignLiteral), and the reward r is how many
 // of those conflicts it actually participated in
-// (s.lrbParticipated[v]) divided by that interval. Its Q-value is
-// then nudged toward r by lrbAlpha (an exponential moving average),
-// and lrbParticipated is reset to 0 for its next stint as an assigned
-// variable. This is the paper's core learning-rate idea; the "reason
-// side rate" bonus and the annealed (rather than fixed) alpha it also
-// describes are both omitted here (see the package doc comment).
+// (s.lrbParticipated[v]), plus STAGE49.md's "reason side rate" bonus
+// (s.lrbReasoned[v] -- see bumpReasonSide's doc comment), divided by that
+// interval. Its Q-value is then nudged toward r by lrbCurrentAlpha
+// (an exponential moving average, annealed once per conflict in
+// learnAndBackjump -- see lrbAlpha's doc comment), and both counters
+// are reset to 0 for its next stint as an assigned variable.
 //
 // For every variable, regardless of s.variant, the moment it becomes
 // unassigned is also when its phase is saved (STAGE14.md): whatever
@@ -2107,10 +2236,11 @@ func (s *solver) backtrackTo(level int) {
 		v := s.trail[i]
 		if s.variant == SelectVarLrb {
 			if interval := s.numConflicts - s.lrbAssignedAtConflict[v]; interval > 0 {
-				r := float64(s.lrbParticipated[v]) / float64(interval)
-				s.lrbQ[v] = (1-s.params.LRBAlpha)*s.lrbQ[v] + s.params.LRBAlpha*r
+				r := (float64(s.lrbParticipated[v]) + float64(s.lrbReasoned[v])) / float64(interval)
+				s.lrbQ[v] = (1-s.lrbCurrentAlpha)*s.lrbQ[v] + s.lrbCurrentAlpha*r
 			}
 			s.lrbParticipated[v] = 0
+			s.lrbReasoned[v] = 0
 		}
 		s.savedPhase[v] = s.x[v] // STAGE14.md: remember this polarity for decide's next guess
 		s.x[v] = assign.Unassigned

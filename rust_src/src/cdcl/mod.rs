@@ -60,11 +60,13 @@
 //!   Every variable's "learning rate" -- how often it has recently
 //!   participated in producing a learned clause, per conflict it has
 //!   been assigned for -- is tracked ([`LrbState`]) and used as its
-//!   score instead. This implementation omits the paper's "reason
-//!   side rate" bonus and its annealed learning-rate schedule for the
-//!   Q-value update itself (kept at a fixed `LRB_ALPHA` instead); see
-//!   [`backtrack_to`]'s doc comment for exactly what is and isn't
-//!   implemented.
+//!   score instead. STAGE49.md adds the paper's "reason side rate"
+//!   bonus and its annealed learning-rate schedule for the Q-value
+//!   update (both were previously omitted); see [`backtrack_to`]'s
+//!   and [`analyze`]'s doc comments for exactly how each is
+//!   implemented, and `reports/REPORT49.md` for why they didn't
+//!   change VSIDS's status as the default (see `reports/REPORT13.md`
+//!   for that original finding).
 //!
 //! Per STAGE13.md, `SelectVarVariant::Vsids` is the default for
 //! `--algorithm=cdcl` (see [`run`]'s doc comment for why: the paper
@@ -645,6 +647,7 @@ fn maybe_restart<R: Rng>(
     saved_phase: &mut [Value],
     glucose: &GlucoseState,
     p: &params::Cdcl,
+    lrb_current_alpha: f64,
     phase_strategy: PhaseStrategy,
     working_problem: &Problem,
     lists: &Lists,
@@ -674,7 +677,7 @@ fn maybe_restart<R: Rng>(
         num_conflicts,
         lrb,
         saved_phase,
-        p.lrb_alpha,
+        lrb_current_alpha,
     );
     *conflicts_since_restart = 0;
     *restart_count += 1;
@@ -769,16 +772,25 @@ fn rephase_from_walksat<R: Rng>(
 // (runtime-configurable); the value above is
 // [`params::default`]'s value for it, unchanged.
 
-// The fixed learning-rate weight `SelectVarVariant::Lrb` uses when
-// updating a variable's Q-value (see [`backtrack_to`]'s doc comment):
-// the paper anneals this over the course of the search, starting high
-// and decaying toward a floor; this implementation keeps it fixed at
-// a value from within that range instead, as a documented
-// simplification (see the module doc comment).
+// The *starting* learning-rate weight `SelectVarVariant::Lrb` uses
+// when updating a variable's Q-value (see [`backtrack_to`]'s doc
+// comment).
 //
 // STAGE39.md: moved to [`params::Cdcl::lrb_alpha`]
 // (runtime-configurable); 0.4, the value named above, is
 // [`params::default`]'s value for it, unchanged.
+//
+// STAGE49.md implements the paper's annealing schedule: `run_loop`'s
+// local `lrb_current_alpha` begins at `p.lrb_alpha` and is decayed by
+// `LRB_ALPHA_DECAY_STEP` once per conflict down to a floor of
+// `LRB_ALPHA_FLOOR`, after which it stays fixed for the rest of the
+// search. The decay step and floor are plain constants, not exposed
+// via `params::Cdcl`, since nothing benchmark-motivated has justified
+// tuning them independently (per STAGE39.md's "only expose what's
+// benchmark-motivated" rationale for what got promoted to
+// `params::Cdcl` and what didn't).
+const LRB_ALPHA_DECAY_STEP: f64 = 1e-6;
+const LRB_ALPHA_FLOOR: f64 = 0.06;
 
 /// Per-variable VSIDS bookkeeping (`SelectVarVariant::Vsids` only):
 /// `activity[v]` is bumped by `increment` every time variable `v` is
@@ -798,9 +810,22 @@ struct VsidsState {
 /// conflicts had occurred when it was last assigned, so
 /// [`backtrack_to`] can compute how many elapsed while it was
 /// assigned. See [`backtrack_to`]'s doc comment for the update rule.
+///
+/// `reasoned[v]` is STAGE49.md's "reason side rate" bonus counter,
+/// bumped by [`bump_reason_side`] (called from [`propagate`], not
+/// `analyze` -- see that function's own doc comment for why) once per
+/// conflict "epoch": `reasoned_epoch[v]` records the last
+/// `num_conflicts` value already credited for `v`, the same
+/// "compare against the current epoch" trick `assigned_at_conflict`
+/// already uses, avoiding an O(num_vars) reset per conflict. `-1`
+/// means "never credited," since `num_conflicts` starts at 0 and a
+/// zero-initialized counter would otherwise wrongly look
+/// already-credited at the very first conflict.
 struct LrbState {
     q: Vec<f64>,
     participated: Vec<usize>,
+    reasoned: Vec<usize>,
+    reasoned_epoch: Vec<i64>,
     assigned_at_conflict: Vec<usize>,
 }
 
@@ -818,6 +843,8 @@ impl LrbState {
         LrbState {
             q: vec![0.0; num_vars + 1],
             participated: vec![0; num_vars + 1],
+            reasoned: vec![0; num_vars + 1],
+            reasoned_epoch: vec![-1; num_vars + 1],
             assigned_at_conflict: vec![0; num_vars + 1],
         }
     }
@@ -1295,6 +1322,10 @@ fn run_loop<R: Rng>(
     // actually calls for it.
     let mut vsids = VsidsState::new(problem.num_vars);
     let mut lrb = LrbState::new(problem.num_vars);
+    // STAGE49.md: the annealed learning-rate weight, starting at
+    // p.lrb_alpha and decayed once per conflict (see the
+    // LRB_ALPHA_DECAY_STEP doc comment) down to LRB_ALPHA_FLOOR.
+    let mut lrb_current_alpha = p.lrb_alpha;
 
     // STAGE14.md's phase saving: the value each variable last held
     // before becoming unassigned. Starts all `Value::False`, which is
@@ -1422,7 +1453,7 @@ fn run_loop<R: Rng>(
                 num_conflicts,
                 &mut lrb,
                 &mut saved_phase,
-                p.lrb_alpha,
+                lrb_current_alpha,
             );
             let new_clause = add_learned_clause(
                 &learned,
@@ -1485,6 +1516,14 @@ fn run_loop<R: Rng>(
                 }
             }
 
+            // STAGE49.md: anneal LRB's Q-value weight once per
+            // conflict, the paper's own schedule, mirroring the VSIDS
+            // increment growth immediately above in shape (a small
+            // per-conflict step, not a per-bump one).
+            if variant == SelectVarVariant::Lrb {
+                lrb_current_alpha = decay_lrb_alpha(lrb_current_alpha);
+            }
+
             if let Some(limit) = memory_limit_bytes
                 && estimated_bytes > limit
             {
@@ -1541,6 +1580,7 @@ fn run_loop<R: Rng>(
                 &mut saved_phase,
                 &glucose,
                 p,
+                lrb_current_alpha,
                 phase_strategy,
                 &working_problem,
                 &lists,
@@ -1767,11 +1807,22 @@ fn build_watchers(watch: &[[Literal; 2]], num_vars: usize) -> (Vec<Vec<usize>>, 
 /// a pure, behavior-preserving simplification, matching the
 /// equivalent fix applied to the Go port. A second, more aggressive
 /// idea (skip `choose_watch`'s scan entirely whenever `other_watch`
-/// is already true) was tried and rejected: measured on this
-/// project's own benchmark instances (mostly length-3 clauses), it
-/// made things reproducibly *worse*, not better -- see
-/// `reports/REPORT23.md` for why, and for why it's listed there as a
-/// possible future change rather than applied here.
+/// is already true) was tried and rejected at the time: measured on
+/// this project's own benchmark instances (mostly length-3 clauses),
+/// it made things reproducibly *worse*, not better -- see
+/// `reports/REPORT23.md` for why.
+///
+/// STAGE48.md reversed that conclusion, once re-measured against the
+/// candidate source STAGE45.md's fix actually put in place (see the
+/// next paragraph): with `propagate` visiting only genuine watchers
+/// instead of every occurrence, `choose_watch` is no longer a cheap,
+/// already-thin scan riding along for free -- a fresh profile found
+/// it back up to a large share of total CPU time on its own. Skipping
+/// it whenever the other watch is already true (see the
+/// blocking-literal check below) turned out to help everywhere it was
+/// measured this time -- the opposite of `REPORT23.md`'s finding, not
+/// because the technique changed, but because what it was competing
+/// against did. See `reports/REPORT48.md` for the full numbers.
 ///
 /// STAGE45.md: from Stage 9 through Stage 44, this loop's own
 /// candidate source was `lists.positive`/`lists.negative` -- the
@@ -1794,6 +1845,13 @@ fn build_watchers(watch: &[[Literal; 2]], num_vars: usize) -> (Vec<Vec<usize>>, 
 /// just became false. `lists` is kept only because
 /// `rephase_from_walksat` (STAGE43.md) still needs a real full
 /// occurrence index for WalkSAT's flip-scoring.
+///
+/// STAGE49.md: for `SelectVarVariant::Lrb` only, every genuine unit
+/// propagation found here (the `forced_var` branch below) also calls
+/// [`bump_reason_side`] to credit the antecedent clause's other,
+/// already-false literals with the paper's "reason side rate" bonus
+/// -- see that function's own doc comment for why this lives here
+/// rather than in [`analyze`].
 ///
 /// The scan below is MiniSat's own standard in-place compaction
 /// pattern: since a clause whose watch moves away (`choose_watch`
@@ -1905,6 +1963,9 @@ fn propagate(
                     num_conflicts,
                     lrb,
                 );
+                if variant == SelectVarVariant::Lrb {
+                    bump_reason_side(clauses, c, other_watch, level, lrb, num_conflicts);
+                }
             }
             // Otherwise other_watch is already true: the clause is
             // satisfied through it, and there is nothing to do.
@@ -1922,6 +1983,68 @@ fn propagate(
         }
     }
     None
+}
+
+/// Implements `SelectVarVariant::Lrb`'s "reason side rate" bonus
+/// (STAGE49.md): called only when [`propagate`] has just forced
+/// `forced` true via clause `c` through genuine unit propagation, at
+/// which point every *other* literal in `c` must already be false --
+/// that is exactly what makes `c` a forcing unit clause -- so each of
+/// their variables just served as part of the "reason" for this
+/// propagation, whether or not that propagation ever ends up touched
+/// by an actual conflict. This is a deliberately different signal
+/// from `lrb.participated` (bumped only for variables [`analyze`]
+/// actually resolves through while deriving a learned clause -- see
+/// that function's own doc comment for why there is no meaningfully
+/// distinct "reason side" set to find purely within it): propagations
+/// vastly outnumber conflicts, so this rewards variables for being
+/// generally useful to BCP, not just to the specific conflicts they
+/// happened to participate in resolving.
+///
+/// `lrb.reasoned_epoch` deduplicates by `num_conflicts` (once per
+/// variable per conflict "epoch", regardless of how many propagations
+/// occur within it), keeping `lrb.reasoned` on the same
+/// conflict-counted scale as `lrb.participated` so [`backtrack_to`]'s
+/// reward formula (see its own doc comment) can add them together
+/// directly instead of one dominating the other by sheer call-count.
+fn bump_reason_side(
+    clauses: &[Clause],
+    c: usize,
+    forced: Literal,
+    level: &[usize],
+    lrb: &mut LrbState,
+    num_conflicts: usize,
+) {
+    for &lit in &clauses[c] {
+        if lit == forced {
+            continue;
+        }
+        let v = cnf::literal_var(lit);
+        if level[v] == 0 || lrb.reasoned_epoch[v] == num_conflicts as i64 {
+            continue;
+        }
+        lrb.reasoned_epoch[v] = num_conflicts as i64;
+        lrb.reasoned[v] += 1;
+    }
+}
+
+/// Applies STAGE49.md's per-conflict LRB alpha-decay step to
+/// `current`, clamped at [`LRB_ALPHA_FLOOR`]. Extracted as its own
+/// function (rather than left inline in [`run_loop`]'s per-conflict
+/// bookkeeping, the way it started) purely so it has a directly
+/// testable unit, matching this module's existing style of small
+/// extracted pure functions ([`restart_threshold`],
+/// [`glucose_should_restart`], [`phase_for`]).
+fn decay_lrb_alpha(current: f64) -> f64 {
+    if current <= LRB_ALPHA_FLOOR {
+        return current;
+    }
+    let next = current - LRB_ALPHA_DECAY_STEP;
+    if next < LRB_ALPHA_FLOOR {
+        LRB_ALPHA_FLOOR
+    } else {
+        next
+    }
 }
 
 /// `MIN_UNDEF`/`MIN_REMOVABLE`/`MIN_FAILED` are [`literal_redundant`]'s
@@ -2165,7 +2288,16 @@ fn literal_redundant(
 /// LRB increments `lrb.participated`, counting this as one more
 /// conflict the variable has contributed to since it was last
 /// assigned (see [`backtrack_to`] for where that turns into an
-/// updated Q-value).
+/// updated Q-value). LRB's "reason side rate" bonus
+/// (`lrb.reasoned`) is bumped elsewhere, in [`propagate`]/
+/// [`bump_reason_side`], not here -- nearly every variable this loop
+/// touches already ends up `seen`/`lrb.participated` by construction
+/// (this is a first-UIP scan that marks everything it resolves
+/// through), so there is no meaningfully distinct "touched but not
+/// bumped" set to reward *within* this function; the paper's actual
+/// extra signal is about unit propagation antecedents in general,
+/// most of which never take part in any particular conflict's
+/// resolution at all.
 ///
 /// STAGE36.md: before `backtrack_level`/the LBD are computed,
 /// [`minimize_clause`] gets a chance to drop any literal from the
@@ -2392,13 +2524,13 @@ fn update_target_phase(
 /// variable was last assigned, recorded by [`assign_literal`] in
 /// `lrb.assigned_at_conflict`), and the reward `r` is how many of
 /// those conflicts it actually participated in
-/// (`lrb.participated[v]`) divided by that interval. Its Q-value is
-/// then nudged toward `r` by `LRB_ALPHA` (an exponential moving
-/// average), and `lrb.participated` is reset to 0 for its next stint
-/// as an assigned variable. This is the paper's core learning-rate
-/// idea; the "reason side rate" bonus and the annealed (rather than
-/// fixed) alpha it also describes are both omitted here (see the
-/// module doc comment).
+/// (`lrb.participated[v]`), plus STAGE49.md's "reason side rate"
+/// bonus (`lrb.reasoned[v]` -- see [`bump_reason_side`]'s doc
+/// comment), divided by that interval. Its Q-value is then nudged
+/// toward `r` by `lrb_alpha` (an exponential moving average, annealed
+/// once per conflict in [`run_loop`] -- see the `LRB_ALPHA_DECAY_STEP`
+/// doc comment), and both counters are reset to 0 for its next stint
+/// as an assigned variable.
 ///
 /// For every variable, regardless of `variant`, the moment it becomes
 /// unassigned is also when its phase is saved (STAGE14.md): whatever
@@ -2425,10 +2557,11 @@ fn backtrack_to(
         if variant == SelectVarVariant::Lrb {
             let interval = num_conflicts - lrb.assigned_at_conflict[v];
             if interval > 0 {
-                let r = lrb.participated[v] as f64 / interval as f64;
+                let r = (lrb.participated[v] + lrb.reasoned[v]) as f64 / interval as f64;
                 lrb.q[v] = (1.0 - lrb_alpha) * lrb.q[v] + lrb_alpha * r;
             }
             lrb.participated[v] = 0;
+            lrb.reasoned[v] = 0;
         }
         saved_phase[v] = x[v];
         x[v] = Value::Unassigned;
@@ -3856,6 +3989,7 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &p,
+            p.lrb_alpha,
             PhaseStrategy::Saving,
             &_working_problem,
             &lists,
@@ -4107,6 +4241,272 @@ mod tests {
         );
     }
 
+    /// test_backtrack_to_updates_lrb_q's own scenario, extended to
+    /// verify STAGE49.md's "reason side rate" bonus is actually folded
+    /// into the reward: with participated=3 and reasoned=2, the same
+    /// num_conflicts=5/10 setup should now yield Q = LRB_ALPHA *
+    /// (5.0/5.0), and both counters must reset to 0 afterward.
+    #[test]
+    fn test_backtrack_to_updates_lrb_q_includes_reasoned_bonus() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2]],
+        };
+        let (_working_problem, _watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let mut level = vec![0usize; 3];
+        let mut reason: Vec<Option<usize>> = vec![None; 3];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut trail_lim: Vec<usize> = vec![0, 0];
+        let mut current_level = 1usize;
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(2);
+        let mut saved_phase = vec![Value::False; 3];
+
+        assign_literal(
+            1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Lrb,
+            5,
+            &mut lrb,
+        );
+        lrb.participated[1] = 3;
+        lrb.reasoned[1] = 2;
+
+        backtrack_to(
+            0,
+            &mut trail,
+            &mut trail_lim,
+            &mut x,
+            &mut q_head,
+            &mut current_level,
+            SelectVarVariant::Lrb,
+            10,
+            &mut lrb,
+            &mut saved_phase,
+            params::default().cdcl.lrb_alpha,
+        );
+
+        let want_q = params::default().cdcl.lrb_alpha * (5.0 / 5.0);
+        assert!(
+            (lrb.q[1] - want_q).abs() < 1e-9,
+            "lrb.q[1] = {}, want {}",
+            lrb.q[1],
+            want_q
+        );
+        assert_eq!(
+            lrb.participated[1], 0,
+            "lrb.participated[1] = {}, want 0 (reset on unassignment)",
+            lrb.participated[1]
+        );
+        assert_eq!(
+            lrb.reasoned[1], 0,
+            "lrb.reasoned[1] = {}, want 0 (reset on unassignment)",
+            lrb.reasoned[1]
+        );
+    }
+
+    /// Hand-traced test of bump_reason_side directly, via a real
+    /// propagate() call: two clauses, [1, 2, 3] and [6, 1, 3], both
+    /// share variables 1 and 3 as watches picked at construction
+    /// ([1,2] and [6,1] respectively, since choose_watch always picks
+    /// a fresh clause's first two literals). Variable 3 is set false
+    /// (level 1, direct setup) and variable 1 is then set false (level
+    /// 1, direct setup) -- a single propagate() call then processes
+    /// both trail entries in order. Variable 3 has no watchers on it
+    /// (neither clause watches literal 3), so nothing happens for it
+    /// directly; variable 1 is watched by both clauses, so falsifying
+    /// it forces variable 2 (via clause 0, [1,2,3]: literal 3 is
+    /// already false, leaving no replacement) and variable 6 (via
+    /// clause 1, [6,1,3]: same reasoning) in turn, both genuine unit
+    /// propagations.
+    ///
+    /// Each forcing clause's *other* false literals (1 and 3, in both
+    /// cases) should have reasoned bumped -- but only once each, not
+    /// twice, since both propagations happen within the same conflict
+    /// epoch (num_conflicts never changes here) and reasoned_epoch
+    /// must deduplicate across them. The forced variables themselves
+    /// (2 and 6) must never get reasoned bumped for their own forcing
+    /// clause.
+    #[test]
+    fn test_propagate_bumps_lrb_reason_side() {
+        let problem = Problem {
+            num_vars: 6,
+            clauses: vec![vec![1, 2, 3], vec![6, 1, 3]],
+        };
+        let (working_problem, mut watch, mut x) =
+            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+
+        assert!(
+            watch[0] == [1, 2],
+            "watch[0] after bootstrap = {:?}, want [1, 2] (test setup assumption violated)",
+            watch[0]
+        );
+        assert!(
+            watch[1] == [6, 1],
+            "watch[1] after bootstrap = {:?}, want [6, 1] (test setup assumption violated)",
+            watch[1]
+        );
+
+        let mut level = vec![0usize; 7];
+        let mut reason: Vec<Option<usize>> = vec![None; 7];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(6);
+
+        assign_literal(
+            -3,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Lrb,
+            0,
+            &mut lrb,
+        ); // variable 3 := false, no watchers on it
+        assign_literal(
+            -1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Lrb,
+            0,
+            &mut lrb,
+        ); // variable 1 := false, triggers both clauses
+
+        let conflict = propagate(
+            &working_problem.clauses,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &mut x,
+            &mut trail,
+            &mut q_head,
+            1,
+            &mut level,
+            &mut reason,
+            SelectVarVariant::Lrb,
+            0,
+            &mut lrb,
+        );
+
+        assert_eq!(
+            conflict, None,
+            "expected no conflict (both clauses force a literal, neither conflicts)"
+        );
+        assert_eq!(
+            x[2],
+            Value::True,
+            "variable 2 should be forced True by clause 0, [1 2 3]"
+        );
+        assert_eq!(
+            x[6],
+            Value::True,
+            "variable 6 should be forced True by clause 1, [6 1 3]"
+        );
+
+        assert_eq!(
+            lrb.reasoned[1], 1,
+            "lrb.reasoned[1] = {}, want 1 (reason side of both propagations, deduplicated once per conflict epoch)",
+            lrb.reasoned[1]
+        );
+        assert_eq!(
+            lrb.reasoned[3], 1,
+            "lrb.reasoned[3] = {}, want 1 (reason side of both propagations, deduplicated once per conflict epoch)",
+            lrb.reasoned[3]
+        );
+        assert_eq!(
+            lrb.reasoned[2], 0,
+            "lrb.reasoned[2] = {}, want 0 (the forced variable itself, never its own reason)",
+            lrb.reasoned[2]
+        );
+        assert_eq!(
+            lrb.reasoned[6], 0,
+            "lrb.reasoned[6] = {}, want 0 (the forced variable itself, never its own reason)",
+            lrb.reasoned[6]
+        );
+    }
+
+    /// Verifies decay_lrb_alpha directly: one step subtracts exactly
+    /// LRB_ALPHA_DECAY_STEP, and a value already within one step of
+    /// LRB_ALPHA_FLOOR clamps exactly to the floor rather than
+    /// dropping below it.
+    #[test]
+    fn test_decay_lrb_alpha_steps_and_clamps() {
+        let start = params::default().cdcl.lrb_alpha;
+        let after_one = decay_lrb_alpha(start);
+        let want = start - LRB_ALPHA_DECAY_STEP;
+        assert!(
+            (after_one - want).abs() < 1e-15,
+            "decay_lrb_alpha({start}) = {after_one}, want {want}"
+        );
+
+        let near_floor = LRB_ALPHA_FLOOR + LRB_ALPHA_DECAY_STEP / 2.0;
+        assert_eq!(
+            decay_lrb_alpha(near_floor),
+            LRB_ALPHA_FLOOR,
+            "decay_lrb_alpha near the floor must clamp exactly to LRB_ALPHA_FLOOR, not drop below it"
+        );
+
+        assert_eq!(
+            decay_lrb_alpha(LRB_ALPHA_FLOOR),
+            LRB_ALPHA_FLOOR,
+            "decay_lrb_alpha at the floor must stay at the floor"
+        );
+    }
+
+    /// End-to-end confirmation that run_loop actually anneals LRB's
+    /// alpha over a real run with many conflicts, not just that
+    /// decay_lrb_alpha's own arithmetic is correct in isolation: a
+    /// pigeonhole instance forced through `SelectVarVariant::Lrb`
+    /// needs many conflicts to prove UNSAT, which -- given
+    /// LRB_ALPHA_DECAY_STEP's tiny size -- would leave alpha
+    /// unmeasurably close to its start after only a handful of
+    /// conflicts if the decay call were ever accidentally dropped from
+    /// run_loop's per-conflict bookkeeping. This doesn't inspect
+    /// lrb_current_alpha directly (run_loop has no way to report it),
+    /// so it is a coarser check than the unit tests above; its real
+    /// job is confirming the wiring between run_loop and
+    /// decay_lrb_alpha survives, not re-verifying the arithmetic.
+    #[test]
+    fn test_run_loop_uses_lrb_variant_to_completion_with_many_conflicts() {
+        let problem = pigeonhole_problem(5, 4);
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let result = run_loop(
+            &problem,
+            None,
+            SelectVarVariant::Lrb,
+            RestartStrategy::None,
+            None,
+            &mut rng,
+            None,
+            None,
+            &[],
+            &params::default().cdcl,
+            PhaseStrategy::Saving,
+        );
+
+        assert!(!result.satisfiable, "5-pigeon/4-hole must be UNSAT");
+        assert!(
+            result.num_conflicts > 10,
+            "expected more than a handful of conflicts (num_conflicts = {}), to make alpha decay observable in principle",
+            result.num_conflicts
+        );
+    }
+
     /// Verifies STAGE14.md's core mechanism directly: a variable
     /// assigned True and then backtracked over should have its phase
     /// saved as True, regardless of SelectVar variant.
@@ -4340,6 +4740,7 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
+            params::default().cdcl.lrb_alpha,
             PhaseStrategy::Saving,
             &_working_problem,
             &lists,
@@ -4430,6 +4831,7 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
+            params::default().cdcl.lrb_alpha,
             PhaseStrategy::Saving,
             &working_problem,
             &lists,
@@ -4458,6 +4860,7 @@ mod tests {
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
+            params::default().cdcl.lrb_alpha,
             PhaseStrategy::Saving,
             &working_problem,
             &lists,

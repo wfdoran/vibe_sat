@@ -28,11 +28,11 @@ A parameter's JSON key (where it has one) is the name used inside
 
 | JSON key | Default | Go / Rust location | What it controls |
 |---|---|---|---|
-| `lubyBaseConflicts` | `100` | `cdcl.go` / `cdcl/mod.rs` | Scale factor for the Luby restart schedule (`RestartLuby`) — MiniSat's own default base. |
+| `lubyBaseConflicts` | `4000` | `cdcl.go` / `cdcl/mod.rs` | Scale factor for the Luby restart schedule (`RestartLuby`). Originally MiniSat's own default base (`100`); recalibrated by `STAGE49.md`'s benchmark sweep, which found the literature value measurably underperforms on this project's own benchmark set — see `REPORT49.md`. |
 | `polynomialBaseConflicts` | `18000` | same | Scale factor for the polynomial restart schedule (`RestartPolynomial`). No literature standard exists for this one; chosen by this project's own benchmarking (see `REPORT18.md`/`REPORT19.md`). |
 | `geometricBaseConflicts` | `100` | same | Base interval for the geometric restart schedule (`RestartGeometric`); previously tied to `lubyBaseConflicts` by definition, now independently tunable. |
 | `geometricGrowthFactor` | `1.5` | same | Growth ratio ("c") applied to `geometricBaseConflicts` after every restart. |
-| `lrbAlpha` | `0.4` | same | Exponential-moving-average learning-rate weight for the LRB (`SelectVarVariant::Lrb`) branching heuristic's Q-values. |
+| `lrbAlpha` | `0.4` | same | *Starting* exponential-moving-average learning-rate weight for the LRB (`SelectVarVariant::Lrb`) branching heuristic's Q-values (`STAGE49.md`: annealed once per conflict down to a floor thereafter — see the compile-time constants below). |
 | `clauseActivityDecay` | `0.999` | same | Per-conflict decay applied to the clause-activity increment (VSIDS-style clause bumping). |
 | `varActivityDecay` | `0.95` | same | Per-conflict decay applied to the variable-activity increment (`SelectVarVsids`'s analogue of `clauseActivityDecay`). |
 | `glueClauseLBDThreshold` | `2` | same | LBD at or below which a learned clause is a "glue clause," permanently exempt from `reduceClauseDatabase`'s deletion. |
@@ -64,6 +64,8 @@ no real use for it.
 | Name | Value | Location | Why not exposed |
 |---|---|---|---|
 | `activityRescaleThreshold` | `1e100` | `cdcl.go` / `cdcl/mod.rs` (`ACTIVITY_RESCALE_THRESHOLD`) | A floating-point overflow safety valve, not a tuning parameter — any value large enough to almost never bind works identically; there is nothing to trade off by changing it. |
+| `lrbAlphaDecayStep` | `1e-6` | `cdcl.go` / `cdcl/mod.rs` (`LRB_ALPHA_DECAY_STEP`) | `STAGE49.md`'s per-conflict decay applied to `lrbAlpha`'s annealed running value (`lrbCurrentAlpha`/`lrb_current_alpha`). Not benchmark-motivated to tune independently yet — see `REPORT49.md`. |
+| `lrbAlphaFloor` | `0.06` | `cdcl.go` / `cdcl/mod.rs` (`LRB_ALPHA_FLOOR`) | The floor `lrbAlphaDecayStep`'s annealing clamps at, per the LRB paper's own schedule. Same rationale as `lrbAlphaDecayStep` for not being exposed. |
 | `exportMaxClauseLen` | `8` | `clauseshare.go` / `cdcl/mod.rs` | Reuses ManySAT's own literature convention for which learned clauses are worth sharing between threads; not benchmark-tuned by this project, and STAGE20/21's clause-sharing design treats it as a fixed policy choice rather than a dial. |
 | `exportBufferCapacity` | `256` | `clauseshare.go` / `cdcl/mod.rs` | A "generous, cheap-to-hold guess" per its own doc comment — sizing a lossy ring buffer where correctness never depends on the value, only how often a peer might miss a shared clause. Not measured to matter. |
 | `importCheckMask` | `0x1f` (check every 32 conflicts) | `clauseshare.go` / `cdcl/mod.rs` | A pure amortization choice (how often to poll peers for shared clauses), not a search-quality parameter — no known instance is sensitive to this value. |
