@@ -16,6 +16,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::assignment::{self, Assignment, Value};
 use crate::cnf::{self, Clause, Literal, Problem};
@@ -124,6 +125,23 @@ pub struct PreprocessResult {
 /// and bounded variable elimination) remains single-threaded
 /// regardless of `num_threads`; see REPORT25.md for why BVE in
 /// particular was not also threaded this stage.
+///
+/// STAGE52.md: unlike `dfs::bootstrap`/`cdcl::bootstrap`'s own
+/// defensive `unit_propagate` call (now interruptible -- see
+/// `unit_propagate`'s doc comment), `run` itself is called from
+/// `cmd/vibe_sat`'s `main` entirely outside `--time-limit-secs`'s scope
+/// (before either algorithm's own `start_time` is even captured), so
+/// it passes `None`/`Instant::now()` everywhere it calls
+/// `unit_propagate`/`simplify_with_assignment` -- the same
+/// unconditional, run-to-completion behavior as before this stage.
+/// This is a real, disclosed, un-addressed gap this stage's
+/// investigation surfaced but did not fix (a materially bigger change,
+/// since it would mean adding time-limit awareness to subsumption/BVE
+/// too, both of which already have their own separate work-budget
+/// safety caps -- see `reports/REPORT52.md`); STAGE52.md's own scope,
+/// following `REPORT35.md`'s "known, disclosed limitation" wording
+/// exactly, is the narrower bootstrap path each algorithm runs on its
+/// own, not this pipeline.
 pub fn run(
     problem: &Problem,
     verbose: i32,
@@ -148,7 +166,12 @@ pub fn run(
     for _ in 0..MAX_ROUNDS {
         let mut changed = false;
 
-        let (unsat, units_fixed) = unit_propagate(&mut clauses, &mut assignment);
+        // STAGE52.md: not time-limited (None/Instant::now()) -- run is
+        // called from cmd/vibe_sat entirely outside --time-limit-secs's
+        // scope (before either algorithm's own start_time is even
+        // captured); see run's own doc comment.
+        let (unsat, units_fixed, _) =
+            unit_propagate(&mut clauses, &mut assignment, None, Instant::now());
         stats.units_propagated += units_fixed;
         if unsat {
             return PreprocessResult {
@@ -379,10 +402,45 @@ fn clause_satisfied(clause: &Clause, assignment: &Assignment) -> bool {
 /// originally scoped to fix, but the real dominant cost behind that
 /// specific 42.65-second measurement. See reports/REPORT35.md for the
 /// full before/after numbers.
-fn simplify_with_assignment(clauses: &mut Vec<Clause>, assignment: &Assignment) -> bool {
+///
+/// STAGE52.md: `time_limit`/`start_time` (`None`/any `Instant` meaning
+/// no limit, the same convention `dfs::run`'s/`cdcl::run_loop`'s own
+/// search loops already use) let a caller doing time-bounded bootstrap
+/// work bail out rather than running this whole clause set to
+/// completion regardless of how long that takes -- see
+/// `unit_propagate`'s own doc comment for why this was previously the
+/// one part of a time-limited run that couldn't be interrupted at all.
+/// Checked once up front (before `clauses` is even taken, so a
+/// deadline that's already passed leaves `clauses` completely
+/// untouched -- this is what
+/// `test_simplify_with_assignment_reports_timed_out_without_mutating_clauses`
+/// relies on) and again once per clause during the scan. A timeout
+/// noticed mid-scan does *not* attempt to restore `clauses` to its
+/// pre-call contents (Rust's owned-`Vec` `mem::take` here, unlike Go's
+/// aliased in-place compaction, makes that non-trivial to do cheaply)
+/// -- this is safe because every real caller (`cdcl::bootstrap`,
+/// `dfs::bootstrap`) discards `clauses` entirely the moment `timed_out`
+/// comes back true, so a mid-scan timeout's exact partial state is
+/// never observed by anyone.
+fn simplify_with_assignment(
+    clauses: &mut Vec<Clause>,
+    assignment: &Assignment,
+    time_limit: Option<Duration>,
+    start_time: Instant,
+) -> (bool, bool) {
+    if let Some(limit) = time_limit
+        && start_time.elapsed() >= limit
+    {
+        return (false, true);
+    }
     let old = std::mem::take(clauses);
     let mut kept = Vec::with_capacity(old.len());
     for clause in old {
+        if let Some(limit) = time_limit
+            && start_time.elapsed() >= limit
+        {
+            return (false, true);
+        }
         let mut satisfied = false;
         let mut reduced: Option<Clause> = None; // lazily allocated; None means "clause unchanged so far"
         for i in 0..clause.len() {
@@ -420,20 +478,20 @@ fn simplify_with_assignment(clauses: &mut Vec<Clause>, assignment: &Assignment) 
                 // the original (already owned) clause, no allocation
                 // needed.
                 if clause.is_empty() {
-                    return true;
+                    return (true, false);
                 }
                 kept.push(clause);
             }
             Some(reduced) => {
                 if reduced.is_empty() {
-                    return true;
+                    return (true, false);
                 }
                 kept.push(reduced);
             }
         }
     }
     *clauses = kept;
-    false
+    (false, false)
 }
 
 /// Repeatedly finds a clause with exactly one unassigned literal and
@@ -446,15 +504,45 @@ fn simplify_with_assignment(clauses: &mut Vec<Clause>, assignment: &Assignment) 
 /// Exposed beyond this module (see [`crate::dfs::run`]'s bootstrap
 /// step, STAGE9.md) since watched literals require every clause to
 /// have at least two literals, which this guarantees.
-pub fn unit_propagate(clauses: &mut Vec<Clause>, assignment: &mut Assignment) -> (bool, usize) {
+///
+/// STAGE52.md: `time_limit`/`start_time` (`None`/any `Instant` meaning
+/// no limit) are threaded straight through to
+/// [`simplify_with_assignment`], and also checked once per clause in
+/// the unit-clause-finding loop below -- every call site that needs
+/// unbounded behavior ([`run`]'s own pipeline, which is not currently
+/// time-limited at all -- see its doc comment) simply passes
+/// `None`/`Instant::now()`, exactly the previous, unconditional
+/// behavior. Callers doing time-bounded bootstrap work
+/// (`dfs::bootstrap`, `cdcl::bootstrap`) instead get a real, prompt
+/// exit: `timed_out` is true the moment either loop notices the
+/// deadline has passed, mid-round if necessary, rather than only
+/// between whole rounds -- this was previously the one part of a
+/// time-limited run that could not be interrupted at all once started
+/// (`REPORT35.md`'s own disclosed limitation; see `reports/REPORT52.md`).
+pub fn unit_propagate(
+    clauses: &mut Vec<Clause>,
+    assignment: &mut Assignment,
+    time_limit: Option<Duration>,
+    start_time: Instant,
+) -> (bool, usize, bool) {
     let mut num_fixed = 0;
     loop {
-        if simplify_with_assignment(clauses, assignment) {
-            return (true, num_fixed);
+        let (clauses_unsat, timed_out) =
+            simplify_with_assignment(clauses, assignment, time_limit, start_time);
+        if timed_out {
+            return (false, num_fixed, true);
+        }
+        if clauses_unsat {
+            return (true, num_fixed, false);
         }
 
         let mut found_unit = false;
         for clause in clauses.iter() {
+            if let Some(limit) = time_limit
+                && start_time.elapsed() >= limit
+            {
+                return (false, num_fixed, true);
+            }
             if clause.len() != 1 {
                 continue;
             }
@@ -469,7 +557,7 @@ pub fn unit_propagate(clauses: &mut Vec<Clause>, assignment: &mut Assignment) ->
             found_unit = true;
         }
         if !found_unit {
-            return (false, num_fixed);
+            return (false, num_fixed, false);
         }
     }
 }
@@ -518,7 +606,10 @@ fn eliminate_pure_literals(clauses: &mut Vec<Clause>, assignment: &mut Assignmen
         // introduces a new false literal elsewhere, since the
         // variable never appears with the opposite polarity), so this
         // cannot discover a contradiction.
-        let _ = simplify_with_assignment(clauses, assignment);
+        // Not time-limited (None/Instant::now()): eliminate_pure_literals
+        // is only ever called from run's own pipeline, which has no
+        // time-limit awareness at all yet -- see run's doc comment.
+        let _ = simplify_with_assignment(clauses, assignment, None, Instant::now());
     }
 }
 
@@ -1173,7 +1264,8 @@ mod tests {
         let mut clauses = vec![vec![1], vec![-1, 2], vec![-2, 3]];
         let mut assignment = assignment::new(3);
 
-        let (unsat, num_fixed) = unit_propagate(&mut clauses, &mut assignment);
+        let (unsat, num_fixed, _) =
+            unit_propagate(&mut clauses, &mut assignment, None, Instant::now());
         assert!(!unsat);
         assert_eq!(num_fixed, 3);
         assert_eq!(assignment[1], Value::True);
@@ -1187,8 +1279,41 @@ mod tests {
         let mut clauses = vec![vec![1], vec![-1]];
         let mut assignment = assignment::new(1);
 
-        let (unsat, _) = unit_propagate(&mut clauses, &mut assignment);
+        let (unsat, _, _) = unit_propagate(&mut clauses, &mut assignment, None, Instant::now());
         assert!(unsat);
+    }
+
+    /// STAGE52.md's core mechanism: with an already-elapsed deadline (a
+    /// zero time_limit against Instant::now()), unit_propagate must
+    /// report timed_out = true immediately, before ever propagating the
+    /// chain of unit clauses it would otherwise find -- unsat must be
+    /// false (timing out means "don't know", never "proven
+    /// unsatisfiable") and num_fixed must be 0, confirming no work
+    /// happened after the deadline was noticed.
+    #[test]
+    fn test_unit_propagate_reports_timed_out_before_finding_unit_clause() {
+        let mut clauses = vec![vec![1], vec![-1, 2]];
+        let mut assignment = assignment::new(2);
+        let already_elapsed = Duration::from_secs(0);
+
+        let (unsat, num_fixed, timed_out) = unit_propagate(
+            &mut clauses,
+            &mut assignment,
+            Some(already_elapsed),
+            Instant::now(),
+        );
+        assert!(
+            timed_out,
+            "expected timed_out = true with an already-elapsed deadline"
+        );
+        assert!(
+            !unsat,
+            "expected unsat = false on timeout -- timing out is 'unknown', never 'proven unsatisfiable'"
+        );
+        assert_eq!(
+            num_fixed, 0,
+            "num_fixed = {num_fixed}, want 0 (deadline noticed before any unit clause was propagated)"
+        );
     }
 
     /// STAGE35.md: verifies simplify_with_assignment's lazy-allocation
@@ -1207,7 +1332,7 @@ mod tests {
         let mut assignment = assignment::new(5);
         assignment[3] = Value::True; // makes literal -3 false, dropping it from to_reduce
 
-        let unsat = simplify_with_assignment(&mut clauses, &assignment);
+        let (unsat, _) = simplify_with_assignment(&mut clauses, &assignment, None, Instant::now());
         assert!(!unsat, "expected no contradiction");
         assert_eq!(clauses.len(), 2, "clauses = {clauses:?}, want 2 kept");
         assert_eq!(
@@ -1228,7 +1353,7 @@ mod tests {
         assignment[1] = Value::True;
 
         let mut satisfied = vec![vec![1, -2]];
-        assert!(!simplify_with_assignment(&mut satisfied, &assignment));
+        assert!(!simplify_with_assignment(&mut satisfied, &assignment, None, Instant::now()).0);
         assert!(
             satisfied.is_empty(),
             "satisfied clause should have been dropped entirely, got {satisfied:?}"
@@ -1236,14 +1361,45 @@ mod tests {
 
         let mut all_false = vec![vec![-1]];
         assert!(
-            simplify_with_assignment(&mut all_false, &assignment),
+            simplify_with_assignment(&mut all_false, &assignment, None, Instant::now()).0,
             "expected unsat when every literal in a clause is false"
         );
 
         let mut empty: Vec<Clause> = vec![vec![]];
         assert!(
-            simplify_with_assignment(&mut empty, &assignment),
+            simplify_with_assignment(&mut empty, &assignment, None, Instant::now()).0,
             "expected unsat for an originally empty clause"
+        );
+    }
+
+    /// STAGE52.md's core mechanism: with an already-elapsed deadline (a
+    /// zero time_limit against Instant::now()), simplify_with_assignment
+    /// must report timed_out = true and leave `clauses` completely
+    /// untouched -- checked before `clauses` is ever taken, so a caller
+    /// that abandons bootstrap on timeout never observes a
+    /// partially-simplified, inconsistent clause set.
+    #[test]
+    fn test_simplify_with_assignment_reports_timed_out_without_mutating_clauses() {
+        let original = vec![vec![1, 2], vec![-1]];
+        let mut clauses = original.clone();
+        let mut assignment = assignment::new(2);
+        assignment[1] = Value::True; // would satisfy clause 0 and drop clause 1's only literal if this ran
+        let already_elapsed = Duration::from_secs(0);
+
+        let (unsat, timed_out) = simplify_with_assignment(
+            &mut clauses,
+            &assignment,
+            Some(already_elapsed),
+            Instant::now(),
+        );
+        assert!(
+            timed_out,
+            "expected timed_out = true with an already-elapsed deadline"
+        );
+        assert!(!unsat, "expected unsat = false on timeout");
+        assert_eq!(
+            clauses, original,
+            "clauses = {clauses:?}, want unchanged {original:?} (timeout must be noticed before any compaction)"
         );
     }
 

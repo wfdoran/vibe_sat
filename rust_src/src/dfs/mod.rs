@@ -154,25 +154,50 @@ fn watchers_for<'a>(
 
 /// Builds a [`WatchState`] for `clauses`, choosing for every clause
 /// two literals that are not false under `assignment`. Returns `None`
-/// if some clause has fewer than two such literals (a contradiction,
-/// given the precondition above; checked defensively rather than
-/// assumed).
-fn new_watch_state(clauses: &[Clause], assignment: &Assignment) -> Option<WatchState> {
+/// (as the first element of the pair) if some clause has fewer than
+/// two such literals (a contradiction, given the precondition above;
+/// checked defensively rather than assumed).
+///
+/// STAGE52.md: `time_limit`/`start_time` (`None`/any `Instant` meaning
+/// no limit) are checked once per clause -- see `bootstrap`'s doc
+/// comment for why this single O(clauses) pass needed the same
+/// interruptibility treatment as `preprocess::unit_propagate`. The
+/// second element of the returned pair is `true` the moment the
+/// deadline is noticed; the first element is only meaningful when it
+/// is `false`.
+fn new_watch_state(
+    clauses: &[Clause],
+    assignment: &Assignment,
+    time_limit: Option<Duration>,
+    start_time: Instant,
+) -> (Option<WatchState>, bool) {
     let mut watch = Vec::with_capacity(clauses.len());
     let mut watchers_positive = vec![Vec::new(); assignment.len()];
     let mut watchers_negative = vec![Vec::new(); assignment.len()];
     for (c, clause) in clauses.iter().enumerate() {
-        let first = choose_watch(clause, assignment, None)?;
-        let second = choose_watch(clause, assignment, Some(first))?;
+        if let Some(limit) = time_limit
+            && start_time.elapsed() >= limit
+        {
+            return (None, true);
+        }
+        let Some(first) = choose_watch(clause, assignment, None) else {
+            return (None, false);
+        };
+        let Some(second) = choose_watch(clause, assignment, Some(first)) else {
+            return (None, false);
+        };
         watch.push([first, second]);
         append_watcher(&mut watchers_positive, &mut watchers_negative, first, c);
         append_watcher(&mut watchers_positive, &mut watchers_negative, second, c);
     }
-    Some(WatchState {
-        watch,
-        watchers_positive,
-        watchers_negative,
-    })
+    (
+        Some(WatchState {
+            watch,
+            watchers_positive,
+            watchers_negative,
+        }),
+        false,
+    )
 }
 
 /// Scans `clause` for a literal that is not false under `assignment`
@@ -493,24 +518,59 @@ fn start_search<'a, R: Rng>(
 /// that) followed by initial watch state for whatever clauses survive
 /// it -- the same two-step bootstrap [`run`] always performed inline,
 /// now shared with [`parallel::run_parallel`], which needs the exact
-/// same root before branching into its BFS seeding phase. Returns
-/// `None` if this bootstrap alone already proves `problem`
-/// unsatisfiable; otherwise, the (possibly simplified) clause set and
-/// the root node.
-fn bootstrap(problem: &Problem) -> Option<(Vec<Clause>, SearchNode)> {
+/// same root before branching into its BFS seeding phase. The first
+/// element of the returned pair is `None` if this bootstrap alone
+/// already proves `problem` unsatisfiable; otherwise, the (possibly
+/// simplified) clause set and the root node. The second element is
+/// `true` if `time_limit` (`None` meaning no limit) was reached before
+/// bootstrap could finish, in which case the first element is also
+/// `None` but the caller must report `TimedOut`, not `Satisfiable:
+/// false` -- bootstrap timing out means the problem's status is
+/// genuinely unknown, not proven UNSAT.
+///
+/// STAGE52.md: previously `bootstrap` had no time-limit awareness at
+/// all (`REPORT35.md`'s own disclosed limitation, "A known, disclosed
+/// limitation") -- a single instance whose unit propagation or initial
+/// watch selection alone took longer than `time_limit` would run to
+/// completion regardless, with the search loop never getting a chance
+/// to check anything until bootstrap finished on its own. Both steps
+/// now check `time_limit`/`start_time` themselves (`unit_propagate`
+/// down to `simplify_with_assignment`'s own per-clause loop;
+/// `new_watch_state` per clause) and report a timeout promptly
+/// instead. See `reports/REPORT52.md`.
+fn bootstrap(
+    problem: &Problem,
+    time_limit: Option<Duration>,
+    start_time: Instant,
+) -> (Option<(Vec<Clause>, SearchNode)>, bool) {
     let mut clauses = problem.clauses.clone();
     let mut root_assignment = assignment::new(problem.num_vars);
-    if preprocess::unit_propagate(&mut clauses, &mut root_assignment).0 {
-        return None;
+    let (unsat, _, timed_out) =
+        preprocess::unit_propagate(&mut clauses, &mut root_assignment, time_limit, start_time);
+    if timed_out {
+        return (None, true);
     }
-    let root_watch = new_watch_state(&clauses, &root_assignment)?;
-    Some((
-        clauses,
-        SearchNode {
-            assignment: root_assignment,
-            watch: root_watch,
-        },
-    ))
+    if unsat {
+        return (None, false);
+    }
+    let (root_watch, timed_out) =
+        new_watch_state(&clauses, &root_assignment, time_limit, start_time);
+    if timed_out {
+        return (None, true);
+    }
+    let Some(root_watch) = root_watch else {
+        return (None, false);
+    };
+    (
+        Some((
+            clauses,
+            SearchNode {
+                assignment: root_assignment,
+                watch: root_watch,
+            },
+        )),
+        false,
+    )
 }
 
 /// Returns whether every variable of `x` currently has a value. Only
@@ -607,7 +667,19 @@ pub fn run<R: Rng>(
         };
     }
 
-    let Some((clauses, root)) = bootstrap(problem) else {
+    let (bootstrap_result, bootstrap_timed_out) = bootstrap(problem, time_limit, start_time);
+    if bootstrap_timed_out {
+        if verbose >= 1 {
+            println!("UNKNOWN");
+        }
+        return SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            num_nodes: 0,
+            timed_out: true,
+        };
+    }
+    let Some((clauses, root)) = bootstrap_result else {
         if verbose >= 1 {
             println!("UNSAT");
         }
@@ -987,7 +1059,9 @@ mod tests {
         let mut x = assignment::new(3);
         x[1] = Value::False;
 
-        let ws = new_watch_state(&clauses, &x).expect("expected two non-false literals");
+        let ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected two non-false literals");
         assert_eq!(ws.watch.len(), 1);
         assert!(ws.watch[0].contains(&2));
         assert!(ws.watch[0].contains(&3));
@@ -1001,14 +1075,67 @@ mod tests {
         x[1] = Value::False;
         x[2] = Value::True;
 
-        assert!(new_watch_state(&clauses, &x).is_none());
+        assert!(
+            new_watch_state(&clauses, &x, None, Instant::now())
+                .0
+                .is_none()
+        );
+    }
+
+    /// STAGE52.md's core mechanism, verified directly: with an
+    /// already-elapsed deadline (a zero time_limit against
+    /// Instant::now()), new_watch_state must report timed_out = true
+    /// before ever choosing watches for any clause -- the first element
+    /// of the returned pair must be None (timed_out and a valid
+    /// watch state are never both true).
+    #[test]
+    fn test_new_watch_state_reports_timed_out_before_second_clause() {
+        let x = assignment::new(2);
+        let clauses = vec![vec![1], vec![2]];
+        let already_elapsed = Duration::from_secs(0);
+
+        let (ws, timed_out) = new_watch_state(&clauses, &x, Some(already_elapsed), Instant::now());
+        assert!(
+            timed_out,
+            "expected timed_out = true with an already-elapsed deadline"
+        );
+        assert!(ws.is_none(), "expected None when timed_out is true");
+    }
+
+    /// STAGE52.md's core distinction, verified directly: with an
+    /// already-elapsed deadline, bootstrap must report timed_out = true
+    /// with a None result -- crucially distinct from a genuine
+    /// UNSAT-by-bootstrap result (also None, but timed_out = false),
+    /// since the two mean completely different things (unknown status
+    /// vs. proven unsatisfiable). A two-unit-clause contradiction
+    /// (which bootstrap would otherwise detect and report as None,
+    /// timed_out = false) is used deliberately, so this test would fail
+    /// loudly (wrong verdict entirely) if the timeout check were ever
+    /// skipped or misplaced after the point where the contradiction
+    /// would have been found.
+    #[test]
+    fn test_bootstrap_reports_timed_out_not_unsat() {
+        let problem = Problem {
+            num_vars: 1,
+            clauses: vec![vec![1], vec![-1]],
+        };
+        let already_elapsed = Duration::from_secs(0);
+
+        let (result, timed_out) = bootstrap(&problem, Some(already_elapsed), Instant::now());
+        assert!(
+            timed_out,
+            "expected timed_out = true with an already-elapsed deadline"
+        );
+        assert!(result.is_none(), "expected None when timed_out is true");
     }
 
     #[test]
     fn test_clone_watch_state_is_independent() {
         let clauses = vec![vec![1, 2]];
         let x = assignment::new(2);
-        let ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         let mut clone = ws.clone();
         clone.watch[0][0] = 99;
         assert_ne!(ws.watch[0][0], clone.watch[0][0]);
@@ -1018,7 +1145,9 @@ mod tests {
     fn test_bcp_moves_watch_away_from_falsified_literal() {
         let clauses = vec![vec![1, 2, 3]];
         let mut x = assignment::new(3);
-        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let mut ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         // Force the clause to watch {1, 2} explicitly, then falsify 1;
         // bcp must shed that watch onto 3 rather than forcing anything.
         ws.watch[0] = [1, 2];
@@ -1038,7 +1167,9 @@ mod tests {
     fn test_new_watch_state_populates_watcher_lists() {
         let clauses = vec![vec![1, 2, 3], vec![-1, 2, -3], vec![1, -4]];
         let x = assignment::new(4);
-        let ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         for (c, w) in ws.watch.iter().enumerate() {
             for &lit in w {
                 let v = cnf::literal_var(lit);
@@ -1077,7 +1208,9 @@ mod tests {
             vec![1, 3],    // C
         ];
         let mut x = assignment::new(7);
-        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let mut ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         assert_eq!(
             *watchers_for(&mut ws.watchers_positive, &mut ws.watchers_negative, 1),
             vec![0, 1, 2, 3],
@@ -1147,7 +1280,9 @@ mod tests {
             vec![1, 4],    // B: stays, writing into the compacted list at index 0
         ];
         let x = assignment::new(7);
-        let original = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let original = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         let original_watchers_of_1_before = original.watchers_positive[1].clone();
         assert_eq!(
             original_watchers_of_1_before,
@@ -1179,7 +1314,9 @@ mod tests {
         // (via clause {2, 3}), completing the assignment.
         let clauses = vec![vec![-1, -2], vec![2, 3]];
         let mut x = assignment::new(3);
-        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let mut ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         x[1] = Value::True;
 
         let mut trail = Vec::new();
@@ -1205,7 +1342,9 @@ mod tests {
         // precondition).
         let clauses = vec![vec![-1, -2], vec![2, 3], vec![-3, -4], vec![-3, 4]];
         let mut x = assignment::new(4);
-        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let mut ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         x[1] = Value::True;
 
         assert_eq!(bcp(&clauses, &mut ws, &mut x, 1, None), Status::Contra);
@@ -1215,7 +1354,9 @@ mod tests {
     fn test_bcp_leaves_partial_assignment_ok() {
         let clauses = vec![vec![1, 2, 3]];
         let mut x = assignment::new(3);
-        let mut ws = new_watch_state(&clauses, &x).expect("expected a valid watch state");
+        let mut ws = new_watch_state(&clauses, &x, None, Instant::now())
+            .0
+            .expect("expected a valid watch state");
         x[1] = Value::False;
 
         assert_eq!(bcp(&clauses, &mut ws, &mut x, 1, None), Status::Ok);

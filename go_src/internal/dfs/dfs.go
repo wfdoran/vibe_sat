@@ -311,22 +311,44 @@ func (s *searchState) shedFrame(deque *deque) (outcome shedOutcome, satisfyingAs
 // the same two-step bootstrap Run always performed inline, now shared
 // with RunParallel (see parallel.go), which needs the exact same root
 // before branching into its BFS seeding phase. ok is false if this
-// bootstrap alone already proves problem unsatisfiable.
-func bootstrap(problem *cnf.Problem) (clauses []cnf.Clause, root searchNode, ok bool) {
+// bootstrap alone already proves problem unsatisfiable; timedOut is
+// true if timeLimit (nil meaning no limit) was reached before
+// bootstrap could finish, in which case ok is also false but the
+// caller must report TimedOut, not Satisfiable: false -- bootstrap
+// timing out means the problem's status is genuinely unknown, not
+// proven UNSAT.
+//
+// STAGE52.md: previously bootstrap had no time-limit awareness at all
+// (REPORT35.md's own disclosed limitation, "A known, disclosed
+// limitation") -- a single instance whose unit propagation or initial
+// watch selection alone took longer than timeLimit would run to
+// completion regardless, with the search loop never getting a chance
+// to check anything until bootstrap finished on its own. Both steps
+// now check timeLimit/startTime themselves (UnitPropagate down to
+// simplifyWithAssignment's own per-clause loop; newWatchState per
+// clause below) and report timedOut promptly instead.
+func bootstrap(problem *cnf.Problem, timeLimit *time.Duration, startTime time.Time) (clauses []cnf.Clause, root searchNode, ok bool, timedOut bool) {
 	clauses = append([]cnf.Clause(nil), problem.Clauses...)
 	rootAssignment := assign.New(problem.NumVars)
-	if unsat, _ := preprocess.UnitPropagate(&clauses, rootAssignment); unsat {
-		return clauses, searchNode{}, false
+	unsat, _, propTimedOut := preprocess.UnitPropagate(&clauses, rootAssignment, timeLimit, startTime)
+	if propTimedOut {
+		return clauses, searchNode{}, false, true
 	}
-	rootWatch, foundWatch := newWatchState(clauses, rootAssignment)
+	if unsat {
+		return clauses, searchNode{}, false, false
+	}
+	rootWatch, foundWatch, watchTimedOut := newWatchState(clauses, rootAssignment, timeLimit, startTime)
+	if watchTimedOut {
+		return clauses, searchNode{}, false, true
+	}
 	if !foundWatch {
 		// Defensive: UnitPropagate above should already rule this out,
 		// since every surviving clause has at least one unassigned
 		// literal (otherwise it would have been a unit clause caught
 		// above, or a contradiction).
-		return clauses, searchNode{}, false
+		return clauses, searchNode{}, false, false
 	}
-	return clauses, searchNode{assignment: rootAssignment, watch: rootWatch}, true
+	return clauses, searchNode{assignment: rootAssignment, watch: rootWatch}, true, false
 }
 
 // allAssigned reports whether every variable of x currently has a
@@ -404,7 +426,13 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	clauses, root, ok := bootstrap(problem)
+	clauses, root, ok, bootstrapTimedOut := bootstrap(problem, timeLimit, startTime)
+	if bootstrapTimedOut {
+		if verbose >= 1 {
+			fmt.Println("UNKNOWN")
+		}
+		return Result{Satisfiable: false, TimedOut: true}
+	}
 	if !ok {
 		if verbose >= 1 {
 			fmt.Println("UNSAT")

@@ -17,9 +17,9 @@ import (
 func TestChooseWatchSkipsFalseLiterals(t *testing.T) {
 	x := assign.New(2)
 	x[1] = assign.False
-	lit, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, 0)
+	lit, _, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, 0, 0)
 	if !ok || lit != cnf.Literal(2) {
-		t.Errorf("chooseWatch() = (%v, %v), want (2, true)", lit, ok)
+		t.Errorf("chooseWatch() = (%v, _, %v), want (2, _, true)", lit, ok)
 	}
 }
 
@@ -28,9 +28,9 @@ func TestChooseWatchSkipsFalseLiterals(t *testing.T) {
 // (non-false) choice.
 func TestChooseWatchHonorsAvoid(t *testing.T) {
 	x := assign.New(2)
-	lit, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, cnf.Literal(1))
+	lit, _, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, cnf.Literal(1), 0)
 	if !ok || lit != cnf.Literal(2) {
-		t.Errorf("chooseWatch() = (%v, %v), want (2, true)", lit, ok)
+		t.Errorf("chooseWatch() = (%v, _, %v), want (2, _, true)", lit, ok)
 	}
 }
 
@@ -40,9 +40,53 @@ func TestChooseWatchFailsWhenNoneAvailable(t *testing.T) {
 	x := assign.New(2)
 	x[1] = assign.False
 	x[2] = assign.False
-	_, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, 0)
+	_, _, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, 0, 0)
 	if ok {
 		t.Errorf("chooseWatch() reported ok = true, want false")
+	}
+}
+
+// TestChooseWatchStartsFromGivenPosition verifies STAGE51.md's core
+// mechanism directly: starting the scan mid-clause finds a later
+// literal before an earlier, otherwise-equally-valid one, and reports
+// the position right after the one it found.
+func TestChooseWatchStartsFromGivenPosition(t *testing.T) {
+	x := assign.New(4)
+	clause := cnf.Clause{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3), cnf.Literal(4)}
+	lit, nextPos, ok := chooseWatch(clause, x, 0, 2)
+	if !ok || lit != cnf.Literal(3) || nextPos != 3 {
+		t.Errorf("chooseWatch(start=2) = (%v, %v, %v), want (3, 3, true)", lit, nextPos, ok)
+	}
+}
+
+// TestChooseWatchWrapsAroundFromGivenPosition verifies that starting
+// mid-clause still finds a valid literal earlier in the clause via
+// wraparound, rather than missing it just because the scan started
+// past it -- the correctness property that makes remembering a
+// position across calls safe in the first place.
+func TestChooseWatchWrapsAroundFromGivenPosition(t *testing.T) {
+	x := assign.New(4)
+	x[3] = assign.False
+	x[4] = assign.False
+	clause := cnf.Clause{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3), cnf.Literal(4)}
+	lit, nextPos, ok := chooseWatch(clause, x, cnf.Literal(1), 2)
+	if !ok || lit != cnf.Literal(2) || nextPos != 2 {
+		t.Errorf("chooseWatch(start=2, avoid=1) = (%v, %v, %v), want (2, 2, true) (found at index 1, after wrapping past index 2 (literal 3, false), index 3 (literal 4, false), and index 0 (literal 1, avoided))", lit, nextPos, ok)
+	}
+}
+
+// TestChooseWatchFailsWhenNoneAvailableFromGivenPosition mirrors
+// TestChooseWatchFailsWhenNoneAvailable, starting mid-clause: every
+// literal in the whole clause is still examined exactly once via
+// wraparound, so "none available" must still be reported correctly
+// regardless of start.
+func TestChooseWatchFailsWhenNoneAvailableFromGivenPosition(t *testing.T) {
+	x := assign.New(2)
+	x[1] = assign.False
+	x[2] = assign.False
+	_, _, ok := chooseWatch(cnf.Clause{cnf.Literal(1), cnf.Literal(2)}, x, 0, 1)
+	if ok {
+		t.Errorf("chooseWatch(start=1) reported ok = true, want false")
 	}
 }
 
@@ -54,9 +98,63 @@ func TestNewSolverDetectsBootstrapContradiction(t *testing.T) {
 		NumVars: 1,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
 	}
-	_, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	_, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if ok {
 		t.Errorf("newSolver() reported ok = true for a contradictory unit-clause pair")
+	}
+}
+
+// TestNewSolverReportsTimedOutNotUnsat verifies STAGE52.md's core
+// distinction directly: with an already-elapsed deadline, newSolver
+// must report timedOut = true and ok = false -- crucially distinct
+// from a genuine UNSAT-by-bootstrap result (also ok = false, but
+// timedOut = false), since the two mean completely different things
+// (unknown status vs. proven unsatisfiable). A two-unit-clause
+// contradiction (which newSolver would otherwise detect and report as
+// ok = false, timedOut = false, exactly like
+// TestNewSolverDetectsBootstrapContradiction above) is used
+// deliberately, so this test would fail loudly if the timeout check
+// were ever skipped or checked too late.
+func TestNewSolverReportsTimedOutNotUnsat(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 1,
+		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
+	}
+	alreadyElapsed := time.Duration(0)
+
+	s, ok, timedOut := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, &alreadyElapsed, time.Now())
+	if !timedOut {
+		t.Fatal("expected timedOut = true with an already-elapsed deadline")
+	}
+	if ok {
+		t.Error("expected ok = false when timedOut is true")
+	}
+	if s != nil {
+		t.Errorf("expected a nil solver on timeout, got %v", s)
+	}
+}
+
+// TestRunLoopReportsTimedOutWhenBootstrapTimesOut verifies that
+// runLoop, given a timeLimit already exhausted before bootstrap can
+// finish, returns Result{TimedOut: true} rather than
+// Result{Satisfiable: false} -- the latter would falsely claim a
+// proof of unsatisfiability for a problem whose status is genuinely
+// unknown. Mirrors TestNewSolverReportsTimedOutNotUnsat's
+// contradiction setup, at the Run-level boundary this time.
+func TestRunLoopReportsTimedOutWhenBootstrapTimesOut(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 1,
+		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
+	}
+	alreadyElapsed := time.Duration(0)
+
+	result := runLoop(problem, &alreadyElapsed, SelectVarWeighted, RestartNone, nil, nil, nil, nil, nil, params.Default().CDCL, PhaseSaving)
+
+	if !result.TimedOut {
+		t.Fatal("expected Result.TimedOut = true when bootstrap itself exhausts the time limit")
+	}
+	if result.Satisfiable {
+		t.Error("a timed-out result must not claim Satisfiable")
 	}
 }
 
@@ -68,7 +166,7 @@ func TestPropagatePropagatesUnitChain(t *testing.T) {
 		NumVars: 3,
 		Clauses: []cnf.Clause{{cnf.Literal(-1), cnf.Literal(-2)}, {cnf.Literal(2), cnf.Literal(3)}},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -117,7 +215,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-4)},
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -153,7 +251,7 @@ func TestAnalyzeDerivesUnitClauseIndependentOfDecision(t *testing.T) {
 // directly) -- so -2 must be redundant.
 func TestLiteralRedundantDirectCase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -182,7 +280,7 @@ func TestLiteralRedundantRecursiveCase(t *testing.T) {
 			{cnf.Literal(3), cnf.Literal(1)},
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -202,7 +300,7 @@ func TestLiteralRedundantRecursiveCase(t *testing.T) {
 // a decision variable (no reason) that isn't otherwise accounted for.
 func TestLiteralRedundantBlockedByUncoveredDecision(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -226,7 +324,7 @@ func TestLiteralRedundantBlockedByUncoveredDecision(t *testing.T) {
 // exhausted, rather than panicking or ignoring the budget entirely.
 func TestLiteralRedundantRespectsZeroWorkBudget(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -261,7 +359,7 @@ func TestAnalyzeMinimizesLearnedClause(t *testing.T) {
 			{cnf.Literal(-1), cnf.Literal(5)},                   // 3: reason for var 5
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -297,7 +395,7 @@ func TestAnalyzeMinimizesLearnedClause(t *testing.T) {
 // none: it becomes a permanent level-0 fact instead).
 func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -318,7 +416,7 @@ func TestAddLearnedClauseSkipsWatchesForUnitClause(t *testing.T) {
 // highest decision level.
 func TestAddLearnedClauseWatchesAssertingLiteralAndHighestLevel(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -468,7 +566,7 @@ func TestClauseByteCost(t *testing.T) {
 // lists) must still be correct afterward.
 func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 5, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -519,7 +617,7 @@ func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 // panic) when every learned clause is currently locked.
 func TestReduceClauseDatabaseNoOpWhenNothingEligible(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -594,7 +692,7 @@ func TestRunWithMemoryLimitStillFindsSatisfiableFormula(t *testing.T) {
 // the rest, ignoring ties in favor of whichever it finds first.
 func TestSelectVarByActivityPicksHighestScoringUnassignedVariable(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarVsids, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarVsids, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -622,7 +720,7 @@ func TestAnalyzeBumpsVsidsActivity(t *testing.T) {
 			{cnf.Literal(-2), cnf.Literal(-4)},
 		},
 	}
-	s, ok := newSolver(problem, nil, SelectVarVsids, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarVsids, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -652,7 +750,7 @@ func TestAnalyzeBumpsVsidsActivity(t *testing.T) {
 // out), and its participated counter should reset to 0.
 func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -683,7 +781,7 @@ func TestBacktrackToUpdatesLrbQ(t *testing.T) {
 // and both counters must reset to 0 afterward.
 func TestBacktrackToUpdatesLrbQIncludesReasonedBonus(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -735,7 +833,7 @@ func TestPropagateBumpsLrbReasonSide(t *testing.T) {
 		{1, 2, 3},
 		{6, 1, 3},
 	}}
-	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -788,7 +886,7 @@ func TestLearnAndBackjumpDecaysLrbAlpha(t *testing.T) {
 		{cnf.Literal(-2), cnf.Literal(4)},
 		{cnf.Literal(-2), cnf.Literal(-4)},
 	}}
-	s, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -815,7 +913,7 @@ func TestLearnAndBackjumpDecaysLrbAlpha(t *testing.T) {
 	// just above the floor (less than one full step away), verifies
 	// learnAndBackjump's own clamp -- not a duplicate of its
 	// arithmetic -- via the same real conflict trace.
-	s2, ok := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving)
+	s2, ok, _ := newSolver(problem, nil, SelectVarLrb, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -840,7 +938,7 @@ func TestLearnAndBackjumpDecaysLrbAlpha(t *testing.T) {
 // variant.
 func TestBacktrackToSavesPhase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -864,7 +962,7 @@ func TestBacktrackToSavesPhase(t *testing.T) {
 // variable) must assign it True, not False.
 func TestDecideGuessesSavedPhase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarFast, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarFast, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -883,7 +981,7 @@ func TestDecideGuessesSavedPhase(t *testing.T) {
 // decision order.
 func TestDecideDefaultsToFalseWithNoSavedPhase(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarFast, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarFast, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1018,7 +1116,7 @@ func TestRestartThresholdGeometric(t *testing.T) {
 // regardless of how many conflicts have accumulated.
 func TestMaybeRestartIsNoOpForRestartNone(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1042,7 +1140,7 @@ func TestMaybeRestartIsNoOpForRestartNone(t *testing.T) {
 // restart untouched, per STAGE15.md's explicit requirement.
 func TestMaybeRestartTriggersAtThresholdAndResets(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartLuby, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartLuby, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1143,7 +1241,7 @@ func TestRunWithRestartsStillFindsSatisfiableFormula(t *testing.T) {
 // remaining, non-glue-eligible clauses -- is deleted instead.
 func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 6, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1182,7 +1280,7 @@ func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
 // the primary sort key, activity only a tiebreak among equal LBDs.
 func TestReduceClauseDatabaseSortsByLBDBeforeActivity(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1216,7 +1314,7 @@ func TestReduceClauseDatabaseSortsByLBDBeforeActivity(t *testing.T) {
 // match a hand-computed recentAvg*glucoseK >= globalAvg comparison.
 func TestGlucoseShouldRestart(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 1, Clauses: nil}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartGlucose, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1273,7 +1371,7 @@ func TestGlucoseShouldRestart(t *testing.T) {
 // root anyway.
 func TestMaybeRestartDoesNotPanicAtRootLevel(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartGlucose, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartGlucose, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}

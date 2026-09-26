@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
@@ -42,9 +43,23 @@ import (
 // the real dominant cost behind that specific 42.65-second
 // measurement. See reports/REPORT35.md for the full before/after
 // numbers.
-func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment) (unsat bool) {
+//
+// STAGE52.md: timeLimit/startTime (nil/zero meaning no limit, the same
+// convention dfs.go/cdcl.go's own search loops already use) let a
+// caller doing time-bounded bootstrap work bail out mid-scan rather
+// than running this whole clause set to completion regardless of how
+// long that takes -- see UnitPropagate's own doc comment for why this
+// was previously the one part of a time-limited run that couldn't be
+// interrupted at all. Checked unconditionally, once per clause,
+// matching STAGE35.md's own established finding that a raw clock
+// check's overhead (~14ns) is unmeasurable next to real per-clause
+// work.
+func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment, timeLimit *time.Duration, startTime time.Time) (unsat bool, timedOut bool) {
 	kept := (*clauses)[:0]
 	for _, clause := range *clauses {
+		if timeLimit != nil && time.Since(startTime) >= *timeLimit {
+			return false, true
+		}
 		var reduced cnf.Clause // lazily allocated; nil means "clause unchanged so far"
 		satisfied := false
 		for i, lit := range clause {
@@ -78,18 +93,18 @@ func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment)
 			// unassigned literals, unchanged -- keep the original slice,
 			// no allocation needed.
 			if len(clause) == 0 {
-				return true
+				return true, false
 			}
 			kept = append(kept, clause)
 			continue
 		}
 		if len(reduced) == 0 {
-			return true
+			return true, false
 		}
 		kept = append(kept, reduced)
 	}
 	*clauses = kept
-	return false
+	return false, false
 }
 
 // UnitPropagate repeatedly finds a clause with exactly one unassigned
@@ -98,14 +113,35 @@ func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment)
 // until no clause is a unit clause or a contradiction is found. It
 // returns whether a contradiction was found, and how many variables
 // were newly fixed.
-func UnitPropagate(clauses *[]cnf.Clause, assignment assign.Assignment) (unsat bool, numFixed int) {
+//
+// STAGE52.md: timeLimit/startTime (nil/zero meaning no limit) are
+// threaded straight through to simplifyWithAssignment, and also
+// checked once per clause in the unit-clause-finding loop below --
+// every call site that needs unbounded behavior (preprocess.Run's own
+// pipeline, which is not currently time-limited at all -- see the
+// package doc comment) simply passes nil/the zero time.Time, which is
+// exactly the previous, unconditional behavior. Callers doing
+// time-bounded bootstrap work (dfs.bootstrap, cdcl.newSolver) instead
+// get a real, prompt exit: timedOut is true the moment either loop
+// notices the deadline has passed, mid-round if necessary, rather than
+// only between whole rounds -- this was previously the one part of a
+// time-limited run that could not be interrupted at all once started
+// (REPORT35.md's own disclosed limitation).
+func UnitPropagate(clauses *[]cnf.Clause, assignment assign.Assignment, timeLimit *time.Duration, startTime time.Time) (unsat bool, numFixed int, timedOut bool) {
 	for {
-		if unsat := simplifyWithAssignment(clauses, assignment); unsat {
-			return true, numFixed
+		clausesUnsat, propTimedOut := simplifyWithAssignment(clauses, assignment, timeLimit, startTime)
+		if propTimedOut {
+			return false, numFixed, true
+		}
+		if clausesUnsat {
+			return true, numFixed, false
 		}
 
 		foundUnit := false
 		for _, clause := range *clauses {
+			if timeLimit != nil && time.Since(startTime) >= *timeLimit {
+				return false, numFixed, true
+			}
 			if len(clause) != 1 {
 				continue
 			}
@@ -119,7 +155,7 @@ func UnitPropagate(clauses *[]cnf.Clause, assignment assign.Assignment) (unsat b
 			foundUnit = true
 		}
 		if !foundUnit {
-			return false, numFixed
+			return false, numFixed, false
 		}
 	}
 }
@@ -165,8 +201,11 @@ func eliminatePureLiterals(clauses *[]cnf.Clause, assignment assign.Assignment) 
 		// Fixing a pure literal can only satisfy clauses (it never
 		// introduces a new false literal elsewhere, since the
 		// variable never appears with the opposite polarity), so this
-		// cannot discover a contradiction.
-		_ = simplifyWithAssignment(clauses, assignment)
+		// cannot discover a contradiction. Not time-limited (nil/zero):
+		// eliminatePureLiterals is only ever called from
+		// preprocess.Run's own pipeline, which has no time-limit
+		// awareness at all yet -- see the package doc comment.
+		_, _ = simplifyWithAssignment(clauses, assignment, nil, time.Time{})
 	}
 }
 

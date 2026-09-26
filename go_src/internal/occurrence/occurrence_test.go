@@ -3,6 +3,7 @@ package occurrence
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"vibe_sat/internal/cnf"
 )
@@ -69,5 +70,33 @@ func TestBuildEmptyProblem(t *testing.T) {
 	lists := Build(problem)
 	if len(lists.Positive) != 3 || len(lists.Negative) != 3 {
 		t.Fatalf("expected lists sized for 2 variables (+1), got Positive len %d, Negative len %d", len(lists.Positive), len(lists.Negative))
+	}
+}
+
+// TestBuildWithDeadlineReportsTimedOutBeforeFirstClause verifies
+// STAGE52.md's core mechanism: with an already-elapsed deadline (a
+// zero timeLimit against any startTime), BuildWithDeadline must report
+// timedOut = true before scanning even the first clause -- the
+// deadline check runs at the top of each iteration, before that
+// clause's own literals are recorded.
+func TestBuildWithDeadlineReportsTimedOutBeforeFirstClause(t *testing.T) {
+	problem := &cnf.Problem{
+		NumVars: 2,
+		Clauses: []cnf.Clause{
+			{cnf.Literal(1)},
+			{cnf.Literal(2)},
+		},
+	}
+	alreadyElapsed := time.Duration(0)
+
+	lists, timedOut := BuildWithDeadline(problem, &alreadyElapsed, time.Now())
+	if !timedOut {
+		t.Fatal("expected timedOut = true with an already-elapsed deadline")
+	}
+	if len(lists.Positive[1]) != 0 {
+		t.Errorf("Positive[1] = %v, want empty (deadline noticed before the first clause was even scanned)", lists.Positive[1])
+	}
+	if len(lists.Positive[2]) != 0 {
+		t.Errorf("Positive[2] = %v, want empty", lists.Positive[2])
 	}
 }

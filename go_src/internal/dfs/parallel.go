@@ -181,7 +181,13 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	clauses, root, ok := bootstrap(problem)
+	clauses, root, ok, bootstrapTimedOut := bootstrap(problem, timeLimit, startTime)
+	if bootstrapTimedOut {
+		if verbose >= 1 {
+			fmt.Println("UNKNOWN")
+		}
+		return Result{Satisfiable: false, TimedOut: true}
+	}
 	if !ok {
 		if verbose >= 1 {
 			fmt.Println("UNSAT")

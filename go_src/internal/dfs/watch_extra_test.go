@@ -3,6 +3,7 @@ package dfs
 import (
 	"slices"
 	"testing"
+	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
@@ -18,7 +19,7 @@ func TestNewWatchStatePopulatesWatcherLists(t *testing.T) {
 		{1, 2, 3}, {-1, 2, -3}, {1, -4},
 	}
 	x := assign.New(4)
-	ws, ok := newWatchState(clauses, x)
+	ws, ok, _ := newWatchState(clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatal("newWatchState reported ok = false unexpectedly")
 	}
@@ -52,7 +53,7 @@ func TestBCPWatcherListCompaction(t *testing.T) {
 		{1, 3},    // C
 	}
 	x := assign.New(7)
-	ws, ok := newWatchState(clauses, x)
+	ws, ok, _ := newWatchState(clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatal("newWatchState reported ok = false unexpectedly")
 	}
@@ -113,7 +114,7 @@ func TestCloneWatchStateWatcherListsAreIndependent(t *testing.T) {
 		{1, 4},    // B: stays, writing into the compacted list at index 0
 	}
 	x := assign.New(7)
-	original, ok := newWatchState(clauses, x)
+	original, ok, _ := newWatchState(clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatal("newWatchState reported ok = false unexpectedly")
 	}

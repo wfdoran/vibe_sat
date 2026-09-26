@@ -179,11 +179,11 @@ func (s *solver) maybeImport() {
 // some other thread) is likely to keep it available, and this thread
 // will pick it up on a later check once its own trail has changed.
 func (s *solver) importClause(lits cnf.Clause) {
-	first, foundFirst := chooseWatch(lits, s.x, 0)
+	first, _, foundFirst := chooseWatch(lits, s.x, 0, 0)
 	if !foundFirst {
 		return
 	}
-	second, foundSecond := chooseWatch(lits, s.x, first)
+	second, _, foundSecond := chooseWatch(lits, s.x, first, 0)
 	if !foundSecond {
 		return
 	}
@@ -193,6 +193,7 @@ func (s *solver) importClause(lits cnf.Clause) {
 	s.clauses = append(s.clauses, clause)
 	s.clauseActivity = append(s.clauseActivity, 0.0)
 	s.clauseLBD = append(s.clauseLBD, len(clause))
+	s.chooseWatchPos = append(s.chooseWatchPos, 0)
 	s.estimatedBytes += clauseByteCost(clause)
 	for _, lit := range clause {
 		v := lit.Var()

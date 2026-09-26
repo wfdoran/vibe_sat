@@ -16,6 +16,7 @@ package preprocess
 
 import (
 	"fmt"
+	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
@@ -117,6 +118,21 @@ type Stats struct {
 // elimination) remains single-threaded regardless of numThreads; see
 // REPORT25.md for why BVE in particular was not also threaded this
 // stage.
+//
+// STAGE52.md: unlike dfs.bootstrap/cdcl.newSolver's own defensive
+// UnitPropagate call (now interruptible -- see UnitPropagate's doc
+// comment), Run itself is called from cmd/vibe_sat/main.go entirely
+// outside of --time-limit-secs's scope (before either algorithm's own
+// startTime is even captured), so it passes nil/the zero time.Time
+// everywhere it calls UnitPropagate/simplifyWithAssignment -- the same
+// unconditional, run-to-completion behavior as before this stage. This
+// is a real, disclosed, un-addressed gap this stage's investigation
+// surfaced but did not fix (a materially bigger change, since it would
+// mean adding time-limit awareness to subsumption/BVE too, both of
+// which already have their own separate work-budget safety caps -- see
+// reports/REPORT52.md); STAGE52.md's own scope, following REPORT35.md's
+// "known, disclosed limitation" wording exactly, is the narrower
+// bootstrap path each algorithm runs on its own, not this pipeline.
 func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess) *Result {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	assignment := assign.New(problem.NumVars)
@@ -132,7 +148,7 @@ func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess)
 	for round := 0; round < maxRounds; round++ {
 		changed := false
 
-		unsat, unitsFixed := UnitPropagate(&clauses, assignment)
+		unsat, unitsFixed, _ := UnitPropagate(&clauses, assignment, nil, time.Time{})
 		stats.UnitsPropagated += unitsFixed
 		if unsat {
 			return &Result{OriginalNumVars: problem.NumVars, Unsat: true, Stats: stats}

@@ -682,6 +682,12 @@ type solver struct {
 	watch   [][2]cnf.Literal
 	lists   *occurrence.Lists
 
+	// chooseWatchPos[c] (STAGE51.md) is the clause index c's remembered
+	// starting position for chooseWatch's next scan, parallel to
+	// clauses/watch: see chooseWatch's own doc comment for why starting
+	// from here instead of always index 0 is worth doing.
+	chooseWatchPos []int
+
 	// watchersPositive[v]/watchersNegative[v] (STAGE45.md) hold the
 	// indices of clauses *currently* watching literal +v/-v -- i.e.
 	// clauses c where watch[c][0] or watch[c][1] equals that literal
@@ -959,12 +965,32 @@ func (s *solver) watchersFor(lit cnf.Literal) *[]int {
 // means unbounded. variant is the SelectVar heuristic to use
 // (STAGE13.md). restartStrategy is the restart schedule to use
 // (STAGE15.md). ok is false if this bootstrap alone already proves
-// problem unsatisfiable.
-func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy, p params.CDCL, phaseStrategy PhaseStrategy) (s *solver, ok bool) {
+// problem unsatisfiable; timedOut is true if timeLimit (nil meaning no
+// limit) was reached before bootstrap could finish, in which case ok
+// is also false but the caller must report TimedOut, not
+// Satisfiable: false -- bootstrap timing out means the problem's
+// status is genuinely unknown, not proven UNSAT.
+//
+// STAGE52.md: previously newSolver had no time-limit awareness at all
+// (REPORT35.md's own disclosed limitation, "A known, disclosed
+// limitation") -- a single instance whose unit propagation, initial
+// watch selection, or occurrence index construction alone took longer
+// than timeLimit would run to completion regardless, with the search
+// loop never getting a chance to check anything until bootstrap
+// finished on its own. All three steps now check timeLimit/startTime
+// themselves (UnitPropagate down to simplifyWithAssignment's own
+// per-clause loop; the watch-selection loop and
+// occurrence.BuildWithDeadline both per clause) and report timedOut
+// promptly instead.
+func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarVariant, restartStrategy RestartStrategy, p params.CDCL, phaseStrategy PhaseStrategy, timeLimit *time.Duration, startTime time.Time) (s *solver, ok bool, timedOut bool) {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	x := assign.New(problem.NumVars)
-	if unsat, _ := preprocess.UnitPropagate(&clauses, x); unsat {
-		return nil, false
+	propUnsat, _, propTimedOut := preprocess.UnitPropagate(&clauses, x, timeLimit, startTime)
+	if propTimedOut {
+		return nil, false, true
+	}
+	if propUnsat {
+		return nil, false, false
 	}
 
 	watch := make([][2]cnf.Literal, len(clauses))
@@ -972,18 +998,26 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 	watchersNegative := make([][]int, problem.NumVars+1)
 	var estimatedBytes int64
 	for c, clause := range clauses {
-		first, foundFirst := chooseWatch(clause, x, 0)
-		if !foundFirst {
-			return nil, false
+		if timeLimit != nil && time.Since(startTime) >= *timeLimit {
+			return nil, false, true
 		}
-		second, foundSecond := chooseWatch(clause, x, first)
+		first, _, foundFirst := chooseWatch(clause, x, 0, 0)
+		if !foundFirst {
+			return nil, false, false
+		}
+		second, _, foundSecond := chooseWatch(clause, x, first, 0)
 		if !foundSecond {
-			return nil, false
+			return nil, false, false
 		}
 		watch[c] = [2]cnf.Literal{first, second}
 		appendWatcher(watchersPositive, watchersNegative, first, c)
 		appendWatcher(watchersPositive, watchersNegative, second, c)
 		estimatedBytes += clauseByteCost(clause)
+	}
+
+	lists, listsTimedOut := occurrence.BuildWithDeadline(&cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}, timeLimit, startTime)
+	if listsTimedOut {
+		return nil, false, true
 	}
 
 	reason := make([]int, problem.NumVars+1)
@@ -1000,9 +1034,10 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		numVars:                 problem.NumVars,
 		clauses:                 clauses,
 		watch:                   watch,
+		chooseWatchPos:          make([]int, len(clauses)),
 		watchersPositive:        watchersPositive,
 		watchersNegative:        watchersNegative,
-		lists:                   occurrence.Build(&cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}),
+		lists:                   lists,
 		numOriginalClauses:      len(clauses),
 		clauseActivity:          make([]float64, len(clauses)),
 		clauseActivityIncrement: 1.0,
@@ -1030,7 +1065,7 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		minState:                make([]byte, problem.NumVars+1),
 		params:                  p,
 		lbdRecentBuf:            make([]int, p.GlucoseWindowSize),
-	}, true
+	}, true, false
 }
 
 // Run performs a CDCL search: repeatedly propagate, and on a
@@ -1220,7 +1255,10 @@ func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVa
 		return Result{Satisfiable: satisfiable, Assignment: assign.New(0)}
 	}
 
-	s, ok := newSolver(problem, memoryLimitBytes, variant, restartStrategy, p, phaseStrategy)
+	s, ok, bootstrapTimedOut := newSolver(problem, memoryLimitBytes, variant, restartStrategy, p, phaseStrategy, timeLimit, startTime)
+	if bootstrapTimedOut {
+		return Result{TimedOut: true}
+	}
 	if !ok {
 		return Result{Satisfiable: false}
 	}
@@ -1478,6 +1516,14 @@ func (s *solver) assignLiteral(lit cnf.Literal, level int, reason int) {
 // the paper's "reason side rate" bonus -- see bumpReasonSide's own doc
 // comment for why this lives here rather than in analyze.
 //
+// STAGE51.md: chooseWatch's own call below now passes
+// s.chooseWatchPos[c] as its starting scan position, rather than
+// always 0, and stores back whatever position it returns -- see
+// chooseWatch's own doc comment for why remembering this across calls
+// is worth doing, once REPORT47.md's re-profile (following STAGE45.md's
+// fix above) confirmed chooseWatch itself, not propagate's own
+// candidate discovery, is now the dominant remaining cost.
+//
 // The scan below is MiniSat's own standard in-place compaction
 // pattern, adapted to Go: since a clause whose watch moves away
 // (chooseWatch found a replacement) must be removed from this
@@ -1542,7 +1588,8 @@ func (s *solver) propagate() int {
 				continue scan
 			}
 
-			if replacement, found := chooseWatch(s.clauses[c], s.x, otherWatch); found {
+			if replacement, nextPos, found := chooseWatch(s.clauses[c], s.x, otherWatch, s.chooseWatchPos[c]); found {
+				s.chooseWatchPos[c] = nextPos
 				watch[falsifiedSlot] = replacement
 				*s.watchersFor(replacement) = append(*s.watchersFor(replacement), c)
 				continue scan
@@ -2283,6 +2330,7 @@ func (s *solver) addLearnedClause(learned cnf.Clause, lbd int) int {
 	s.clauses = append(s.clauses, learned)
 	s.clauseActivity = append(s.clauseActivity, 0.0)
 	s.clauseLBD = append(s.clauseLBD, lbd)
+	s.chooseWatchPos = append(s.chooseWatchPos, 0)
 	s.estimatedBytes += clauseByteCost(learned)
 	for _, lit := range learned {
 		v := lit.Var()
@@ -2400,6 +2448,11 @@ func (s *solver) reduceClauseDatabase() {
 	s.watch = newWatch
 	s.clauseActivity = newActivity
 	s.clauseLBD = newLBD
+	// chooseWatchPos is just a heuristic hint (see chooseWatch's doc
+	// comment), never required for correctness, so a fresh all-zero
+	// slice is simplest and safe -- no need to carry surviving clauses'
+	// old positions through the oldToNew remap.
+	s.chooseWatchPos = make([]int, len(newClauses))
 	s.lists = occurrence.Build(&cnf.Problem{NumVars: s.numVars, Clauses: newClauses})
 
 	// STAGE45.md: watchersPositive/watchersNegative index by clause
@@ -2426,22 +2479,52 @@ func (s *solver) reduceClauseDatabase() {
 	}
 }
 
-// chooseWatch scans clause for a literal that is not false under
-// assignment and is not equal to avoid (0 is never a valid literal,
-// so passing 0 imposes no exclusion). Identical in spirit to
-// STAGE9.md's dfs/watch.go helper of the same name; duplicated here
-// (rather than exported from internal/dfs) since STAGE11.md asks that
-// dfs be left as it is.
-func chooseWatch(clause cnf.Clause, assignment assign.Assignment, avoid cnf.Literal) (cnf.Literal, bool) {
-	for _, lit := range clause {
-		if lit == avoid {
+// chooseWatch scans clause, starting at index start and wrapping
+// around circularly, for a literal that is not false under assignment
+// and is not equal to avoid (0 is never a valid literal, so passing 0
+// imposes no exclusion). Returns the chosen literal, the index right
+// after it (mod len(clause)) for the caller to remember as this
+// clause's next start position (see chooseWatchPos), and whether a
+// replacement was found at all. Every one of clause's literals is
+// still examined at most once regardless of start, so correctness
+// doesn't depend on start being any particular value -- passing 0
+// always works, exactly like the STAGE9.md/STAGE11.md dfs/watch.go
+// helper of the same name this was originally identical to.
+//
+// STAGE51.md: starting from a remembered position rather than always
+// index 0 is a real, standard MiniSat-lineage technique
+// (REPORT47.md's own recommendation, after profiling repeatedly named
+// this function the dominant cost once STAGE45.md fixed propagate's
+// candidate discovery -- see REPORT41.md/REPORT45.md/REPORT47.md). A
+// long-lived clause whose early literals became false long ago and
+// have stayed that way would otherwise have those same literals
+// re-examined, and rejected, on every single call for as long as they
+// remain false -- wasted work that grows with how often the clause's
+// watches move, not with anything about the search itself. Starting
+// from wherever the last scan left off spreads that cost out instead
+// of concentrating it on the clause's own first few literals; the
+// wraparound guarantees no candidate is ever skipped just because of
+// where the scan happened to start.
+func chooseWatch(clause cnf.Clause, assignment assign.Assignment, avoid cnf.Literal, start int) (lit cnf.Literal, nextPos int, found bool) {
+	n := len(clause)
+	for i := 0; i < n; i++ {
+		idx := start + i
+		if idx >= n {
+			idx -= n
+		}
+		candidate := clause[idx]
+		if candidate == avoid {
 			continue
 		}
-		if !isFalse(lit, assignment) {
-			return lit, true
+		if !isFalse(candidate, assignment) {
+			next := idx + 1
+			if next >= n {
+				next = 0
+			}
+			return candidate, next, true
 		}
 	}
-	return 0, false
+	return 0, start, false
 }
 
 // isFalse reports whether lit currently evaluates to false under

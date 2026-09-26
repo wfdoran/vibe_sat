@@ -204,6 +204,15 @@ Scratch files (the 25-file working copy, cleaned trailer-stripped
 copies, the comparison script, raw timing output) lived entirely
 outside the repository and were not committed.
 
+**Addendum (`STAGE52.md`)**: `benchmark/uf250-1065/uf250-03.cnf`
+regressed noticeably under `STAGE51.md`'s `chooseWatch` scan-position
+fix (`REPORT51.md`'s own disclosed per-file variance) and was not
+already part of this stage's 25-file set (the sole 250-variable SAT
+representative here is `uf250-0100.cnf`). Added to the standing list
+for whenever this comparison is next re-run, so a future `minisat`/
+`cryptominisat5` sweep picks it up alongside the original 25 rather
+than needing this noted again.
+
 ## Questions for you
 
 - `minisat`'s and `cryptominisat5`'s edge shows up most clearly on

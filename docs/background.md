@@ -178,6 +178,33 @@ didn't change between `STAGE23.md` and `STAGE48.md` — what it was
 being measured against did, and that's the entire reason the same idea
 went from a rejected regression to a clear win.
 
+### `chooseWatch`'s remembered scan position
+
+`STAGE48.md`'s own fix left `chooseWatch` itself as the largest single
+remaining cost (`REPORT48.md`'s profile put it at ~49.6%). `STAGE51.md`
+applies the other real, standard MiniSat-lineage optimization to it: a
+per-clause remembered scan position (`chooseWatchPos`/
+`choose_watch_pos`), so the search for a replacement watch resumes from
+wherever the *previous* search for that clause left off, wrapping
+around circularly, rather than always restarting from the clause's
+first literal. A long-lived clause whose early literals became false
+long ago and stayed that way would otherwise have those same literals
+re-examined and rejected on every single call for as long as they
+remain false; starting from a rotating offset spreads that cost out
+instead of concentrating it on the clause's own first few literals,
+with wraparound guaranteeing no candidate is ever skipped regardless of
+where the scan starts. Measured directly: `chooseWatch`'s own share of
+a fresh profile dropped from 49.6% to 23.5% cumulative, ~34% faster on
+the standing hard benchmark instance in both languages, and a 176-file
+correctness/timing sweep found 0 verify failures, 0 cross-language
+mismatches, and four previously-timed-out files now solved within the
+same time budget. See `reports/REPORT51.md` for the full numbers,
+including the honest caveat that a few individual files got measurably
+*slower* — an expected consequence of changing watch-move order (and
+therefore propagation order) shifting CDCL's search trajectory, the
+same phenomenon `REPORT45.md`/`REPORT46.md` already documented for the
+watch-list rewrite itself.
+
 ## WalkSAT
 
 `--algorithm=ws` is entirely different in spirit from `dfs`/`cdcl`: no
@@ -245,6 +272,59 @@ been guessed as the likely bottleneck — responsible for the vast
 majority of that time, simply because its cost grows with the
 *square* of the clause count. Subsumption elimination now uses
 multiple threads (`--num-threads`) for exactly this reason.
+
+## Time limits and bootstrap interruptibility
+
+`--time-limit-secs` is checked unconditionally on every single node
+(`dfs`) or decision/conflict (`cdcl`) — a fixed periodic interval
+(`STAGE35.md` removed the last one, a "check every 4096 steps"
+bitmask) can't bound overrun in general, since no interval is both
+small enough for expensive steps and large enough to stay a cheap
+amortization for cheap ones. `REPORT29.md` measured this failing badly
+on a real, large industrial instance before the fix: a 3-second
+request blew its budget to 42.65 seconds.
+
+`STAGE35.md`'s own investigation found that overrun wasn't really
+about the check interval at all: the dominant cost was `newSolver`'s
+bootstrap step (a defensive round of unit propagation plus initial
+watch selection, needed even with `--no-preprocessing` off, since a
+fresh solver always re-verifies its starting state) hitting an
+allocation bug, fixed at the time. What that investigation explicitly
+left unfixed, and disclosed as a known limitation: **bootstrap itself
+had no time-limit awareness of any kind** — `UnitPropagate`, the
+initial watch-selection loop, and `occurrence.Build` all ran to
+completion regardless of how long that took, with the search loop
+never getting a chance to check the clock until bootstrap finished on
+its own.
+
+`STAGE52.md` closes that gap: all three now check `--time-limit-secs`
+themselves (`UnitPropagate` down to its own per-clause loop, so a
+timeout is noticed mid-scan, not just between whole propagation
+rounds), reporting a genuine three-way outcome — *ok* (bootstrap
+finished normally), *unsat* (bootstrap alone proved the problem
+unsatisfiable), or *timed out* (the deadline passed before bootstrap
+could finish, so the problem's status is genuinely unknown) — rather
+than the two-way "ok or not" bootstrap previously reported, which had
+no way to represent "don't know" at all. Measured directly on the
+exact file `REPORT29.md`/`REPORT35.md` used (a 1.5M-variable,
+6.3M-clause industrial instance, `--no-preprocessing
+--time-limit-secs=3`): wall-clock time dropped from ~11.8s to ~4.2s for
+both `cdcl` and `dfs` — the remaining ~1.2s over budget is CNF parsing
+and problem setup, which happen before either algorithm's own
+`--time-limit-secs` clock starts and were never in this fix's scope.
+
+**One related gap remains, disclosed rather than fixed here**:
+`preprocess.Run`'s own pipeline (Stage 8's subsumption/BVE/pure-literal
+loop, `cmd/vibe_sat/main.go`'s call to it) runs entirely outside
+`--time-limit-secs`'s scope too, before either algorithm's own
+`startTime` is even captured. Unlike bootstrap's now-fixed defensive
+re-propagation, this is a substantially bigger change to make
+time-aware (subsumption and BVE would each need their own deadline
+threading, on top of the work-budget safety caps they already have for
+a different reason — see `docs/internal-parameters.md`), and
+`STAGE52.md`'s own scope, following `REPORT35.md`'s "known, disclosed
+limitation" wording exactly, was the narrower bootstrap path each
+algorithm runs on its own. See `reports/REPORT52.md`.
 
 ## Restart strategies
 

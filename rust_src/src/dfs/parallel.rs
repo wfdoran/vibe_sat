@@ -215,7 +215,19 @@ pub fn run_parallel<R: Rng>(
         };
     }
 
-    let Some((clauses, root)) = bootstrap(problem) else {
+    let (bootstrap_result, bootstrap_timed_out) = bootstrap(problem, time_limit, start_time);
+    if bootstrap_timed_out {
+        if verbose >= 1 {
+            println!("UNKNOWN");
+        }
+        return SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            num_nodes: 0,
+            timed_out: true,
+        };
+    }
+    let Some((clauses, root)) = bootstrap_result else {
         if verbose >= 1 {
             println!("UNSAT");
         }
@@ -982,7 +994,9 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2, 3]],
         };
-        let (clauses, root) = bootstrap(&problem).expect("bootstrap reported UNSAT unexpectedly");
+        let (clauses, root) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("bootstrap reported UNSAT unexpectedly");
         let working_problem = Problem {
             num_vars: problem.num_vars,
             clauses: clauses.clone(),
@@ -1056,7 +1070,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1], vec![2]],
         };
-        let (clauses, root) = bootstrap(&problem).expect("bootstrap reported UNSAT unexpectedly");
+        let (clauses, root) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("bootstrap reported UNSAT unexpectedly");
         let working_problem = Problem {
             num_vars: problem.num_vars,
             clauses: clauses.clone(),
@@ -1096,7 +1112,7 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        let Some((clauses, root)) = bootstrap(&problem) else {
+        let Some((clauses, root)) = bootstrap(&problem, None, Instant::now()).0 else {
             // The bootstrap's own unit propagation may already catch
             // this particular contradiction; either way is a correct
             // UNSAT.

@@ -3,6 +3,7 @@ package cdcl
 import (
 	"slices"
 	"testing"
+	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
@@ -17,7 +18,7 @@ func TestNewSolverPopulatesWatcherLists(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{
 		{1, 2, 3}, {-1, 2, -3}, {1, -4},
 	}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -73,7 +74,7 @@ func TestPropagateWatcherListCompaction(t *testing.T) {
 		{1, 2},    // A
 		{1, 3},    // C
 	}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -119,7 +120,7 @@ func TestPropagateWatcherListCompaction(t *testing.T) {
 // otherwise a future propagate() would never find this clause at all.
 func TestAddLearnedClauseUpdatesWatcherLists(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{1, 2, 3, 4}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -151,7 +152,7 @@ func TestAddLearnedClauseUpdatesWatcherLists(t *testing.T) {
 // reference a clause index that no longer exists.
 func TestReduceClauseDatabaseRebuildsWatcherLists(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -194,7 +195,7 @@ func TestReduceClauseDatabaseRebuildsWatcherLists(t *testing.T) {
 // not: watch[0] must still be {1, 2}, unchanged, not moved to {3, 2}.
 func TestPropagateSkipsChooseWatchForBlockingLiteral(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{1, 2, 3}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -214,5 +215,43 @@ func TestPropagateSkipsChooseWatchForBlockingLiteral(t *testing.T) {
 	}
 	if s.x[3] != assign.Unassigned {
 		t.Errorf("variable 3 = %v, want Unassigned (clause 0 needed no attention at all)", s.x[3])
+	}
+}
+
+// TestPropagatePersistsChooseWatchPos verifies STAGE51.md's core
+// wiring directly: propagate must read s.chooseWatchPos[c] as
+// chooseWatch's start position, not always 0, and write the returned
+// position back afterward. Clause {1, 2, 3, 4, 5}: construction picks
+// watches {1, 2} (chooseWatch scans left to right when all literals
+// are unassigned). Manually setting chooseWatchPos[0] = 4 (pure test
+// setup) means the search triggered by falsifying literal 1 must find
+// literal 5 -- even though literals 3 and 4 are also valid, unassigned
+// candidates a from-scratch (start=0) scan would have found first.
+// This is the only way to prove propagate is actually threading the
+// remembered position through, not just that chooseWatch's own
+// standalone logic is correct (already covered by
+// TestChooseWatchStartsFromGivenPosition and friends in cdcl_test.go).
+func TestPropagatePersistsChooseWatchPos(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 5, Clauses: []cnf.Clause{{1, 2, 3, 4, 5}}}
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
+	if !ok {
+		t.Fatal("newSolver reported UNSAT unexpectedly")
+	}
+	if s.watch[0] != [2]cnf.Literal{1, 2} {
+		t.Fatalf("watch[0] after construction = %v, want {1 2} (test setup assumption violated)", s.watch[0])
+	}
+
+	s.chooseWatchPos[0] = 4 // pure test setup: simulate a prior scan having advanced this far
+
+	s.assignLiteral(cnf.Literal(-1), 0, noReason) // variable 1 := false
+	if conflict := s.propagate(); conflict != noReason {
+		t.Fatalf("propagate() = %d, want noReason", conflict)
+	}
+
+	if s.watch[0] != [2]cnf.Literal{5, 2} && s.watch[0] != [2]cnf.Literal{2, 5} {
+		t.Errorf("watch[0] after propagate() = %v, want {5 2} in either order (chooseWatch should have started its scan from index 4, landing on literal 5 directly, not the earlier-but-also-valid literal 3)", s.watch[0])
+	}
+	if s.chooseWatchPos[0] != 0 {
+		t.Errorf("chooseWatchPos[0] after propagate() = %d, want 0 (wrapped around from index 4, the position right after literal 5 -- the clause's last literal)", s.chooseWatchPos[0])
 	}
 }

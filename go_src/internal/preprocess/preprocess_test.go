@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
@@ -32,7 +33,7 @@ func TestUnitPropagateChain(t *testing.T) {
 	}
 	assignment := assign.New(3)
 
-	unsat, numFixed := UnitPropagate(&clauses, assignment)
+	unsat, numFixed, _ := UnitPropagate(&clauses, assignment, nil, time.Time{})
 	if unsat {
 		t.Fatalf("expected no contradiction")
 	}
@@ -56,9 +57,68 @@ func TestUnitPropagateDetectsContradiction(t *testing.T) {
 	}
 	assignment := assign.New(1)
 
-	unsat, _ := UnitPropagate(&clauses, assignment)
+	unsat, _, _ := UnitPropagate(&clauses, assignment, nil, time.Time{})
 	if !unsat {
 		t.Fatalf("expected unsat = true")
+	}
+}
+
+// TestUnitPropagateReportsTimedOutBeforeFindingUnitClause verifies
+// STAGE52.md's core mechanism: with an already-elapsed deadline (a
+// zero timeLimit against any startTime), UnitPropagate must report
+// timedOut = true immediately, before ever propagating the chain of
+// unit clauses it would otherwise find -- unsat must be false (timing
+// out means "don't know", never "proven unsatisfiable") and numFixed
+// must be 0, confirming no work happened after the deadline was
+// noticed.
+func TestUnitPropagateReportsTimedOutBeforeFindingUnitClause(t *testing.T) {
+	clauses := []cnf.Clause{
+		{cnf.Literal(1)},
+		{cnf.Literal(-1), cnf.Literal(2)},
+	}
+	assignment := assign.New(2)
+	alreadyElapsed := time.Duration(0)
+
+	unsat, numFixed, timedOut := UnitPropagate(&clauses, assignment, &alreadyElapsed, time.Now())
+	if !timedOut {
+		t.Fatal("expected timedOut = true with an already-elapsed deadline")
+	}
+	if unsat {
+		t.Error("expected unsat = false on timeout -- timing out is 'unknown', never 'proven unsatisfiable'")
+	}
+	if numFixed != 0 {
+		t.Errorf("numFixed = %d, want 0 (deadline noticed before any unit clause was propagated)", numFixed)
+	}
+}
+
+// TestSimplifyWithAssignmentReportsTimedOutWithoutMutatingClauses
+// verifies that simplifyWithAssignment, given an already-elapsed
+// deadline, reports timedOut = true and leaves *clauses completely
+// untouched -- the in-place compaction (*clauses = kept) only ever
+// happens on the normal, non-timed-out return path, so a caller that
+// abandons bootstrap on timeout never observes a partially-simplified,
+// inconsistent clause set.
+func TestSimplifyWithAssignmentReportsTimedOutWithoutMutatingClauses(t *testing.T) {
+	original := []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}, {cnf.Literal(-1)}}
+	clauses := append([]cnf.Clause(nil), original...)
+	assignment := assign.New(2)
+	assignment[1] = assign.True // would satisfy clause 0 and drop clause 1's only literal if this ran
+	alreadyElapsed := time.Duration(0)
+
+	unsat, timedOut := simplifyWithAssignment(&clauses, assignment, &alreadyElapsed, time.Now())
+	if !timedOut {
+		t.Fatal("expected timedOut = true with an already-elapsed deadline")
+	}
+	if unsat {
+		t.Error("expected unsat = false on timeout")
+	}
+	if len(clauses) != len(original) {
+		t.Fatalf("clauses = %v, want unchanged %v (timeout must be noticed before any compaction)", clauses, original)
+	}
+	for i := range clauses {
+		if !slices.Equal(clauses[i], original[i]) {
+			t.Errorf("clauses[%d] = %v, want unchanged %v", i, clauses[i], original[i])
+		}
 	}
 }
 
@@ -75,7 +135,7 @@ func TestSimplifyWithAssignmentReusesUnchangedClauses(t *testing.T) {
 	assignment := assign.New(5)
 	assignment[3] = assign.True // makes literal -3 false, dropping it from toReduce
 
-	if unsat := simplifyWithAssignment(&clauses, assignment); unsat {
+	if unsat, _ := simplifyWithAssignment(&clauses, assignment, nil, time.Time{}); unsat {
 		t.Fatal("expected no contradiction")
 	}
 	if len(clauses) != 2 {
@@ -99,7 +159,7 @@ func TestSimplifyWithAssignmentDropsSatisfiedAndDetectsEmptyClause(t *testing.T)
 	assignment[1] = assign.True
 
 	satisfied := []cnf.Clause{{cnf.Literal(1), cnf.Literal(-2)}}
-	if unsat := simplifyWithAssignment(&satisfied, assignment); unsat {
+	if unsat, _ := simplifyWithAssignment(&satisfied, assignment, nil, time.Time{}); unsat {
 		t.Fatal("expected no contradiction")
 	}
 	if len(satisfied) != 0 {
@@ -107,12 +167,12 @@ func TestSimplifyWithAssignmentDropsSatisfiedAndDetectsEmptyClause(t *testing.T)
 	}
 
 	allFalse := []cnf.Clause{{cnf.Literal(-1)}}
-	if unsat := simplifyWithAssignment(&allFalse, assignment); !unsat {
+	if unsat, _ := simplifyWithAssignment(&allFalse, assignment, nil, time.Time{}); !unsat {
 		t.Error("expected unsat = true when every literal in a clause is false")
 	}
 
 	empty := []cnf.Clause{{}}
-	if unsat := simplifyWithAssignment(&empty, assignment); !unsat {
+	if unsat, _ := simplifyWithAssignment(&empty, assignment, nil, time.Time{}); !unsat {
 		t.Error("expected unsat = true for an originally empty clause")
 	}
 }

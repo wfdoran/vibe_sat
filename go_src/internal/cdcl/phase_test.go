@@ -3,6 +3,7 @@ package cdcl
 import (
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
@@ -128,7 +129,7 @@ func TestMaybeRephaseOnlyFiresForPhaseRephaseWalkSAT(t *testing.T) {
 // wholesale -- see rephaseFromWalkSAT).
 func TestMaybeRephaseRespectsInterval(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.CDCL{RephaseIntervalRestarts: 3, RephaseMaxFlips: 100}, PhaseRephaseWalkSAT)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.CDCL{RephaseIntervalRestarts: 3, RephaseMaxFlips: 100}, PhaseRephaseWalkSAT, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -180,7 +181,7 @@ func TestMaybeRephaseGuardsNonPositiveInterval(t *testing.T) {
 // satisfied with overwhelming probability on the first try.
 func TestRephaseFromWalkSATSolvesEarlyExit(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.CDCL{RephaseIntervalRestarts: 1, RephaseMaxFlips: 1000}, PhaseRephaseWalkSAT)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.CDCL{RephaseIntervalRestarts: 1, RephaseMaxFlips: 1000}, PhaseRephaseWalkSAT, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}

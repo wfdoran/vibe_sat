@@ -1,6 +1,8 @@
 package dfs
 
 import (
+	"time"
+
 	"vibe_sat/internal/assign"
 	"vibe_sat/internal/cnf"
 )
@@ -90,24 +92,33 @@ func (ws *watchState) watchersFor(lit cnf.Literal) *[]int {
 // false if some clause has fewer than two such literals (a
 // contradiction, given the precondition above; checked defensively
 // rather than assumed).
-func newWatchState(clauses []cnf.Clause, assignment assign.Assignment) (ws *watchState, ok bool) {
+//
+// STAGE52.md: timeLimit/startTime (nil/zero meaning no limit) are
+// checked once per clause -- see bootstrap's doc comment for why this
+// single O(clauses) pass needed the same interruptibility treatment as
+// UnitPropagate. timedOut is true the moment the deadline is noticed;
+// ok is only meaningful when timedOut is false.
+func newWatchState(clauses []cnf.Clause, assignment assign.Assignment, timeLimit *time.Duration, startTime time.Time) (ws *watchState, ok bool, timedOut bool) {
 	watch := make([][2]cnf.Literal, len(clauses))
 	watchersPositive := make([][]int, len(assignment))
 	watchersNegative := make([][]int, len(assignment))
 	for c, clause := range clauses {
+		if timeLimit != nil && time.Since(startTime) >= *timeLimit {
+			return nil, false, true
+		}
 		first, foundFirst := chooseWatch(clause, assignment, 0)
 		if !foundFirst {
-			return nil, false
+			return nil, false, false
 		}
 		second, foundSecond := chooseWatch(clause, assignment, first)
 		if !foundSecond {
-			return nil, false
+			return nil, false, false
 		}
 		watch[c] = [2]cnf.Literal{first, second}
 		appendWatcher(watchersPositive, watchersNegative, first, c)
 		appendWatcher(watchersPositive, watchersNegative, second, c)
 	}
-	return &watchState{watch: watch, watchersPositive: watchersPositive, watchersNegative: watchersNegative}, true
+	return &watchState{watch: watch, watchersPositive: watchersPositive, watchersNegative: watchersNegative}, true, false
 }
 
 // cloneWatchState returns an independent copy of ws, for a new search

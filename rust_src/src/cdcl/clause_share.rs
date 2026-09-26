@@ -152,6 +152,7 @@ pub(crate) fn maybe_import(
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) {
     if peers.is_empty() {
@@ -172,6 +173,7 @@ pub(crate) fn maybe_import(
                 x,
                 clause_activity,
                 clause_lbd,
+                choose_watch_pos,
                 estimated_bytes,
             );
         }
@@ -232,12 +234,13 @@ fn import_clause(
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) {
-    let Some(first) = super::choose_watch(lits, x, None) else {
+    let Some((first, _)) = super::choose_watch(lits, x, None, 0) else {
         return;
     };
-    let Some(second) = super::choose_watch(lits, x, Some(first)) else {
+    let Some((second, _)) = super::choose_watch(lits, x, Some(first), 0) else {
         return;
     };
 
@@ -245,6 +248,7 @@ fn import_clause(
     clauses.push(lits.clone());
     clause_activity.push(0.0);
     clause_lbd.push(lits.len());
+    choose_watch_pos.push(0);
     *estimated_bytes += super::clause_byte_cost(lits);
     for &lit in lits {
         let v = crate::cnf::literal_var(lit);

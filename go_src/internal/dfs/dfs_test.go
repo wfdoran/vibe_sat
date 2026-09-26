@@ -51,7 +51,7 @@ func TestNewWatchStatePicksTwoNonFalseLiterals(t *testing.T) {
 	x[1] = assign.False // literal 1 is false; literal -1 is true
 	clauses := []cnf.Clause{{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)}}
 
-	ws, ok := newWatchState(clauses, x)
+	ws, ok, _ := newWatchState(clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatalf("expected ok = true")
 	}
@@ -70,8 +70,56 @@ func TestNewWatchStateFailsOnContradiction(t *testing.T) {
 	x[1] = assign.False
 	x[2] = assign.True
 	clauses := []cnf.Clause{{cnf.Literal(1), cnf.Literal(-2)}} // both literals false
-	if _, ok := newWatchState(clauses, x); ok {
+	if _, ok, _ := newWatchState(clauses, x, nil, time.Time{}); ok {
 		t.Errorf("expected ok = false for a clause with no valid watches")
+	}
+}
+
+// TestNewWatchStateReportsTimedOutBeforeSecondClause verifies
+// STAGE52.md's core mechanism: with an already-elapsed deadline (a
+// zero timeLimit against any startTime), newWatchState must report
+// timedOut = true before ever choosing watches for any clause -- ok
+// must be false (timedOut and ok are never both true) and the
+// returned watchState must be nil.
+func TestNewWatchStateReportsTimedOutBeforeSecondClause(t *testing.T) {
+	x := assign.New(2)
+	clauses := []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(2)}}
+	alreadyElapsed := time.Duration(0)
+
+	ws, ok, timedOut := newWatchState(clauses, x, &alreadyElapsed, time.Now())
+	if !timedOut {
+		t.Fatal("expected timedOut = true with an already-elapsed deadline")
+	}
+	if ok {
+		t.Error("expected ok = false when timedOut is true")
+	}
+	if ws != nil {
+		t.Errorf("expected a nil watchState on timeout, got %v", ws)
+	}
+}
+
+// TestBootstrapReportsTimedOutNotUnsat verifies STAGE52.md's core
+// distinction directly: with an already-elapsed deadline, bootstrap
+// must report timedOut = true and ok = false -- crucially, a caller
+// must be able to tell this apart from a genuine UNSAT-by-bootstrap
+// result (also ok = false, but timedOut = false), since the two mean
+// completely different things (unknown status vs. proven
+// unsatisfiable). A two-unit-clause contradiction (which bootstrap
+// would otherwise detect and report as ok = false, timedOut = false)
+// is used deliberately, so this test would fail loudly (wrong verdict
+// entirely) if the timeout check were ever skipped or misplaced after
+// the point where UnitPropagate itself would have found the
+// contradiction.
+func TestBootstrapReportsTimedOutNotUnsat(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 1, Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}}}
+	alreadyElapsed := time.Duration(0)
+
+	_, _, ok, timedOut := bootstrap(problem, &alreadyElapsed, time.Now())
+	if !timedOut {
+		t.Fatal("expected timedOut = true with an already-elapsed deadline")
+	}
+	if ok {
+		t.Error("expected ok = false when timedOut is true")
 	}
 }
 
@@ -79,7 +127,7 @@ func TestNewWatchStateFailsOnContradiction(t *testing.T) {
 // watchState does not affect the original.
 func TestCloneWatchStateIsIndependent(t *testing.T) {
 	x := assign.New(2)
-	ws, ok := newWatchState([]cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}, x)
+	ws, ok, _ := newWatchState([]cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}, x, nil, time.Time{})
 	if !ok {
 		t.Fatalf("expected ok = true")
 	}
@@ -106,7 +154,7 @@ func TestBCPPropagatesUnitChain(t *testing.T) {
 		},
 	}
 	x := assign.New(3)
-	ws, ok := newWatchState(problem.Clauses, x)
+	ws, ok, _ := newWatchState(problem.Clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatalf("expected ok = true")
 	}
@@ -151,7 +199,7 @@ func TestBCPDetectsContradiction(t *testing.T) {
 		},
 	}
 	x := assign.New(4)
-	ws, ok := newWatchState(problem.Clauses, x)
+	ws, ok, _ := newWatchState(problem.Clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatalf("expected ok = true")
 	}
@@ -173,7 +221,7 @@ func TestBCPLeavesPartialAssignmentOK(t *testing.T) {
 		},
 	}
 	x := assign.New(3)
-	ws, ok := newWatchState(problem.Clauses, x)
+	ws, ok, _ := newWatchState(problem.Clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatalf("expected ok = true")
 	}
@@ -199,7 +247,7 @@ func TestBCPMovesWatchAwayFromFalsifiedLiteral(t *testing.T) {
 		},
 	}
 	x := assign.New(3)
-	ws, ok := newWatchState(problem.Clauses, x)
+	ws, ok, _ := newWatchState(problem.Clauses, x, nil, time.Time{})
 	if !ok {
 		t.Fatalf("expected ok = true")
 	}

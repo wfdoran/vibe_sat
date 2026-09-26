@@ -248,7 +248,7 @@ func TestExportBufferPublishOwnsItsData(t *testing.T) {
 // design here.
 func TestImportClauseSkipsAlreadyFalsifiedClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver() reported ok = false unexpectedly")
 	}
@@ -268,7 +268,7 @@ func TestImportClauseSkipsAlreadyFalsifiedClause(t *testing.T) {
 // a clause when at least two of its literals are not currently false.
 func TestImportClauseAddsLiveClause(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver() reported ok = false unexpectedly")
 	}
@@ -289,7 +289,7 @@ func TestImportClauseAddsLiveClause(t *testing.T) {
 // (which, with no memory limit set, may never happen).
 func TestImportClauseRegistersWatcherLists(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
-	s, ok := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving)
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver() reported ok = false unexpectedly")
 	}

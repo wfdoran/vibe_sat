@@ -1257,7 +1257,17 @@ fn run_loop<R: Rng>(
         };
     }
 
-    let Some((mut working_problem, mut watch, mut x)) = bootstrap(problem) else {
+    let (bootstrap_result, bootstrap_timed_out) = bootstrap(problem, time_limit, start_time);
+    if bootstrap_timed_out {
+        return SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            num_decisions: 0,
+            num_conflicts: 0,
+            timed_out: true,
+        };
+    }
+    let Some((mut working_problem, mut watch, mut x)) = bootstrap_result else {
         return SolveResult {
             satisfiable: false,
             assignment: assignment::new(problem.num_vars),
@@ -1268,9 +1278,29 @@ fn run_loop<R: Rng>(
     };
 
     let mut peer_cursors = vec![0u64; peers.len()];
-    let mut lists = occurrence::build(&working_problem);
+    // STAGE52.md: build_with_deadline, not the plain build, since this
+    // is still part of the same time-bounded bootstrap path bootstrap()
+    // itself just finished (unit propagation, watch selection) -- see
+    // bootstrap's own doc comment.
+    let (mut lists, lists_timed_out) =
+        occurrence::build_with_deadline(&working_problem, time_limit, start_time);
+    if lists_timed_out {
+        return SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            num_decisions: 0,
+            num_conflicts: 0,
+            timed_out: true,
+        };
+    }
     let (mut watchers_positive, mut watchers_negative) =
         build_watchers(&watch, working_problem.num_vars);
+    // STAGE51.md: choose_watch_pos[c] is clause c's remembered starting
+    // position for choose_watch's next scan, parallel to
+    // working_problem.clauses/watch -- see choose_watch's own doc
+    // comment for why starting from here instead of always index 0 is
+    // worth doing.
+    let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
     let mut level = vec![0usize; problem.num_vars + 1];
     let mut reason: Vec<Option<usize>> = vec![None; problem.num_vars + 1];
     let mut trail: Vec<usize> = Vec::new();
@@ -1405,6 +1435,7 @@ fn run_loop<R: Rng>(
             variant,
             num_conflicts,
             &mut lrb,
+            &mut choose_watch_pos,
         );
 
         if let Some(c) = confl {
@@ -1466,6 +1497,7 @@ fn run_loop<R: Rng>(
                 &level,
                 &mut clause_activity,
                 &mut clause_lbd,
+                &mut choose_watch_pos,
                 &mut estimated_bytes,
             );
             // STAGE20.md/STAGE21.md's Option B: publish learned to
@@ -1535,6 +1567,7 @@ fn run_loop<R: Rng>(
                     &mut watch,
                     &mut clause_activity,
                     &mut clause_lbd,
+                    &mut choose_watch_pos,
                     &mut estimated_bytes,
                     &x,
                     &mut reason,
@@ -1561,6 +1594,7 @@ fn run_loop<R: Rng>(
                 &x,
                 &mut clause_activity,
                 &mut clause_lbd,
+                &mut choose_watch_pos,
                 &mut estimated_bytes,
             );
 
@@ -1665,30 +1699,72 @@ fn run_loop<R: Rng>(
 /// (see [`crate::dfs::run`]'s identical bootstrap step for why this is
 /// needed even though Stage 8's preprocessing already does this by
 /// default), followed by initial watch state for whatever clauses
-/// survive it. Returns `None` if this bootstrap alone already proves
-/// `problem` unsatisfiable.
-fn bootstrap(problem: &Problem) -> Option<(Problem, Vec<[Literal; 2]>, Assignment)> {
+/// survive it. The first element of the returned pair is `None` if
+/// this bootstrap alone already proves `problem` unsatisfiable;
+/// otherwise the bootstrapped problem, initial watches, and
+/// assignment. The second element is `true` if `time_limit` (`None`
+/// meaning no limit) was reached before bootstrap could finish, in
+/// which case the first element is also `None` but the caller must
+/// report `TimedOut`, not `Satisfiable: false` -- bootstrap timing out
+/// means the problem's status is genuinely unknown, not proven UNSAT.
+///
+/// STAGE52.md: previously `bootstrap` had no time-limit awareness at
+/// all (`REPORT35.md`'s own disclosed limitation, "A known, disclosed
+/// limitation") -- a single instance whose unit propagation or initial
+/// watch selection alone took longer than `time_limit` would run to
+/// completion regardless, with the search loop never getting a chance
+/// to check anything until bootstrap finished on its own. Both steps
+/// now check `time_limit`/`start_time` themselves (`unit_propagate`
+/// down to `simplify_with_assignment`'s own per-clause loop; the
+/// watch-selection loop below, per clause) and report a timeout
+/// promptly instead. [`run_loop`]'s own call to
+/// `occurrence::build_with_deadline` right after this function returns
+/// gets the same treatment for the same reason -- see its own call
+/// site. See `reports/REPORT52.md`.
+#[allow(clippy::type_complexity)]
+fn bootstrap(
+    problem: &Problem,
+    time_limit: Option<Duration>,
+    start_time: Instant,
+) -> (Option<(Problem, Vec<[Literal; 2]>, Assignment)>, bool) {
     let mut clauses = problem.clauses.clone();
     let mut x = assignment::new(problem.num_vars);
-    if preprocess::unit_propagate(&mut clauses, &mut x).0 {
-        return None;
+    let (unsat, _, timed_out) =
+        preprocess::unit_propagate(&mut clauses, &mut x, time_limit, start_time);
+    if timed_out {
+        return (None, true);
+    }
+    if unsat {
+        return (None, false);
     }
 
     let mut watch = Vec::with_capacity(clauses.len());
     for clause in &clauses {
-        let first = choose_watch(clause, &x, None)?;
-        let second = choose_watch(clause, &x, Some(first))?;
+        if let Some(limit) = time_limit
+            && start_time.elapsed() >= limit
+        {
+            return (None, true);
+        }
+        let Some((first, _)) = choose_watch(clause, &x, None, 0) else {
+            return (None, false);
+        };
+        let Some((second, _)) = choose_watch(clause, &x, Some(first), 0) else {
+            return (None, false);
+        };
         watch.push([first, second]);
     }
 
-    Some((
-        Problem {
-            num_vars: problem.num_vars,
-            clauses,
-        },
-        watch,
-        x,
-    ))
+    (
+        Some((
+            Problem {
+                num_vars: problem.num_vars,
+                clauses,
+            },
+            watch,
+            x,
+        )),
+        false,
+    )
 }
 
 /// Records `lit` as true (setting its variable's value, decision
@@ -1853,6 +1929,15 @@ fn build_watchers(watch: &[[Literal; 2]], num_vars: usize) -> (Vec<Vec<usize>>, 
 /// -- see that function's own doc comment for why this lives here
 /// rather than in [`analyze`].
 ///
+/// STAGE51.md: `choose_watch`'s own call below now passes
+/// `choose_watch_pos[c]` as its starting scan position, rather than
+/// always 0, and stores back whatever position it returns -- see
+/// `choose_watch`'s own doc comment for why remembering this across
+/// calls is worth doing, once `REPORT47.md`'s re-profile (following
+/// `STAGE45.md`'s fix above) confirmed `choose_watch` itself, not
+/// `propagate`'s own candidate discovery, is now the dominant
+/// remaining cost.
+///
 /// The scan below is MiniSat's own standard in-place compaction
 /// pattern: since a clause whose watch moves away (`choose_watch`
 /// found a replacement) must be removed from this literal's watcher
@@ -1886,6 +1971,7 @@ fn propagate(
     variant: SelectVarVariant,
     num_conflicts: usize,
     lrb: &mut LrbState,
+    choose_watch_pos: &mut [usize],
 ) -> Option<usize> {
     while *q_head < trail.len() {
         let v = trail[*q_head];
@@ -1935,7 +2021,10 @@ fn propagate(
                 continue;
             }
 
-            if let Some(replacement) = choose_watch(&clauses[c], x, Some(other_watch)) {
+            if let Some((replacement, next_pos)) =
+                choose_watch(&clauses[c], x, Some(other_watch), choose_watch_pos[c])
+            {
+                choose_watch_pos[c] = next_pos;
                 watch[c][falsified_slot] = replacement;
                 watchers_for(watchers_positive, watchers_negative, replacement).push(c);
                 continue;
@@ -2596,6 +2685,7 @@ fn add_learned_clause(
     level: &[usize],
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) -> Option<usize> {
     if learned.len() == 1 {
@@ -2606,6 +2696,7 @@ fn add_learned_clause(
     clauses.push(learned.clone());
     clause_activity.push(0.0);
     clause_lbd.push(lbd);
+    choose_watch_pos.push(0);
     *estimated_bytes += clause_byte_cost(learned);
     for &lit in learned {
         let v = cnf::literal_var(lit);
@@ -2675,6 +2766,7 @@ fn reduce_clause_database(
     watch: &mut Vec<[Literal; 2]>,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
     x: &Assignment,
     reason: &mut [Option<usize>],
@@ -2753,23 +2845,58 @@ fn reduce_clause_database(
     *watchers_negative = new_watchers_negative;
     *clause_activity = new_activity;
     *clause_lbd = new_lbd;
+    // choose_watch_pos is just a heuristic hint (see choose_watch's
+    // doc comment), never required for correctness, so a fresh
+    // all-zero Vec is simplest and safe -- no need to carry surviving
+    // clauses' old positions through old_to_new.
+    *choose_watch_pos = vec![0; clauses.len()];
 }
 
-/// Scans `clause` for a literal that is not false under `assignment`
-/// and is not equal to `avoid` (used when picking a clause's second
-/// watch, to avoid re-picking the first). Identical in spirit to
-/// STAGE9.md's `dfs::choose_watch`; duplicated here (rather than
-/// exported from `crate::dfs`) since STAGE11.md asks that dfs be left
-/// as it is.
+/// Scans `clause`, starting at index `start` and wrapping around
+/// circularly, for a literal that is not false under `assignment` and
+/// is not equal to `avoid` (used when picking a clause's second watch,
+/// to avoid re-picking the first). Returns the chosen literal and the
+/// index right after it (mod `clause.len()`) for the caller to
+/// remember as this clause's next start position (see
+/// `choose_watch_pos` at each call site), or `None` if every literal
+/// is either false or `avoid`. Every literal is still examined at most
+/// once regardless of `start`, so correctness never depends on `start`
+/// being any particular value -- passing 0 always works, exactly like
+/// the STAGE9.md/STAGE11.md `dfs::choose_watch` helper of the same
+/// name this was originally identical to.
+///
+/// STAGE51.md: starting from a remembered position rather than always
+/// index 0 is a real, standard MiniSat-lineage technique
+/// (REPORT47.md's own recommendation, after profiling repeatedly named
+/// this function the dominant cost once STAGE45.md fixed propagate's
+/// candidate discovery -- see REPORT41.md/REPORT45.md/REPORT47.md). A
+/// long-lived clause whose early literals became false long ago and
+/// have stayed that way would otherwise have those same literals
+/// re-examined, and rejected, on every single call for as long as they
+/// remain false -- wasted work that grows with how often the clause's
+/// watches move, not with anything about the search itself. Starting
+/// from wherever the last scan left off spreads that cost out instead
+/// of concentrating it on the clause's own first few literals; the
+/// wraparound guarantees no candidate is ever skipped just because of
+/// where the scan happened to start.
 fn choose_watch(
     clause: &Clause,
     assignment: &Assignment,
     avoid: Option<Literal>,
-) -> Option<Literal> {
-    clause
-        .iter()
-        .copied()
-        .find(|&lit| Some(lit) != avoid && !is_false(lit, assignment))
+    start: usize,
+) -> Option<(Literal, usize)> {
+    let n = clause.len();
+    for i in 0..n {
+        let idx = (start + i) % n;
+        let candidate = clause[idx];
+        if Some(candidate) == avoid {
+            continue;
+        }
+        if !is_false(candidate, assignment) {
+            return Some((candidate, (idx + 1) % n));
+        }
+    }
+    None
 }
 
 /// Returns whether `literal` currently evaluates to false under
@@ -2891,13 +3018,13 @@ mod tests {
     fn test_choose_watch_skips_false_literals() {
         let mut x = assignment::new(2);
         x[1] = Value::False;
-        assert_eq!(choose_watch(&vec![1, 2], &x, None), Some(2));
+        assert_eq!(choose_watch(&vec![1, 2], &x, None, 0), Some((2, 0)));
     }
 
     #[test]
     fn test_choose_watch_honors_avoid() {
         let x = assignment::new(2);
-        assert_eq!(choose_watch(&vec![1, 2], &x, Some(1)), Some(2));
+        assert_eq!(choose_watch(&vec![1, 2], &x, Some(1), 0), Some((2, 0)));
     }
 
     #[test]
@@ -2905,7 +3032,47 @@ mod tests {
         let mut x = assignment::new(2);
         x[1] = Value::False;
         x[2] = Value::False;
-        assert_eq!(choose_watch(&vec![1, 2], &x, None), None);
+        assert_eq!(choose_watch(&vec![1, 2], &x, None, 0), None);
+    }
+
+    /// STAGE51.md's core mechanism, verified directly: starting the
+    /// scan mid-clause finds a later literal before an earlier,
+    /// otherwise-equally-valid one, and reports the position right
+    /// after the one it found.
+    #[test]
+    fn test_choose_watch_starts_from_given_position() {
+        let x = assignment::new(4);
+        let clause = vec![1, 2, 3, 4];
+        assert_eq!(choose_watch(&clause, &x, None, 2), Some((3, 3)));
+    }
+
+    /// Verifies that starting mid-clause still finds a valid literal
+    /// earlier in the clause via wraparound, rather than missing it
+    /// just because the scan started past it -- the correctness
+    /// property that makes remembering a position across calls safe
+    /// in the first place.
+    #[test]
+    fn test_choose_watch_wraps_around_from_given_position() {
+        let mut x = assignment::new(4);
+        x[3] = Value::False;
+        x[4] = Value::False;
+        let clause = vec![1, 2, 3, 4];
+        // Starting at index 2: literal 3 (false), literal 4 (false),
+        // literal 1 (avoided, index 0), literal 2 (valid, index 1) --
+        // found by wrapping around past every earlier candidate.
+        assert_eq!(choose_watch(&clause, &x, Some(1), 2), Some((2, 2)));
+    }
+
+    /// Mirrors test_choose_watch_fails_when_none_available, starting
+    /// mid-clause: every literal in the whole clause is still examined
+    /// exactly once via wraparound, so "none available" must still be
+    /// reported correctly regardless of start.
+    #[test]
+    fn test_choose_watch_fails_when_none_available_from_given_position() {
+        let mut x = assignment::new(2);
+        x[1] = Value::False;
+        x[2] = Value::False;
+        assert_eq!(choose_watch(&vec![1, 2], &x, None, 1), None);
     }
 
     #[test]
@@ -2914,7 +3081,73 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        assert!(bootstrap(&problem).is_none());
+        assert!(bootstrap(&problem, None, Instant::now()).0.is_none());
+    }
+
+    /// STAGE52.md's core distinction, verified directly: with an
+    /// already-elapsed deadline, bootstrap must report timed_out = true
+    /// and a None result -- crucially distinct from a genuine
+    /// UNSAT-by-bootstrap result (also None, but timed_out = false),
+    /// since the two mean completely different things (unknown status
+    /// vs. proven unsatisfiable). A two-unit-clause contradiction
+    /// (which bootstrap would otherwise detect and report as None,
+    /// timed_out = false, exactly like test_bootstrap_detects_contradiction
+    /// above) is used deliberately, so this test would fail loudly if
+    /// the timeout check were ever skipped or checked too late.
+    #[test]
+    fn test_bootstrap_reports_timed_out_not_unsat() {
+        let problem = Problem {
+            num_vars: 1,
+            clauses: vec![vec![1], vec![-1]],
+        };
+        let already_elapsed = Duration::from_secs(0);
+
+        let (result, timed_out) = bootstrap(&problem, Some(already_elapsed), Instant::now());
+        assert!(
+            timed_out,
+            "expected timed_out = true with an already-elapsed deadline"
+        );
+        assert!(result.is_none(), "expected None when timed_out is true");
+    }
+
+    /// Verifies that run_loop, given a time_limit already exhausted
+    /// before bootstrap can finish, returns SolveResult { timed_out:
+    /// true, .. } rather than SolveResult { satisfiable: false, .. } --
+    /// the latter would falsely claim a proof of unsatisfiability for a
+    /// problem whose status is genuinely unknown. Mirrors
+    /// test_bootstrap_reports_timed_out_not_unsat's contradiction setup,
+    /// at the run_loop-level boundary this time.
+    #[test]
+    fn test_run_loop_reports_timed_out_when_bootstrap_times_out() {
+        let problem = Problem {
+            num_vars: 1,
+            clauses: vec![vec![1], vec![-1]],
+        };
+        let already_elapsed = Duration::from_secs(0);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let result = run_loop(
+            &problem,
+            Some(already_elapsed),
+            SelectVarVariant::Weighted,
+            RestartStrategy::None,
+            None,
+            &mut rng,
+            None,
+            None,
+            &[],
+            &params::default().cdcl,
+            PhaseStrategy::Saving,
+        );
+
+        assert!(
+            result.timed_out,
+            "expected SolveResult.timed_out = true when bootstrap itself exhausts the time limit"
+        );
+        assert!(
+            !result.satisfiable,
+            "a timed-out result must not claim satisfiable"
+        );
     }
 
     #[test]
@@ -2923,10 +3156,12 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![-1, -2], vec![2, 3]],
         };
-        let (working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
         let mut level = vec![0usize; 4];
         let mut reason: Vec<Option<usize>> = vec![None; 4];
         let mut trail: Vec<usize> = Vec::new();
@@ -2959,6 +3194,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut choose_watch_pos,
         );
 
         assert_eq!(confl, None);
@@ -2997,10 +3233,12 @@ mod tests {
                 vec![-2, -4],
             ],
         };
-        let (working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
         let mut level = vec![0usize; 5];
         let mut reason: Vec<Option<usize>> = vec![None; 5];
         let mut trail: Vec<usize> = Vec::new();
@@ -3035,6 +3273,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut choose_watch_pos,
         )
         .expect("expected clause {-2,-4} to be falsified");
 
@@ -3088,8 +3327,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (working_problem, _watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, _watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 3];
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let mut seen = vec![false; 3];
@@ -3132,8 +3372,9 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2], vec![3, 1]],
         };
-        let (working_problem, _watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, _watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 4];
         let mut reason: Vec<Option<usize>> = vec![None; 4];
         let mut seen = vec![false; 4];
@@ -3176,8 +3417,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (working_problem, _watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, _watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 3];
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let seen = vec![false; 3];
@@ -3221,8 +3463,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (working_problem, _watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, _watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 3];
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let mut seen = vec![false; 3];
@@ -3277,8 +3520,9 @@ mod tests {
                 vec![-1, 5],      // 3: reason for var 5
             ],
         };
-        let (working_problem, _watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, _watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let current_level = 2;
         let mut level = vec![0usize; 6];
         let mut reason: Vec<Option<usize>> = vec![None; 6];
@@ -3350,8 +3594,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -3361,6 +3606,7 @@ mod tests {
         let before = working_problem.clauses.len();
 
         let mut clause_lbd: Vec<usize> = Vec::new();
+        let mut choose_watch_pos: Vec<usize> = Vec::new();
         let idx = add_learned_clause(
             &vec![-1],
             1,
@@ -3372,6 +3618,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         );
 
@@ -3385,8 +3632,9 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -3397,6 +3645,7 @@ mod tests {
         let mut estimated_bytes = 0i64;
 
         let mut clause_lbd: Vec<usize> = Vec::new();
+        let mut choose_watch_pos: Vec<usize> = Vec::new();
         let idx = add_learned_clause(
             &vec![-1, 2, 3],
             3,
@@ -3408,6 +3657,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause for a length-3 learned clause");
@@ -3525,8 +3775,9 @@ mod tests {
             num_vars: 5,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -3534,6 +3785,7 @@ mod tests {
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
         let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut choose_watch_pos: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 6];
 
@@ -3552,6 +3804,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3566,6 +3819,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3580,6 +3834,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3598,6 +3853,7 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -3637,8 +3893,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -3646,6 +3903,7 @@ mod tests {
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
         let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut choose_watch_pos: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 3];
 
@@ -3660,6 +3918,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3675,6 +3934,7 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -3697,8 +3957,9 @@ mod tests {
             num_vars: 6,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -3706,6 +3967,7 @@ mod tests {
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
         let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut choose_watch_pos: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 7];
         let glue_clause_lbd_threshold = params::default().cdcl.glue_clause_lbd_threshold;
@@ -3721,6 +3983,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3735,6 +3998,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3749,6 +4013,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3765,6 +4030,7 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -3797,8 +4063,9 @@ mod tests {
             num_vars: 4,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -3806,6 +4073,7 @@ mod tests {
         let num_original_clauses = working_problem.clauses.len();
         let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
         let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut choose_watch_pos: Vec<usize> = vec![0; num_original_clauses];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 5];
 
@@ -3820,6 +4088,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3834,6 +4103,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -3849,6 +4119,7 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
@@ -3942,8 +4213,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (_working_problem, _watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (_working_problem, _watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut trail: Vec<usize> = Vec::new();
         let mut trail_lim: Vec<usize> = vec![0];
         let mut current_level = 0usize; // matches the state right after a level-0 learned unit clause
@@ -4094,10 +4366,12 @@ mod tests {
                 vec![-2, -4],
             ],
         };
-        let (working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
         let mut level = vec![0usize; 5];
         let mut reason: Vec<Option<usize>> = vec![None; 5];
         let mut trail: Vec<usize> = Vec::new();
@@ -4132,6 +4406,7 @@ mod tests {
             SelectVarVariant::Vsids,
             0,
             &mut lrb,
+            &mut choose_watch_pos,
         )
         .expect("expected clause {-2,-4} to be falsified");
 
@@ -4188,8 +4463,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (_working_problem, _watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (_working_problem, _watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 3];
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let mut trail: Vec<usize> = Vec::new();
@@ -4252,8 +4528,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (_working_problem, _watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (_working_problem, _watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 3];
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let mut trail: Vec<usize> = Vec::new();
@@ -4339,10 +4616,12 @@ mod tests {
             num_vars: 6,
             clauses: vec![vec![1, 2, 3], vec![6, 1, 3]],
         };
-        let (working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
 
         assert!(
             watch[0] == [1, 2],
@@ -4400,6 +4679,7 @@ mod tests {
             SelectVarVariant::Lrb,
             0,
             &mut lrb,
+            &mut choose_watch_pos,
         );
 
         assert_eq!(
@@ -4516,8 +4796,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (_working_problem, _watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (_working_problem, _watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut level = vec![0usize; 3];
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let mut trail: Vec<usize> = Vec::new();
@@ -4711,8 +4992,9 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (_working_problem, _watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (_working_problem, _watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut trail: Vec<usize> = Vec::new();
         let mut trail_lim: Vec<usize> = vec![0];
         let mut current_level = 0usize;
@@ -4763,14 +5045,16 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
         let mut level = vec![0usize; 3];
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
+        let mut choose_watch_pos: Vec<usize> = vec![0; working_problem.clauses.len()];
         let mut estimated_bytes = 0i64;
         let learned_idx = add_learned_clause(
             &vec![-1, 2],
@@ -4783,6 +5067,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause");
@@ -5669,7 +5954,9 @@ mod tests {
             num_vars: 4,
             clauses: vec![vec![1, 2, 3], vec![-1, 2, -3], vec![1, -4]],
         };
-        let (working_problem, watch, _x) = bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
 
@@ -5731,10 +6018,12 @@ mod tests {
                 vec![1, 3],    // C
             ],
         };
-        let (working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
 
         assert_eq!(
             *watchers_for(&mut watchers_positive, &mut watchers_negative, 1),
@@ -5781,6 +6070,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut choose_watch_pos,
         );
 
         assert_eq!(conflict, Some(2), "expected clause A ({{1 2}}) to conflict");
@@ -5832,10 +6122,12 @@ mod tests {
             num_vars: 3,
             clauses: vec![vec![1, 2, 3]],
         };
-        let (working_problem, mut watch, mut x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
 
         assert!(
             watch[0] == [1, 2],
@@ -5878,6 +6170,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut choose_watch_pos,
         );
 
         assert_eq!(
@@ -5896,6 +6189,90 @@ mod tests {
         );
     }
 
+    /// STAGE51.md's core wiring, verified directly: propagate must
+    /// read choose_watch_pos[c] as choose_watch's start position, not
+    /// always 0, and write the returned position back afterward.
+    /// Clause [1, 2, 3, 4, 5]: construction picks watches {1, 2}
+    /// (choose_watch scans left to right when all literals are
+    /// unassigned). Manually setting choose_watch_pos[0] = 4 (pure
+    /// test setup) means the search triggered by falsifying literal 1
+    /// must find literal 5 -- even though literals 3 and 4 are also
+    /// valid, unassigned candidates a from-scratch (start=0) scan
+    /// would have found first. This is the only way to prove propagate
+    /// is actually threading the remembered position through, not just
+    /// that choose_watch's own standalone logic is correct (already
+    /// covered by test_choose_watch_starts_from_given_position and
+    /// friends above).
+    #[test]
+    fn test_propagate_persists_choose_watch_pos() {
+        let problem = Problem {
+            num_vars: 5,
+            clauses: vec![vec![1, 2, 3, 4, 5]],
+        };
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+
+        assert!(
+            watch[0] == [1, 2],
+            "watch[0] after bootstrap = {:?}, want [1, 2] (test setup assumption violated)",
+            watch[0]
+        );
+
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
+        choose_watch_pos[0] = 4; // pure test setup: simulate a prior scan having advanced this far
+
+        let mut level = vec![0usize; 6];
+        let mut reason: Vec<Option<usize>> = vec![None; 6];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut q_head = 0usize;
+        let mut lrb = LrbState::new(5);
+
+        assign_literal(
+            -1,
+            0,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+        ); // variable 1 := false
+
+        let conflict = propagate(
+            &working_problem.clauses,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &mut x,
+            &mut trail,
+            &mut q_head,
+            0,
+            &mut level,
+            &mut reason,
+            SelectVarVariant::Weighted,
+            0,
+            &mut lrb,
+            &mut choose_watch_pos,
+        );
+
+        assert_eq!(conflict, None, "expected no conflict");
+        assert!(
+            watch[0] == [5, 2] || watch[0] == [2, 5],
+            "watch[0] after propagate() = {:?}, want [5, 2] in either order (choose_watch should have started its scan from index 4, landing on literal 5 directly, not the earlier-but-also-valid literal 3)",
+            watch[0]
+        );
+        assert_eq!(
+            choose_watch_pos[0], 0,
+            "choose_watch_pos[0] after propagate() = {}, want 0 (wrapped around from index 4, the position right after literal 5 -- the clause's last literal)",
+            choose_watch_pos[0]
+        );
+    }
+
     /// Verifies that a freshly learned clause's two initial watches
     /// are recorded in watchers_positive/watchers_negative, not just
     /// in watch itself -- otherwise a future propagate() would never
@@ -5906,8 +6283,9 @@ mod tests {
             num_vars: 4,
             clauses: vec![vec![1, 2, 3, 4]],
         };
-        let (mut working_problem, mut watch, _x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, _x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
@@ -5916,6 +6294,7 @@ mod tests {
         level[4] = 5; // higher level than 3, so add_learned_clause's own "watch the highest-level other literal" tiebreak picks literal 4 (best)
         let mut clause_activity: Vec<f64> = vec![0.0; working_problem.clauses.len()];
         let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
+        let mut choose_watch_pos: Vec<usize> = vec![0; working_problem.clauses.len()];
         let mut estimated_bytes: i64 = 0;
 
         let idx = add_learned_clause(
@@ -5929,6 +6308,7 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
         )
         .expect("expected a stored clause for a length-3 learned clause");
@@ -5956,14 +6336,16 @@ mod tests {
             num_vars: 2,
             clauses: vec![vec![1, 2]],
         };
-        let (mut working_problem, mut watch, x) =
-            bootstrap(&problem).expect("expected a valid bootstrap");
+        let (mut working_problem, mut watch, x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
         let mut lists = occurrence::build(&working_problem);
         let (mut watchers_positive, mut watchers_negative) =
             build_watchers(&watch, working_problem.num_vars);
         let level = vec![0usize; 3];
         let mut clause_activity: Vec<f64> = vec![0.0; working_problem.clauses.len()];
         let mut clause_lbd: Vec<usize> = vec![0; working_problem.clauses.len()];
+        let mut choose_watch_pos: Vec<usize> = vec![0; working_problem.clauses.len()];
         let mut estimated_bytes: i64 = 0;
         let mut reason: Vec<Option<usize>> = vec![None; 3];
         let num_original_clauses = working_problem.clauses.len();
@@ -5984,6 +6366,7 @@ mod tests {
                 &level,
                 &mut clause_activity,
                 &mut clause_lbd,
+                &mut choose_watch_pos,
                 &mut estimated_bytes,
             );
         }
@@ -5995,6 +6378,7 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,

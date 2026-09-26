@@ -133,7 +133,7 @@ func TestRunParallelProvesUnsatisfiableLargerPigeonhole(t *testing.T) {
 // work in.
 func TestShedFrameMaterializesUntriedSiblingForStealing(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 3, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)}}}
-	clauses, root, ok := bootstrap(problem)
+	clauses, root, ok, _ := bootstrap(problem, nil, time.Time{})
 	if !ok {
 		t.Fatalf("bootstrap reported UNSAT unexpectedly")
 	}
@@ -218,7 +218,7 @@ func TestBFSSeedReturnsSATDirectlyWithoutSpawningWorkers(t *testing.T) {
 		NumVars: 2,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(2)}},
 	}
-	clauses, root, ok := bootstrap(problem)
+	clauses, root, ok, _ := bootstrap(problem, nil, time.Time{})
 	if !ok {
 		t.Fatal("bootstrap reported UNSAT unexpectedly")
 	}
@@ -252,7 +252,7 @@ func TestBFSSeedReturnsUNSATDirectlyWithoutSpawningWorkers(t *testing.T) {
 		NumVars: 1,
 		Clauses: []cnf.Clause{{cnf.Literal(1)}, {cnf.Literal(-1)}},
 	}
-	clauses, root, ok := bootstrap(problem)
+	clauses, root, ok, _ := bootstrap(problem, nil, time.Time{})
 	if !ok {
 		// The bootstrap's own unit propagation may already catch this
 		// particular contradiction; either way is a correct UNSAT.
