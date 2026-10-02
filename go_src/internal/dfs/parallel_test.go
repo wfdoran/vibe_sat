@@ -663,3 +663,49 @@ func TestRunParallelReportsExactlyOneWinner(t *testing.T) {
 		}
 	}
 }
+
+// TestShedFrameKeepsRootAssignment guards against a shed snapshot
+// forgetting variables that were already assigned in the search's root
+// node (bootstrap's unit propagation, or bfsSeed's branching): those
+// never appear in searchState.trail, so a snapshot built from the trail
+// alone leaves them Unassigned and a thief could later "solve" the
+// formula with them set to the wrong value.
+func TestShedFrameKeepsRootAssignment(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{
+		{cnf.Literal(1)},
+		{cnf.Literal(2), cnf.Literal(3), cnf.Literal(4)},
+	}}
+	clauses, root, ok, _ := bootstrap(problem, nil, time.Time{})
+	if !ok {
+		t.Fatalf("bootstrap reported UNSAT unexpectedly")
+	}
+	if root.assignment[1] != assign.True {
+		t.Fatalf("bootstrap left variable 1 = %v, want True", root.assignment[1])
+	}
+	workingProblem := &cnf.Problem{NumVars: problem.NumVars, Clauses: clauses}
+	state := startSearch(clauses, workingProblem, root, SelectVarFast, nil)
+
+	calls := 0
+	checkPause := func(int) bool {
+		calls++
+		return calls > 1
+	}
+	if outcome, _ := state.step(workingProblem, SelectVarFast, nil, checkPause); outcome != stepPaused {
+		t.Fatalf("step() outcome = %v, want stepPaused", outcome)
+	}
+
+	d := newDeque()
+	if shedResult, _ := state.shedFrame(d); shedResult != shedPushed {
+		t.Fatalf("shedFrame() = %v, want shedPushed", shedResult)
+	}
+	shed, ok := d.popBottom()
+	if !ok {
+		t.Fatalf("expected shedFrame to have pushed a node onto the deque")
+	}
+	if shed.assignment[1] != assign.True {
+		t.Errorf("shed node's variable 1 = %v, want True (fixed by bootstrap before the search began)", shed.assignment[1])
+	}
+	if shed.assignment[2] != assign.True {
+		t.Errorf("shed node's variable 2 = %v, want True (the untried sibling)", shed.assignment[2])
+	}
+}

@@ -1060,6 +1060,57 @@ mod tests {
         }
     }
 
+    /// Guards against a shed snapshot forgetting variables that were
+    /// already assigned in the search's root node (bootstrap's unit
+    /// propagation, or `bfs_seed`'s branching): those never appear in
+    /// `SearchState::trail`, so a snapshot built from the trail alone
+    /// leaves them Unassigned and a thief could later "solve" the
+    /// formula with them set to the wrong value.
+    #[test]
+    fn test_shed_frame_keeps_root_assignment() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![vec![1], vec![2, 3, 4]],
+        };
+        let (clauses, root) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("bootstrap reported UNSAT unexpectedly");
+        assert_eq!(root.assignment[1], Value::True);
+        let working_problem = Problem {
+            num_vars: problem.num_vars,
+            clauses: clauses.clone(),
+        };
+        let mut rng = StdRng::seed_from_u64(0); // unused by SelectVarVariant::Fast
+        let mut state = start_search(
+            &clauses,
+            &working_problem,
+            root,
+            SelectVarVariant::Fast,
+            &mut rng,
+        );
+
+        let mut calls = 0;
+        let mut check_pause = |_: usize| -> bool {
+            calls += 1;
+            calls > 1
+        };
+        let (outcome, _) = state.step(
+            &working_problem,
+            SelectVarVariant::Fast,
+            &mut rng,
+            Some(&mut check_pause),
+        );
+        assert_eq!(outcome, StepOutcome::Paused);
+
+        let worker: Worker<SearchNode> = Worker::new_lifo();
+        assert!(state.shed_frame(|node| worker.push(node)).is_none());
+        let shed = worker
+            .pop()
+            .expect("expected shed_frame to have pushed a node");
+        assert_eq!(shed.assignment[1], Value::True);
+        assert_eq!(shed.assignment[2], Value::True);
+    }
+
     /// Verifies STAGE18.md's "BFS solves the problem" SAT case: a
     /// formula trivial enough that the very first branch `bfs_seed`
     /// tries already completes a satisfying assignment, before

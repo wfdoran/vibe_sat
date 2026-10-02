@@ -115,7 +115,25 @@ pub fn load(path: &str) -> Result<Params, String> {
     let value = json::parse(&contents).map_err(|e| format!("parse {path}: {e}"))?;
     let mut params = default();
     apply(&mut params, &value);
+    validate(&params).map_err(|e| format!("invalid {path}: {e}"))?;
     Ok(params)
+}
+
+/// Rejects parameter values that would crash the solver rather than
+/// merely tune it badly. Only `glucose_window_size` qualifies today: it
+/// sizes the LBD ring buffer allocated for every cdcl run (whichever
+/// restart strategy is chosen), so a value below 1 panics with an
+/// index-out-of-bounds error. Every other field was checked by hand
+/// with zero, negative and out-of-range values and only degrades
+/// search quality, so it is deliberately left unrestricted.
+fn validate(p: &Params) -> Result<(), String> {
+    if p.cdcl.glucose_window_size < 1 {
+        return Err(format!(
+            "cdcl.glucoseWindowSize must be at least 1 (got {})",
+            p.cdcl.glucose_window_size
+        ));
+    }
+    Ok(())
 }
 
 /// Overlays whatever fields `value` (a parsed JSON object, expected to
@@ -670,6 +688,28 @@ mod tests {
         assert_eq!(p.cdcl.glucose_k, 0.9);
         assert_eq!(p.cdcl.lrb_alpha, default().cdcl.lrb_alpha);
         assert_eq!(p.preprocess, default().preprocess);
+        fs::remove_file(&path).ok();
+    }
+
+    /// Load refuses a glucoseWindowSize below 1 with an error naming
+    /// the field, instead of letting it through to panic inside the
+    /// solver, and still accepts 1.
+    #[test]
+    fn load_rejects_non_positive_glucose_window_size() {
+        for size in ["0", "-5"] {
+            let path = scratch_path("bad_window.json");
+            fs::write(
+                &path,
+                format!(r#"{{"cdcl": {{"glucoseWindowSize": {size}}}}}"#),
+            )
+            .unwrap();
+            let err = load(&path).unwrap_err();
+            assert!(err.contains("glucoseWindowSize"), "size {size}: {err}");
+            fs::remove_file(&path).ok();
+        }
+        let path = scratch_path("ok_window.json");
+        fs::write(&path, r#"{"cdcl": {"glucoseWindowSize": 1}}"#).unwrap();
+        assert_eq!(load(&path).unwrap().cdcl.glucose_window_size, 1);
         fs::remove_file(&path).ok();
     }
 

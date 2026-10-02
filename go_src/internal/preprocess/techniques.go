@@ -740,11 +740,21 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 	mark := make([]int8, numVars+1)
 	var touched []int
 
+	// rejected[v] is true once v has been fully evaluated and found to
+	// increase the clause count. Whether v is eliminable is a pure
+	// function of the live clauses containing v, so that verdict stays
+	// valid until an elimination removes or adds a clause mentioning
+	// v (see the reset below). Without this memo, the restart-from-1
+	// scan re-resolves every rejected variable after every single
+	// elimination -- on a large instance that dominates preprocessing
+	// time and drains the work budget on repeats of the same rejection.
+	rejected := make([]bool, numVars+1)
+
 	for {
 		eliminatedThisPass := false
 		budgetExhausted := false
 		for v := 1; v <= numVars; v++ {
-			if assignment[v] != assign.Unassigned {
+			if assignment[v] != assign.Unassigned || rejected[v] {
 				continue
 			}
 			positive[v] = compactLiveOccurrences(positive[v], live)
@@ -794,6 +804,7 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 				break
 			}
 			if exceeded {
+				rejected[v] = true
 				continue // would increase the clause count; not worth it
 			}
 
@@ -808,15 +819,22 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 
 			for _, idx := range posIdx {
 				live[idx] = false
+				for _, lit := range cs[idx] {
+					rejected[lit.Var()] = false
+				}
 			}
 			for _, idx := range negIdx {
 				live[idx] = false
+				for _, lit := range cs[idx] {
+					rejected[lit.Var()] = false
+				}
 			}
 			for _, resolvent := range resolvents {
 				newIdx := len(cs)
 				cs = append(cs, resolvent)
 				live = append(live, true)
 				for _, lit := range resolvent {
+					rejected[lit.Var()] = false
 					if lit.IsNegative() {
 						negative[lit.Var()] = append(negative[lit.Var()], newIdx)
 					} else {

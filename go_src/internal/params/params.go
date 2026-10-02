@@ -126,7 +126,24 @@ func Load(path string) (Params, error) {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return Params{}, fmt.Errorf("parsing %s: %w", path, err)
 	}
+	if err := validate(p); err != nil {
+		return Params{}, fmt.Errorf("invalid %s: %w", path, err)
+	}
 	return p, nil
+}
+
+// validate rejects parameter values that would crash the solver rather
+// than merely tune it badly. Only GlucoseWindowSize qualifies today: it
+// sizes the LBD ring buffer allocated for every cdcl run (whichever
+// restart strategy is chosen), so a value below 1 panics with a
+// makeslice or index-out-of-range error. Every other field was checked
+// by hand with zero, negative and out-of-range values and only
+// degrades search quality, so it is deliberately left unrestricted.
+func validate(p Params) error {
+	if p.CDCL.GlucoseWindowSize < 1 {
+		return fmt.Errorf("cdcl.glucoseWindowSize must be at least 1 (got %d)", p.CDCL.GlucoseWindowSize)
+	}
+	return nil
 }
 
 // Save writes p to path as indented JSON, creating or truncating the

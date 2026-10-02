@@ -749,3 +749,23 @@ func TestParseUnderscoreAloneSatisfiesHCRequirement(t *testing.T) {
 		t.Errorf("AlgParams = %v, want [_]", formatAlgParams(args.AlgParams))
 	}
 }
+
+// TestParseByteSize verifies plain and suffixed sizes parse to the right
+// byte counts, and that a size whose byte count would overflow int64 is
+// rejected instead of silently wrapping around to a negative number.
+func TestParseByteSize(t *testing.T) {
+	good := map[string]int64{
+		"0": 0, "512": 512, "1k": 1024, "2KB": 2048, "3m": 3 << 20, "4Mb": 4 << 20, "5g": 5 << 30, "8589934591g": 8589934591 << 30,
+	}
+	for in, want := range good {
+		got, err := parseByteSize(in)
+		if err != nil || got != want {
+			t.Errorf("parseByteSize(%q) = (%d, %v), want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "k", "12x", "8589934592g", "9223372036854775807k", "99999999999999999999"} {
+		if got, err := parseByteSize(in); err == nil {
+			t.Errorf("parseByteSize(%q) = %d, want an error", in, got)
+		}
+	}
+}

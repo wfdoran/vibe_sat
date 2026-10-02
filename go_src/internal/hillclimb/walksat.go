@@ -142,6 +142,12 @@ func RunWalkSatParallel(problem *cnf.Problem, lists *occurrence.Lists, params Wa
 // why (RunWalkSatParallel prints one combined announcement/verdict
 // instead of one per worker).
 func walkSatLoop(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatParams, rng *rand.Rand, verbose int) Result {
+	// An empty clause can never be satisfied, and picking a variable
+	// from it (chooseFlipVariable) would index into a zero-length
+	// clause; there is nothing to search for.
+	if hasEmptyClause(problem) {
+		return Result{Satisfiable: false}
+	}
 	startTime := time.Now()
 	numClauses := problem.NumClauses()
 	bestScore := -1
@@ -202,6 +208,17 @@ func walkSatLoop(problem *cnf.Problem, lists *occurrence.Lists, params WalkSatPa
 	}
 
 	return Result{Satisfiable: false, Starts: tries}
+}
+
+// hasEmptyClause reports whether any clause of problem has no
+// literals, which makes the formula unsatisfiable.
+func hasEmptyClause(problem *cnf.Problem) bool {
+	for _, clause := range problem.Clauses {
+		if len(clause) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // chooseFlipVariable picks which variable to flip next, given that

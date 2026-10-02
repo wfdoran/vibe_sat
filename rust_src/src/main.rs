@@ -80,7 +80,7 @@ fn main() -> ExitCode {
         println!("internal parameters: loaded from {internal_params_source}");
     }
 
-    let problem = match cnf::read_dimacs(&args.input, args.verbose) {
+    let mut problem = match cnf::read_dimacs(&args.input, args.verbose) {
         Ok(problem) => problem,
         Err(message) => {
             println!("{message}");
@@ -92,9 +92,18 @@ fn main() -> ExitCode {
         cnf::print_summary(&problem);
     }
 
+    // Drop tautological clauses and repeated literals before anything
+    // else sees the formula (see cnf::normalize); this also covers
+    // --no-preprocessing.
+    let (tautologies, duplicate_literals) = cnf::normalize(&mut problem);
+    if args.verbose >= 1 && (tautologies > 0 || duplicate_literals > 0) {
+        println!(
+            "normalized input: removed {tautologies} tautological clauses and {duplicate_literals} duplicate literals"
+        );
+    }
+
     let original_num_vars = problem.num_vars;
     let mut preresult: Option<PreprocessResult> = None;
-    let mut problem = problem;
     if !args.no_preprocessing {
         let mut result = preprocess::run(
             &problem,

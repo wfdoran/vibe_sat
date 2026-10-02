@@ -629,7 +629,8 @@ fn parse_byte_size(s: &str) -> Result<i64, String> {
         }
     };
 
-    Ok(n * multiplier)
+    n.checked_mul(multiplier)
+        .ok_or_else(|| format!("{s:?} is too large to be a valid byte size"))
 }
 
 /// Checks that the parsed [`Args`] are internally consistent for the
@@ -909,6 +910,32 @@ mod tests {
     fn test_parse_hc_requires_starts_or_time_limit() {
         let result = Args::parse_from_args(["vibe_sat", "--input=problem.cnf", "--algorithm=hc"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_byte_size() {
+        for (input, want) in [
+            ("0", 0i64),
+            ("512", 512),
+            ("1k", 1024),
+            ("2KB", 2048),
+            ("3m", 3 << 20),
+            ("4Mb", 4 << 20),
+            ("5g", 5 << 30),
+            ("8589934591g", 8589934591i64 << 30),
+        ] {
+            assert_eq!(parse_byte_size(input), Ok(want), "{input}");
+        }
+        for input in [
+            "",
+            "k",
+            "12x",
+            "8589934592g",
+            "9223372036854775807k",
+            "99999999999999999999",
+        ] {
+            assert!(parse_byte_size(input).is_err(), "{input}");
+        }
     }
 
     #[test]

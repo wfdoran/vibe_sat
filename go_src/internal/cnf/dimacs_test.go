@@ -3,6 +3,7 @@ package cnf
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -191,5 +192,28 @@ func TestReadDIMACSVerboseAnnouncesFilename(t *testing.T) {
 	}
 	if !strings.Contains(output, path) {
 		t.Errorf("expected stdout to contain filename %q, got %q", path, output)
+	}
+}
+
+// TestReadDIMACSVeryLongLine verifies a clause written on a single line
+// longer than bufio.Scanner's default 64 KiB limit is read correctly.
+func TestReadDIMACSVeryLongLine(t *testing.T) {
+	const n = 30000
+	var b strings.Builder
+	b.WriteString("p cnf 30000 2\n")
+	for i := 1; i <= n; i++ {
+		b.WriteString(strconv.Itoa(i))
+		b.WriteByte(' ')
+	}
+	b.WriteString("0\n-1 0\n")
+	if b.Len() <= 64*1024 {
+		t.Fatalf("test line is only %d bytes; it must exceed 64 KiB", b.Len())
+	}
+	problem, err := ReadDIMACS(writeTempCNF(t, b.String()), 0)
+	if err != nil {
+		t.Fatalf("ReadDIMACS returned unexpected error: %v", err)
+	}
+	if problem.NumClauses() != 2 || len(problem.Clauses[0]) != n {
+		t.Errorf("got %d clauses, first of length %d; want 2 clauses, first of length %d", problem.NumClauses(), len(problem.Clauses[0]), n)
 	}
 }

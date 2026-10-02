@@ -191,6 +191,17 @@ fn walksat_loop<R: Rng>(
     rng: &mut R,
     verbose: i32,
 ) -> super::SolveResult {
+    // An empty clause can never be satisfied, and picking a variable
+    // from it (choose_flip_variable) would index into a zero-length
+    // clause; there is nothing to search for.
+    if has_empty_clause(problem) {
+        return super::SolveResult {
+            satisfiable: false,
+            assignment: assignment::new(problem.num_vars),
+            score: 0,
+            starts: 0,
+        };
+    }
     let start_time = Instant::now();
     let num_clauses = problem.num_clauses();
     let mut local_best_score: i64 = -1;
@@ -276,6 +287,12 @@ fn walksat_loop<R: Rng>(
         score: 0,
         starts: tries,
     }
+}
+
+/// Returns whether any clause of `problem` has no literals, which
+/// makes the formula unsatisfiable.
+fn has_empty_clause(problem: &Problem) -> bool {
+    problem.clauses.iter().any(|clause| clause.is_empty())
 }
 
 /// Picks which variable to flip next, given that `clause_index` names
@@ -406,6 +423,37 @@ mod tests {
         for _ in 0..20 {
             let v = choose_flip_variable(&state, 0, 100, &mut rng);
             assert!((1..=3).contains(&v));
+        }
+    }
+
+    #[test]
+    fn test_has_empty_clause() {
+        let make = |clauses: Vec<Vec<i32>>| Problem {
+            num_vars: 2,
+            clauses,
+        };
+        assert!(!has_empty_clause(&make(vec![])));
+        assert!(!has_empty_clause(&make(vec![vec![1], vec![-1, 2]])));
+        assert!(has_empty_clause(&make(vec![vec![], vec![1]])));
+        assert!(has_empty_clause(&make(vec![vec![1], vec![]])));
+    }
+
+    #[test]
+    fn test_run_walksat_with_empty_clause_reports_unknown() {
+        let problem = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, 2], vec![]],
+        };
+        let lists = occurrence::build(&problem);
+        for noise in [0, 50, 100] {
+            let params = WalkSatParams {
+                noise_percent: noise,
+                max_flips_per_try: 10,
+                ..WalkSatParams::default()
+            };
+            let mut rng = StdRng::seed_from_u64(3);
+            let result = run_walksat(&problem, &lists, params, &mut rng, 0);
+            assert!(!result.satisfiable, "noise {noise}");
         }
     }
 

@@ -215,6 +215,61 @@ pub fn print_summary(problem: &Problem) {
     let _ = write_summary(problem, &mut stdout);
 }
 
+/// Rewrites `problem` in place so that no clause is a tautology and no
+/// clause repeats a literal: every clause containing both `x` and `-x`
+/// is dropped (it is satisfied by every assignment, so removing it
+/// changes no verdict), and every repeated occurrence of the same
+/// literal within a clause is removed, keeping the first. An empty
+/// clause is left alone -- it is what makes a formula unsatisfiable.
+///
+/// The solvers downstream assume this shape: a tautological clause
+/// makes variable elimination self-resolve incorrectly, and a clause
+/// that repeats a literal (e.g. "x x") is really a unit clause but
+/// looks like it has two distinct watchable literals to the
+/// watch-selection code. Reads each literal once, using a per-variable
+/// mark array, so it is O(total literals). Returns `(tautologies,
+/// duplicate_literals)`: how many clauses were dropped as tautologies
+/// and how many duplicate literal occurrences were removed from the
+/// clauses that were kept.
+pub fn normalize(problem: &mut Problem) -> (usize, usize) {
+    // 0 = unseen in this clause, 1 = seen positive, -1 = seen negative.
+    let mut mark = vec![0i8; problem.num_vars + 1];
+    let mut tautologies = 0usize;
+    let mut duplicate_literals = 0usize;
+    let clauses = std::mem::take(&mut problem.clauses);
+    let mut kept: Vec<Clause> = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let mut out: Clause = Vec::with_capacity(clause.len());
+        let mut tautology = false;
+        let mut dups = 0usize;
+        for &lit in &clause {
+            let v = literal_var(lit);
+            let sign: i8 = if literal_is_negative(lit) { -1 } else { 1 };
+            if mark[v] == sign {
+                dups += 1;
+                continue;
+            }
+            if mark[v] == -sign {
+                tautology = true;
+                break;
+            }
+            mark[v] = sign;
+            out.push(lit);
+        }
+        for &lit in &out {
+            mark[literal_var(lit)] = 0;
+        }
+        if tautology {
+            tautologies += 1;
+            continue;
+        }
+        duplicate_literals += dups;
+        kept.push(out);
+    }
+    problem.clauses = kept;
+    (tautologies, duplicate_literals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +450,59 @@ mod tests {
         assert!(output.contains("Number of variables: 4"));
         assert!(output.contains("Number of clauses: 2"));
         assert!(output.contains("Number of literals: 5"));
+    }
+
+    #[test]
+    fn test_normalize_drops_tautologies_and_duplicates() {
+        let mut p = Problem {
+            num_vars: 4,
+            clauses: vec![
+                vec![1, -1, 2],
+                vec![3, 2, 3, 2],
+                vec![-4, 1],
+                vec![2, 3, -2],
+                vec![-1, -1, -1],
+                vec![4, -3, 4, -3],
+            ],
+        };
+        let (tautologies, dups) = normalize(&mut p);
+        assert_eq!(
+            p.clauses,
+            vec![vec![3, 2], vec![-4, 1], vec![-1], vec![4, -3]]
+        );
+        assert_eq!(tautologies, 2);
+        assert_eq!(dups, 6);
+        assert_eq!(p.num_vars, 4);
+    }
+
+    #[test]
+    fn test_normalize_keeps_empty_clause() {
+        let mut p = Problem {
+            num_vars: 2,
+            clauses: vec![vec![], vec![1, 2]],
+        };
+        assert_eq!(normalize(&mut p), (0, 0));
+        assert_eq!(p.clauses, vec![vec![], vec![1, 2]]);
+    }
+
+    #[test]
+    fn test_normalize_no_op_on_clean_input() {
+        let mut p = Problem {
+            num_vars: 3,
+            clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
+        };
+        assert_eq!(normalize(&mut p), (0, 0));
+        assert_eq!(p.clauses, vec![vec![1, 2], vec![-1, 3], vec![-2, -3]]);
+    }
+
+    #[test]
+    fn test_normalize_all_tautologies() {
+        let mut p = Problem {
+            num_vars: 2,
+            clauses: vec![vec![1, -1], vec![2, -2]],
+        };
+        let (tautologies, _) = normalize(&mut p);
+        assert_eq!(tautologies, 2);
+        assert!(p.clauses.is_empty());
     }
 }

@@ -688,3 +688,39 @@ func TestWalkSatLoopStopsImmediatelyWhenStopIsAlreadySet(t *testing.T) {
 		t.Error("expected Satisfiable = false when stopped before any start")
 	}
 }
+
+// TestHasEmptyClause verifies hasEmptyClause finds an empty clause
+// anywhere in the formula and is false when there is none.
+func TestHasEmptyClause(t *testing.T) {
+	cases := []struct {
+		name    string
+		clauses []cnf.Clause
+		want    bool
+	}{
+		{"no clauses", nil, false},
+		{"all non-empty", []cnf.Clause{{1}, {-1, 2}}, false},
+		{"empty first", []cnf.Clause{{}, {1}}, true},
+		{"empty last", []cnf.Clause{{1}, {}}, true},
+	}
+	for _, c := range cases {
+		if got := hasEmptyClause(&cnf.Problem{NumVars: 2, Clauses: c.clauses}); got != c.want {
+			t.Errorf("%s: hasEmptyClause = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRunWalkSatWithEmptyClauseReportsUnknown verifies WalkSAT returns
+// "not found" straight away (instead of panicking in the noise branch
+// or the greedy branch) when the formula contains an empty clause, for
+// both noise settings and even with no try limit.
+func TestRunWalkSatWithEmptyClauseReportsUnknown(t *testing.T) {
+	problem := &cnf.Problem{NumVars: 2, Clauses: []cnf.Clause{{1, 2}, {}}}
+	lists := occurrence.Build(problem)
+	for _, noise := range []int{0, 50, 100} {
+		params := WalkSatParams{MaxFlipsPerTry: 10, NoisePercent: noise}
+		result := RunWalkSat(problem, lists, params, rand.New(rand.NewPCG(3, 3)), 0)
+		if result.Satisfiable {
+			t.Errorf("noise %d: expected Satisfiable = false", noise)
+		}
+	}
+}

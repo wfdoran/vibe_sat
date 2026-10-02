@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// maxDIMACSLineBytes is the longest single line ReadDIMACS accepts.
+const maxDIMACSLineBytes = 1 << 30
+
 // ReadDIMACS opens the file named by filename and parses it as a
 // DIMACS formatted CNF file, returning the resulting Problem.
 //
@@ -43,6 +46,10 @@ func ReadDIMACS(filename string, verbose int) (*Problem, error) {
 	)
 
 	scanner := bufio.NewScanner(file)
+	// A single clause may be written on one very long line; the
+	// default 64 KiB token limit would reject it (bufio.Scanner:
+	// token too long).
+	scanner.Buffer(make([]byte, 0, 64*1024), maxDIMACSLineBytes)
 	lineNum := 0
 readLines:
 	for scanner.Scan() {

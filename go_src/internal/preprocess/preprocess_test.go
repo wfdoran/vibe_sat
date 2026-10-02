@@ -553,6 +553,56 @@ func TestEliminateVariablesSkipsWhenIncreasing(t *testing.T) {
 	}
 }
 
+// TestEliminateVariablesDoesNotReEvaluateRejected verifies the
+// rejection memo: variable 1 (2 positive x 3 negative occurrences =
+// 6 resolvents > 5 clauses) is rejected after costing 6 budget units,
+// variable 7 is then eliminated for 1 unit, and the restart-from-1
+// scan that follows must skip variable 1 instead of paying 6 more.
+// Total spend is therefore exactly 7 (13 without the memo).
+func TestEliminateVariablesDoesNotReEvaluateRejected(t *testing.T) {
+	clauses := []cnf.Clause{
+		{cnf.Literal(1), cnf.Literal(2)},
+		{cnf.Literal(1), cnf.Literal(3)},
+		{cnf.Literal(-1), cnf.Literal(4)},
+		{cnf.Literal(-1), cnf.Literal(5)},
+		{cnf.Literal(-1), cnf.Literal(6)},
+		{cnf.Literal(7), cnf.Literal(8)},
+		{cnf.Literal(-7), cnf.Literal(9)},
+	}
+	assignment := assign.New(9)
+	budget := 100
+
+	steps := eliminateVariables(&clauses, assignment, 9, &budget)
+	if len(steps) != 1 || steps[0].Var != 7 {
+		t.Fatalf("steps = %v, want exactly one step eliminating variable 7", steps)
+	}
+	if spent := 100 - budget; spent != 7 {
+		t.Errorf("budget spent = %d, want 7 (rejected variable 1 must not be re-resolved)", spent)
+	}
+}
+
+// TestEliminateVariablesRejectionInvalidatedByNeighbour verifies the
+// memo is dropped when it stops being true. Variable 1 is rejected at
+// first (2 x 3 = 6 resolvents > 5 clauses). Eliminating variable 7
+// merges the two clauses {-1,4,7} and {-1,4,-7} into {-1,4}, leaving
+// variable 1 with 2 x 2 = 4 resolvents for 4 clauses, which is
+// acceptable -- so variable 1 must be eliminated on a later scan.
+func TestEliminateVariablesRejectionInvalidatedByNeighbour(t *testing.T) {
+	clauses := []cnf.Clause{
+		{cnf.Literal(1), cnf.Literal(2)},
+		{cnf.Literal(1), cnf.Literal(3)},
+		{cnf.Literal(-1), cnf.Literal(4), cnf.Literal(7)},
+		{cnf.Literal(-1), cnf.Literal(4), cnf.Literal(-7)},
+		{cnf.Literal(-1), cnf.Literal(5)},
+	}
+	assignment := assign.New(7)
+
+	steps := eliminateVariables(&clauses, assignment, 7, hugeBudget())
+	if len(steps) != 2 || steps[0].Var != 7 || steps[1].Var != 1 {
+		t.Fatalf("steps = %v, want eliminations of variable 7 then variable 1", steps)
+	}
+}
+
 // TestResolveWithMarksMatchesResolveAcrossReusedBuffers checks
 // resolveWithMarks against resolve directly (tautology detection,
 // intra-clause duplicate-literal handling, and the resolvent

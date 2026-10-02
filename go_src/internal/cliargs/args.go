@@ -13,6 +13,7 @@ package cliargs
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -304,6 +305,9 @@ func parseByteSize(s string) (int64, error) {
 		return 0, fmt.Errorf("%q has an unrecognized unit %q; expected one of k, kb, m, mb, g, gb", s, s[i:])
 	}
 
+	if n > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("%q is too large to be a valid byte size", s)
+	}
 	return n * multiplier, nil
 }
 

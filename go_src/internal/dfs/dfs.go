@@ -283,9 +283,13 @@ func (s *searchState) shedFrame(deque *deque) (outcome shedOutcome, satisfyingAs
 			continue // untouched (nothing committed yet) or already exhausted/shed
 		}
 
-		snapAssignment := assign.New(len(s.x) - 1)
-		for _, v := range s.trail[:f.mark] {
-			snapAssignment[v] = s.x[v]
+		// Start from a full copy of x and unassign only what this frame
+		// (and its descendants) added: variables fixed in the root node
+		// (bootstrap propagation, bfsSeed decisions) are never on the
+		// trail, so rebuilding from the trail alone would drop them.
+		snapAssignment := append(assign.Assignment(nil), s.x...)
+		for _, v := range s.trail[f.mark:] {
+			snapAssignment[v] = assign.Unassigned
 		}
 		snapAssignment[f.variable] = assign.True
 		snapWatch := cloneWatchState(s.ws)

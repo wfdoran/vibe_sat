@@ -2,6 +2,7 @@ package params
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -126,5 +127,30 @@ func TestResolveFallsBackToBuiltInDefaults(t *testing.T) {
 func TestResolveExplicitPathMissingIsAnError(t *testing.T) {
 	if _, _, err := Resolve(filepath.Join(t.TempDir(), "does-not-exist.json")); err == nil {
 		t.Fatal("Resolve with a missing explicit path succeeded, want an error")
+	}
+}
+
+// TestLoadRejectsNonPositiveGlucoseWindowSize verifies Load refuses a
+// glucoseWindowSize below 1 with an error naming the field, instead of
+// letting it through to panic inside the solver, and still accepts 1.
+func TestLoadRejectsNonPositiveGlucoseWindowSize(t *testing.T) {
+	for _, size := range []string{"0", "-5"} {
+		path := filepath.Join(t.TempDir(), "bad.json")
+		if err := writeFile(path, `{"cdcl": {"glucoseWindowSize": `+size+`}}`); err != nil {
+			t.Fatalf("writeFile: %v", err)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "glucoseWindowSize") {
+			t.Errorf("Load with glucoseWindowSize=%s: err = %v, want an error naming glucoseWindowSize", size, err)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "ok.json")
+	if err := writeFile(path, `{"cdcl": {"glucoseWindowSize": 1}}`); err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+	p, err := Load(path)
+	if err != nil || p.CDCL.GlucoseWindowSize != 1 {
+		t.Errorf("Load with glucoseWindowSize=1: (%d, %v), want (1, nil)", p.CDCL.GlucoseWindowSize, err)
 	}
 }

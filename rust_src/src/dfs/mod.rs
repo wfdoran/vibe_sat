@@ -457,9 +457,14 @@ impl<'a> SearchState<'a> {
                 continue; // untouched (nothing committed yet) or already exhausted/shed
             }
 
-            let mut snap_assignment = assignment::new(self.x.len() - 1);
-            for &v in &self.trail[..f.mark] {
-                snap_assignment[v] = self.x[v];
+            // Start from a full copy of x and unassign only what this
+            // frame (and its descendants) added: variables fixed in the
+            // root node (bootstrap propagation, bfs_seed decisions) are
+            // never on the trail, so rebuilding from the trail alone
+            // would silently drop them.
+            let mut snap_assignment = self.x.clone();
+            for &v in &self.trail[f.mark..] {
+                snap_assignment[v] = Value::Unassigned;
             }
             snap_assignment[f.variable] = Value::True;
             let mut snap_watch = self.ws.clone();

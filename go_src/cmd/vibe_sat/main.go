@@ -10,6 +10,7 @@ import (
 	crand "crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"runtime"
@@ -87,6 +88,14 @@ func main() {
 		cnf.PrintSummary(problem)
 	}
 
+	// Drop tautological clauses and repeated literals before anything
+	// else sees the formula (see cnf.Normalize); this also covers
+	// --no-preprocessing.
+	tautologies, duplicateLiterals := cnf.Normalize(problem)
+	if args.Verbose >= 1 && (tautologies > 0 || duplicateLiterals > 0) {
+		fmt.Printf("normalized input: removed %d tautological clauses and %d duplicate literals\n", tautologies, duplicateLiterals)
+	}
+
 	originalNumVars := problem.NumVars
 	var preResult *preprocess.Result
 	if !args.NoPreprocessing {
@@ -115,6 +124,19 @@ func main() {
 	}
 
 	exit(startTime, args.Verbose)
+}
+
+// timeLimitDuration converts a --time-limit-secs value to a
+// time.Duration, saturating at the largest representable duration
+// (about 292 years) instead of overflowing: a plain
+// time.Duration(secs) * time.Second wraps to a negative value for
+// very large secs, which would make the search give up immediately.
+func timeLimitDuration(secs int) time.Duration {
+	const maxSecs = int(math.MaxInt64 / int64(time.Second))
+	if secs > maxSecs {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // exit prints the total wall-clock time used since startTime (per
@@ -177,7 +199,7 @@ func runHillClimb(problem *cnf.Problem, preResult *preprocess.Result, originalNu
 		params.NumStarts = &numStarts
 	}
 	if args.TimeLimitSecs != nil {
-		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		limit := timeLimitDuration(*args.TimeLimitSecs)
 		params.TimeLimit = &limit
 	}
 
@@ -217,7 +239,7 @@ func runWalkSat(problem *cnf.Problem, preResult *preprocess.Result, originalNumV
 		params.NoisePercent = int(*args.AlgParams[2])
 	}
 	if args.TimeLimitSecs != nil {
-		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		limit := timeLimitDuration(*args.TimeLimitSecs)
 		params.TimeLimit = &limit
 	}
 
@@ -247,7 +269,7 @@ func runDFS(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars 
 
 	var timeLimit *time.Duration
 	if args.TimeLimitSecs != nil {
-		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		limit := timeLimitDuration(*args.TimeLimitSecs)
 		timeLimit = &limit
 	}
 
@@ -290,7 +312,7 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 
 	var timeLimit *time.Duration
 	if args.TimeLimitSecs != nil {
-		limit := time.Duration(*args.TimeLimitSecs) * time.Second
+		limit := timeLimitDuration(*args.TimeLimitSecs)
 		timeLimit = &limit
 	}
 

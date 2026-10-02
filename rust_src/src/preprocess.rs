@@ -1110,11 +1110,21 @@ fn eliminate_variables(
     let mut mark: Vec<i8> = vec![0; num_vars + 1];
     let mut touched: Vec<usize> = Vec::new();
 
+    // rejected[v] is true once v has been fully evaluated and found to
+    // increase the clause count. Whether v is eliminable is a pure
+    // function of the live clauses containing v, so that verdict stays
+    // valid until an elimination removes or adds a clause mentioning
+    // v (see the reset below). Without this memo, the restart-from-1
+    // scan re-resolves every rejected variable after every single
+    // elimination -- on a large instance that dominates preprocessing
+    // time and drains the work budget on repeats of the same rejection.
+    let mut rejected: Vec<bool> = vec![false; num_vars + 1];
+
     loop {
         let mut eliminated_this_pass = false;
         let mut budget_exhausted = false;
         for v in 1..=num_vars {
-            if assignment[v] != Value::Unassigned {
+            if assignment[v] != Value::Unassigned || rejected[v] {
                 continue;
             }
             compact_live_occurrences(&mut positive[v], &live);
@@ -1165,6 +1175,7 @@ fn eliminate_variables(
                 break;
             }
             if exceeded {
+                rejected[v] = true;
                 continue; // would increase the clause count; not worth it
             }
 
@@ -1178,11 +1189,15 @@ fn eliminate_variables(
 
             for &idx in pos_idx.iter().chain(neg_idx.iter()) {
                 live[idx] = false;
+                for &lit in &cs[idx] {
+                    rejected[cnf::literal_var(lit)] = false;
+                }
             }
             for resolvent in resolvents {
                 let new_idx = cs.len();
                 for &lit in &resolvent {
                     let w = cnf::literal_var(lit);
+                    rejected[w] = false;
                     if cnf::literal_is_negative(lit) {
                         negative[w].push(new_idx);
                     } else {
@@ -1787,6 +1802,58 @@ mod tests {
 
         let steps = eliminate_variables(&mut clauses, &assignment, 6, &mut huge_budget());
         assert!(steps.is_empty());
+    }
+
+    /// Verifies the rejection memo: variable 1 (2 positive x 3
+    /// negative occurrences = 6 resolvents > 5 clauses) is rejected
+    /// after costing 6 budget units, variable 7 is then eliminated for
+    /// 1 unit, and the restart-from-1 scan that follows must skip
+    /// variable 1 instead of paying 6 more. Total spend is therefore
+    /// exactly 7 (13 without the memo).
+    #[test]
+    fn test_eliminate_variables_does_not_re_evaluate_rejected() {
+        let mut clauses = vec![
+            vec![1, 2],
+            vec![1, 3],
+            vec![-1, 4],
+            vec![-1, 5],
+            vec![-1, 6],
+            vec![7, 8],
+            vec![-7, 9],
+        ];
+        let assignment = assignment::new(9);
+        let mut budget = 100;
+
+        let steps = eliminate_variables(&mut clauses, &assignment, 9, &mut budget);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].var, 7);
+        assert_eq!(
+            100 - budget,
+            7,
+            "rejected variable 1 must not be re-resolved"
+        );
+    }
+
+    /// Verifies the memo is dropped when it stops being true. Variable
+    /// 1 is rejected at first (2 x 3 = 6 resolvents > 5 clauses).
+    /// Eliminating variable 7 merges the two clauses {-1,4,7} and
+    /// {-1,4,-7} into {-1,4}, leaving variable 1 with 2 x 2 = 4
+    /// resolvents for 4 clauses, which is acceptable -- so variable 1
+    /// must be eliminated on a later scan.
+    #[test]
+    fn test_eliminate_variables_rejection_invalidated_by_neighbour() {
+        let mut clauses = vec![
+            vec![1, 2],
+            vec![1, 3],
+            vec![-1, 4, 7],
+            vec![-1, 4, -7],
+            vec![-1, 5],
+        ];
+        let assignment = assignment::new(7);
+
+        let steps = eliminate_variables(&mut clauses, &assignment, 7, &mut huge_budget());
+        let vars: Vec<usize> = steps.iter().map(|s| s.var).collect();
+        assert_eq!(vars, vec![7, 1]);
     }
 
     /// A deliberately naive, obviously-correct reference implementation
