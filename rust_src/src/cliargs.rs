@@ -247,14 +247,16 @@ Options:
 
   --time-limit-secs=<integer>, -t <integer>
         Optional time limit, in seconds, for the search. Required by
-        "hc"/"ws" unless --alg-params is given instead; optional for
+        "hc"/"ws" unless a real (not "_") first --alg-params value (the
+        number of restarts) is given instead; optional for
         "dfs" (which will otherwise run until it finds a solution or
         exhausts the search space, however long that takes).
 
   --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
-        Algorithm-specific parameters (1 to 4 integer values); at
-        least one of --alg-params or --time-limit-secs is required for
-        "hc"/"ws". Every value is positional -- to set val2 you must
+        Algorithm-specific parameters (1 to 4 integer values). For
+        "hc"/"ws", either --time-limit-secs or a real (not "_") val1
+        is required, since neither algorithm otherwise stops on its
+        own. Every value is positional -- to set val2 you must
         also supply val1, to set val3 you must also supply val1 and
         val2, and so on -- but any value may be given as "_"
         (STAGE44.md) instead of a real number to mean "use this slot's
@@ -633,11 +635,19 @@ fn parse_byte_size(s: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("{s:?} is too large to be a valid byte size"))
 }
 
+/// Reports whether `alg_params` carries a real first value -- the
+/// number of starts for hc, the number of tries for ws -- as opposed to
+/// being absent or having `"_"` (a `None` element, STAGE44.md) in that
+/// slot. hc and ws have no built-in stopping point, so without either
+/// this or `--time-limit-secs` they would search forever.
+fn has_iteration_count(alg_params: Option<&[Option<i64>]>) -> bool {
+    matches!(alg_params, Some([Some(_), ..]))
+}
+
 /// Checks that the parsed [`Args`] are internally consistent for the
-/// chosen algorithm: currently only `"hc"` is supported, and it
-/// requires at least one of `--time-limit-secs` or a single
-/// `--alg-params` value (the number of restarts), both of which must
-/// be positive if given.
+/// chosen algorithm. `hc` and `ws` require either `--time-limit-secs`
+/// or a real (non-`_`) first `--alg-params` value (the number of
+/// restarts/tries), each of which must be positive if given.
 fn validate(args: &Args) -> Result<(), String> {
     if args.num_threads < 1 {
         return Err("--num-threads must be a positive integer".to_string());
@@ -661,9 +671,9 @@ fn validate(args: &Args) -> Result<(), String> {
                     );
                 }
             }
-            if args.time_limit_secs.is_none() && args.alg_params.is_none() {
+            if args.time_limit_secs.is_none() && !has_iteration_count(args.alg_params.as_deref()) {
                 return Err(
-                    "for --algorithm=hc, either --time-limit-secs or --alg-params (number of starts) must be given"
+                    "for --algorithm=hc, either --time-limit-secs or a real (not \"_\") first --alg-params value (number of starts) must be given"
                         .to_string(),
                 );
             }
@@ -702,9 +712,9 @@ fn validate(args: &Args) -> Result<(), String> {
                     );
                 }
             }
-            if args.time_limit_secs.is_none() && args.alg_params.is_none() {
+            if args.time_limit_secs.is_none() && !has_iteration_count(args.alg_params.as_deref()) {
                 return Err(
-                    "for --algorithm=ws, either --time-limit-secs or --alg-params (number of tries) must be given"
+                    "for --algorithm=ws, either --time-limit-secs or a real (not \"_\") first --alg-params value (number of tries) must be given"
                         .to_string(),
                 );
             }
@@ -1709,20 +1719,64 @@ mod tests {
         assert_eq!(args.alg_params, Some(vec![Some(2), Some(2)]));
     }
 
-    /// Verifies that "--alg-params _" still counts as "--alg-params
-    /// was given" for hc's "at least one of --alg-params or
-    /// --time-limit-secs" requirement, even though the resulting slot
-    /// is `None`.
+    /// Verifies the STAGE55.md rule: hc and ws need either
+    /// `--time-limit-secs` or a real (non-"_") first `--alg-params`
+    /// value (the number of starts/tries); `--alg-params _` alone
+    /// supplies neither, so it is an error, as are `_` followed by
+    /// other values (ws's max-flips and noise slots do not bound the
+    /// search).
     #[test]
-    fn test_parse_underscore_alone_satisfies_hc_requirement() {
-        let args = Args::parse_from_args([
-            "vibe_sat",
-            "--input=problem.cnf",
-            "--algorithm=hc",
-            "--alg-params",
-            "_",
-        ])
-        .expect("expected successful parse");
-        assert_eq!(args.alg_params, Some(vec![None]));
+    fn test_parse_hc_ws_require_real_iteration_count_or_time_limit() {
+        let rejected: [&[&str]; 4] = [
+            &["--algorithm=hc", "--alg-params", "_"],
+            &["--algorithm=ws", "--alg-params", "_"],
+            &["--algorithm=ws", "--alg-params", "_", "1000"],
+            &["--algorithm=ws", "--alg-params", "_", "1000", "50"],
+        ];
+        for extra in rejected {
+            let argv = ["vibe_sat", "--input=problem.cnf"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let err = Args::parse_from_args(argv).expect_err("expected an error");
+            assert!(err.contains("must be given"), "{extra:?}: {err}");
+        }
+
+        let accepted: [&[&str]; 5] = [
+            &[
+                "--algorithm=hc",
+                "--alg-params",
+                "_",
+                "--time-limit-secs",
+                "5",
+            ],
+            &["--algorithm=hc", "--alg-params", "10"],
+            &[
+                "--algorithm=ws",
+                "--alg-params",
+                "_",
+                "1000",
+                "--time-limit-secs",
+                "5",
+            ],
+            &["--algorithm=ws", "--alg-params", "5", "_", "50"],
+            &["--algorithm=ws", "--time-limit-secs", "5"],
+        ];
+        for extra in accepted {
+            let argv = ["vibe_sat", "--input=problem.cnf"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            Args::parse_from_args(argv).unwrap_or_else(|e| panic!("{extra:?}: {e}"));
+        }
+    }
+
+    /// Checks the helper directly: only a `Some` first element counts.
+    #[test]
+    fn test_has_iteration_count() {
+        assert!(!has_iteration_count(None));
+        assert!(!has_iteration_count(Some(&[])));
+        assert!(!has_iteration_count(Some(&[None])));
+        assert!(!has_iteration_count(Some(&[None, Some(5)])));
+        assert!(has_iteration_count(Some(&[Some(5)])));
+        assert!(has_iteration_count(Some(&[Some(5), None])));
     }
 }

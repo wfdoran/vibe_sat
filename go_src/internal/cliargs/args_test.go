@@ -736,17 +736,62 @@ func TestParseUnderscoreForMemoryLimit(t *testing.T) {
 	}
 }
 
-// TestParseUnderscoreAloneSatisfiesHCRequirement verifies that
-// "--alg-params _" still counts as "--alg-params was given" for hc's
-// "at least one of --alg-params or --time-limit-secs" requirement,
-// even though the resulting slot is nil.
-func TestParseUnderscoreAloneSatisfiesHCRequirement(t *testing.T) {
-	args, err := Parse([]string{"--input=problem.cnf", "--algorithm=hc", "--alg-params", "_"})
-	if err != nil {
-		t.Fatalf("Parse returned unexpected error: %v", err)
+// TestParseHCWSRequireRealIterationCountOrTimeLimit verifies the STAGE55.md
+// rule: hc and ws need either --time-limit-secs or a real (non-"_") first
+// --alg-params value (the number of starts/tries); "--alg-params _" alone
+// supplies neither, so it is an error, as are "_" followed by other values
+// (ws's max-flips and noise slots do not bound the search).
+func TestParseHCWSRequireRealIterationCountOrTimeLimit(t *testing.T) {
+	rejected := [][]string{
+		{"--algorithm=hc", "--alg-params", "_"},
+		{"--algorithm=ws", "--alg-params", "_"},
+		{"--algorithm=ws", "--alg-params", "_", "1000"},
+		{"--algorithm=ws", "--alg-params", "_", "1000", "50"},
 	}
-	if len(args.AlgParams) != 1 || args.AlgParams[0] != nil {
-		t.Errorf("AlgParams = %v, want [_]", formatAlgParams(args.AlgParams))
+	for _, extra := range rejected {
+		argv := append([]string{"--input=problem.cnf"}, extra...)
+		if args, err := Parse(argv); err == nil {
+			t.Errorf("Parse(%v) succeeded with AlgParams %v, want an error", extra, formatAlgParams(args.AlgParams))
+		} else if !strings.Contains(err.Error(), "must be given") {
+			t.Errorf("Parse(%v) error = %q, want one saying what must be given", extra, err)
+		}
+	}
+
+	accepted := [][]string{
+		{"--algorithm=hc", "--alg-params", "_", "--time-limit-secs", "5"},
+		{"--algorithm=hc", "--alg-params", "10"},
+		{"--algorithm=ws", "--alg-params", "_", "1000", "--time-limit-secs", "5"},
+		{"--algorithm=ws", "--alg-params", "5", "_", "50"},
+		{"--algorithm=ws", "--time-limit-secs", "5"},
+	}
+	for _, extra := range accepted {
+		argv := append([]string{"--input=problem.cnf"}, extra...)
+		if _, err := Parse(argv); err != nil {
+			t.Errorf("Parse(%v) returned unexpected error: %v", extra, err)
+		}
+	}
+}
+
+// TestHasIterationCount checks the helper directly: only a non-nil first
+// element counts.
+func TestHasIterationCount(t *testing.T) {
+	five := int64(5)
+	cases := []struct {
+		name   string
+		params []*int64
+		want   bool
+	}{
+		{"nil slice", nil, false},
+		{"empty", []*int64{}, false},
+		{"underscore first", []*int64{nil}, false},
+		{"underscore first, real second", []*int64{nil, &five}, false},
+		{"real first", []*int64{&five}, true},
+		{"real first, underscore second", []*int64{&five, nil}, true},
+	}
+	for _, tc := range cases {
+		if got := hasIterationCount(tc.params); got != tc.want {
+			t.Errorf("%s: hasIterationCount = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

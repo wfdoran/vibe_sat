@@ -1,4 +1,15 @@
 sat_comp
 *~
 #*#
-
+.bashrc
+.bash_profile
+.claude
+.gitconfig
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.vscode
+.zprofile
+.zshrc
+.gitmodules

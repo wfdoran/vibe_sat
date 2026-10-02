@@ -5648,6 +5648,229 @@ mod tests {
         assert_eq!(got[0], 1, "publish must not alias the caller's slice");
     }
 
+    // STAGE55.md: clause-import cursor tests, mirroring
+    // go_src/internal/cdcl/parallel_test.go's own coverage.
+
+    /// Verifies `published` counts every publish, including ones that
+    /// have wrapped the ring, since `maybe_import` relies on it as the
+    /// peer's write index.
+    #[test]
+    fn test_export_buffer_published() {
+        let buf = clause_share::ExportBuffer::new(4);
+        assert_eq!(buf.published(), 0);
+        for _ in 0..10 {
+            buf.publish(&vec![1, 2]);
+        }
+        assert_eq!(buf.published(), 10);
+    }
+
+    /// Checks every way `import_window` can move the start of the
+    /// range: untouched (small backlog), raised past overwritten slots,
+    /// raised to honor `max_per_peer`, and clamped when the cursor is
+    /// ahead of the peer. `end` must always equal `written`.
+    #[test]
+    fn test_import_window() {
+        // (name, cursor, written, capacity, max_per_peer, want_start, want_end)
+        let cases: [(&str, u64, u64, u64, u64, u64, u64); 11] = [
+            ("nothing published", 0, 0, 8, 100, 0, 0),
+            ("caught up", 5, 5, 8, 100, 5, 5),
+            ("small backlog is read whole", 2, 5, 8, 100, 2, 5),
+            ("ring has not wrapped, cursor at start", 0, 3, 8, 100, 0, 3),
+            (
+                "slots before written-capacity were overwritten",
+                0,
+                20,
+                8,
+                100,
+                12,
+                20,
+            ),
+            ("cursor inside the surviving range", 15, 20, 8, 100, 15, 20),
+            (
+                "max_per_peer keeps only the newest clauses",
+                0,
+                6,
+                8,
+                2,
+                4,
+                6,
+            ),
+            (
+                "max_per_peer larger than the backlog changes nothing",
+                4,
+                6,
+                8,
+                5,
+                4,
+                6,
+            ),
+            ("max_per_peer of one", 0, 6, 8, 1, 5, 6),
+            ("cursor ahead of written is clamped", 9, 5, 8, 100, 5, 5),
+            (
+                "cursor far ahead after a wrapped ring",
+                1000,
+                300,
+                256,
+                100,
+                300,
+                300,
+            ),
+        ];
+        for (name, cursor, written, capacity, max_per_peer, want_start, want_end) in cases {
+            assert_eq!(
+                clause_share::import_window(cursor, written, capacity, max_per_peer),
+                (want_start, want_end),
+                "{name}"
+            );
+        }
+    }
+
+    /// The mutable solver state `maybe_import` reads and extends, for a
+    /// 6-variable problem with no clauses and every variable
+    /// unassigned.
+    struct ImportFixture {
+        clauses: Vec<Clause>,
+        lists: occurrence::Lists,
+        watchers_positive: Vec<Vec<usize>>,
+        watchers_negative: Vec<Vec<usize>>,
+        watch: Vec<[Literal; 2]>,
+        x: Assignment,
+        clause_activity: Vec<f64>,
+        clause_lbd: Vec<usize>,
+        choose_watch_pos: Vec<usize>,
+        estimated_bytes: i64,
+    }
+
+    impl ImportFixture {
+        fn new() -> Self {
+            let problem = Problem {
+                num_vars: 6,
+                clauses: Vec::new(),
+            };
+            Self {
+                clauses: Vec::new(),
+                lists: occurrence::build(&problem),
+                watchers_positive: vec![Vec::new(); 7],
+                watchers_negative: vec![Vec::new(); 7],
+                watch: Vec::new(),
+                x: vec![Value::Unassigned; 7],
+                clause_activity: Vec::new(),
+                clause_lbd: Vec::new(),
+                choose_watch_pos: Vec::new(),
+                estimated_bytes: 0,
+            }
+        }
+
+        /// Calls `maybe_import` against this fixture's state, returning
+        /// how many clauses it added.
+        fn run(
+            &mut self,
+            peer: &clause_share::ExportBuffer,
+            cursor: &mut u64,
+            conflicts: usize,
+        ) -> usize {
+            let before = self.clauses.len();
+            clause_share::maybe_import(
+                &[peer],
+                std::slice::from_mut(cursor),
+                conflicts,
+                &mut self.clauses,
+                &mut self.lists,
+                &mut self.watchers_positive,
+                &mut self.watchers_negative,
+                &mut self.watch,
+                &self.x,
+                &mut self.clause_activity,
+                &mut self.clause_lbd,
+                &mut self.choose_watch_pos,
+                &mut self.estimated_bytes,
+            );
+            self.clauses.len() - before
+        }
+    }
+
+    /// Publishes several clauses between two checks and verifies the
+    /// first check imports the newest `min(backlog,
+    /// IMPORT_MAX_PER_PEER)` of them (not just one per check, the old
+    /// behavior) and leaves the cursor at the peer's write index, so
+    /// the second check imports nothing.
+    #[test]
+    fn test_maybe_import_drains_backlog_and_resynchronizes_cursor() {
+        let peer = clause_share::ExportBuffer::new(8);
+        for _ in 0..5 {
+            peer.publish(&vec![2, 3]);
+        }
+        let mut fx = ImportFixture::new();
+        let mut cursor = 0u64;
+        let imported = fx.run(&peer, &mut cursor, 0);
+        assert_eq!(imported as u64, 5.min(clause_share::IMPORT_MAX_PER_PEER));
+        assert_eq!(cursor, 5, "cursor must land on the peer's write index");
+        assert_eq!(fx.run(&peer, &mut cursor, 0), 0, "nothing new to import");
+    }
+
+    /// Lets the peer lap a small ring several times before the first
+    /// check; the check must read at most one ring's worth (capacity)
+    /// of clauses and end at the write index.
+    #[test]
+    fn test_maybe_import_never_reads_past_overwritten_slots() {
+        let peer = clause_share::ExportBuffer::new(4);
+        for _ in 0..23 {
+            peer.publish(&vec![2, 3]);
+        }
+        let mut fx = ImportFixture::new();
+        let mut cursor = 0u64;
+        let imported = fx.run(&peer, &mut cursor, 0);
+        assert_eq!(imported as u64, 4.min(clause_share::IMPORT_MAX_PER_PEER));
+        assert_eq!(cursor, 23);
+    }
+
+    /// Reproduces the old duplicate-import hazard: a cursor ahead of
+    /// the peer's write index (the old code advanced it
+    /// unconditionally) must import nothing and be pulled back to the
+    /// write index, instead of re-reading already-imported slots.
+    #[test]
+    fn test_maybe_import_clamps_cursor_ahead_of_peer() {
+        let peer = clause_share::ExportBuffer::new(8);
+        for _ in 0..3 {
+            peer.publish(&vec![2, 3]);
+        }
+        let mut fx = ImportFixture::new();
+        let mut cursor = 50u64;
+        assert_eq!(fx.run(&peer, &mut cursor, 0), 0);
+        assert_eq!(cursor, 3);
+    }
+
+    /// Verifies `maybe_import` does nothing (and leaves the cursor
+    /// alone) unless `num_conflicts` is a multiple of
+    /// `IMPORT_CHECK_MASK + 1`, and is a no-op without peers.
+    #[test]
+    fn test_maybe_import_respects_check_gate() {
+        let peer = clause_share::ExportBuffer::new(8);
+        peer.publish(&vec![2, 3]);
+        let mut fx = ImportFixture::new();
+        let mut cursor = 0u64;
+        assert_eq!(fx.run(&peer, &mut cursor, 1), 0);
+        assert_eq!(cursor, 0, "a gated-off check must not move the cursor");
+
+        let mut no_cursors: [u64; 0] = [];
+        clause_share::maybe_import(
+            &[],
+            &mut no_cursors,
+            0,
+            &mut fx.clauses,
+            &mut fx.lists,
+            &mut fx.watchers_positive,
+            &mut fx.watchers_negative,
+            &mut fx.watch,
+            &fx.x,
+            &mut fx.clause_activity,
+            &mut fx.clause_lbd,
+            &mut fx.choose_watch_pos,
+            &mut fx.estimated_bytes,
+        );
+        assert!(fx.clauses.is_empty());
+    }
+
     // STAGE43.md: phase-selection strategy tests, mirroring
     // go_src/internal/cdcl/phase_test.go's own coverage exactly.
 

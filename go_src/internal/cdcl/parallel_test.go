@@ -305,3 +305,149 @@ func TestImportClauseRegistersWatcherLists(t *testing.T) {
 		}
 	}
 }
+
+// TestExportBufferPublished verifies published() counts every publish,
+// including ones that have wrapped the ring, since maybeImport relies on
+// it as the peer's write index.
+func TestExportBufferPublished(t *testing.T) {
+	buf := newExportBuffer(4)
+	if got := buf.published(); got != 0 {
+		t.Errorf("published() = %d on an empty buffer, want 0", got)
+	}
+	for i := 0; i < 10; i++ {
+		buf.publish(cnf.Clause{1, 2})
+	}
+	if got := buf.published(); got != 10 {
+		t.Errorf("published() = %d after 10 publishes into a 4-slot ring, want 10", got)
+	}
+}
+
+// TestImportWindow checks every way importWindow can move the start of
+// the range: untouched (small backlog), raised past overwritten slots,
+// raised to honor maxPerPeer, and clamped when the cursor is ahead of
+// the peer. end must always equal written.
+func TestImportWindow(t *testing.T) {
+	tests := []struct {
+		name                                  string
+		cursor, written, capacity, maxPerPeer uint64
+		wantStart, wantEnd                    uint64
+	}{
+		{"nothing published", 0, 0, 8, 100, 0, 0},
+		{"caught up", 5, 5, 8, 100, 5, 5},
+		{"small backlog is read whole", 2, 5, 8, 100, 2, 5},
+		{"ring has not wrapped, cursor at start", 0, 3, 8, 100, 0, 3},
+		{"slots before written-capacity were overwritten", 0, 20, 8, 100, 12, 20},
+		{"cursor inside the surviving range", 15, 20, 8, 100, 15, 20},
+		{"maxPerPeer keeps only the newest clauses", 0, 6, 8, 2, 4, 6},
+		{"maxPerPeer larger than the backlog changes nothing", 4, 6, 8, 5, 4, 6},
+		{"maxPerPeer of one", 0, 6, 8, 1, 5, 6},
+		{"cursor ahead of written is clamped", 9, 5, 8, 100, 5, 5},
+		{"cursor far ahead after a wrapped ring", 1000, 300, 256, 100, 300, 300},
+	}
+	for _, tc := range tests {
+		start, end := importWindow(tc.cursor, tc.written, tc.capacity, tc.maxPerPeer)
+		if start != tc.wantStart || end != tc.wantEnd {
+			t.Errorf("%s: importWindow(%d, %d, %d, %d) = [%d, %d), want [%d, %d)",
+				tc.name, tc.cursor, tc.written, tc.capacity, tc.maxPerPeer, start, end, tc.wantStart, tc.wantEnd)
+		}
+	}
+}
+
+// newImportTestSolver returns a solver for a 6-variable problem with
+// one peer (a capacity-slot export buffer) wired in, with
+// numConflicts = 0 so maybeImport's check gate is open.
+func newImportTestSolver(t *testing.T, capacity int) (*solver, *exportBuffer) {
+	t.Helper()
+	problem := &cnf.Problem{NumVars: 6, Clauses: []cnf.Clause{{cnf.Literal(1)}}}
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
+	if !ok {
+		t.Fatal("newSolver() reported ok = false unexpectedly")
+	}
+	peer := newExportBuffer(capacity)
+	s.peers = []*exportBuffer{peer}
+	s.peerCursors = make([]uint64, 1)
+	s.numConflicts = 0
+	return s, peer
+}
+
+// TestMaybeImportDrainsBacklogAndResynchronizesCursor publishes several
+// clauses between two checks and verifies the first check imports the
+// newest min(backlog, importMaxPerPeer) of them (not just one per
+// check, the old behavior) and leaves the cursor at the peer's write
+// index, so the second check imports nothing.
+func TestMaybeImportDrainsBacklogAndResynchronizesCursor(t *testing.T) {
+	s, peer := newImportTestSolver(t, 8)
+	for i := 0; i < 5; i++ {
+		peer.publish(cnf.Clause{cnf.Literal(2), cnf.Literal(3)})
+	}
+	before := len(s.clauses)
+	s.maybeImport()
+	want := min(5, importMaxPerPeer)
+	if got := len(s.clauses) - before; got != want {
+		t.Errorf("first maybeImport imported %d clauses, want %d", got, want)
+	}
+	if s.peerCursors[0] != 5 {
+		t.Errorf("cursor = %d after the check, want 5 (the peer's write index)", s.peerCursors[0])
+	}
+	before = len(s.clauses)
+	s.maybeImport()
+	if got := len(s.clauses) - before; got != 0 {
+		t.Errorf("second maybeImport with nothing new imported %d clauses, want 0", got)
+	}
+}
+
+// TestMaybeImportNeverReadsPastOverwrittenSlots lets the peer lap a
+// small ring several times before the first check; the check must read
+// at most one ring's worth (capacity) of clauses and end at the write
+// index.
+func TestMaybeImportNeverReadsPastOverwrittenSlots(t *testing.T) {
+	s, peer := newImportTestSolver(t, 4)
+	for i := 0; i < 23; i++ {
+		peer.publish(cnf.Clause{cnf.Literal(2), cnf.Literal(3)})
+	}
+	before := len(s.clauses)
+	s.maybeImport()
+	if got, limit := len(s.clauses)-before, min(4, importMaxPerPeer); got != limit {
+		t.Errorf("imported %d clauses from a lapped 4-slot ring, want %d", got, limit)
+	}
+	if s.peerCursors[0] != 23 {
+		t.Errorf("cursor = %d, want 23", s.peerCursors[0])
+	}
+}
+
+// TestMaybeImportClampsCursorAheadOfPeer reproduces the old duplicate-
+// import hazard: a cursor ahead of the peer's write index (the old
+// code advanced it unconditionally) must import nothing and be pulled
+// back to the write index, instead of re-reading already-imported slots.
+func TestMaybeImportClampsCursorAheadOfPeer(t *testing.T) {
+	s, peer := newImportTestSolver(t, 8)
+	for i := 0; i < 3; i++ {
+		peer.publish(cnf.Clause{cnf.Literal(2), cnf.Literal(3)})
+	}
+	s.peerCursors[0] = 50
+	before := len(s.clauses)
+	s.maybeImport()
+	if got := len(s.clauses) - before; got != 0 {
+		t.Errorf("imported %d clauses with the cursor ahead of the peer, want 0", got)
+	}
+	if s.peerCursors[0] != 3 {
+		t.Errorf("cursor = %d, want it clamped to 3", s.peerCursors[0])
+	}
+}
+
+// TestMaybeImportRespectsCheckGate verifies maybeImport does nothing
+// (and leaves the cursor alone) unless numConflicts is a multiple of
+// importCheckMask+1, and is a no-op without peers.
+func TestMaybeImportRespectsCheckGate(t *testing.T) {
+	s, peer := newImportTestSolver(t, 8)
+	peer.publish(cnf.Clause{cnf.Literal(2), cnf.Literal(3)})
+	s.numConflicts = 1
+	before := len(s.clauses)
+	s.maybeImport()
+	if len(s.clauses) != before || s.peerCursors[0] != 0 {
+		t.Errorf("gated-off check changed state: %d new clauses, cursor %d", len(s.clauses)-before, s.peerCursors[0])
+	}
+
+	s.peers, s.peerCursors, s.numConflicts = nil, nil, 0
+	s.maybeImport() // must not panic
+}

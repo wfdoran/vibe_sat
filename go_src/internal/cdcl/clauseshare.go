@@ -62,6 +62,18 @@ const exportBufferCapacity = 256
 // scale to 128 threads, maybe more" applies here too).
 const importCheckMask = 0x1f
 
+// importMaxPerPeer bounds how many of one peer's newly published
+// clauses a single maybeImport check will read (see importWindow); a
+// larger backlog keeps only its newest importMaxPerPeer clauses.
+// STAGE55.md benchmarked 1, 8, 32 and 256 (see reports/REPORT55.md):
+// every value beat the old one-clause-per-check cursor by 20-56% on
+// the uuf250 set, and the four values were within run-to-run noise of
+// one another, with 8 nominally best on average across 4/8/32 threads
+// in both languages. The gain comes from keeping the cursor
+// synchronized with the peer, not from importing more. It must not
+// exceed exportBufferCapacity to mean anything beyond "all".
+const importMaxPerPeer = 8
+
 // sharedClause is an immutable published clause: constructed once by
 // exportBuffer.Publish and never modified afterward, so any number of
 // reader threads can safely hold a pointer to the same instance
@@ -114,14 +126,64 @@ func (b *exportBuffer) tryRead(idx uint64) (cnf.Clause, bool) {
 	return ptr.lits, true
 }
 
+// published returns how many clauses the owning thread has published
+// in total (the next sequence number it will write). Safe to call from
+// any thread.
+func (b *exportBuffer) published() uint64 {
+	return b.writeIdx.Load()
+}
+
+// importWindow decides which of one peer's published clauses a single
+// maybeImport check should read. cursor is this thread's next unread
+// sequence number for that peer, written is how many clauses the peer
+// has published in total (its writeIdx), capacity is the peer's ring
+// size, and maxPerPeer bounds the work done per check. It returns the
+// half-open range [start, end) of sequence numbers to read; the caller
+// reads them and then stores end as its new cursor.
+//
+// end is always written, so the cursor is re-synchronized with the
+// peer on every check: it can never run ahead of the peer (which would
+// re-read slots already imported and import duplicates) and never
+// falls permanently behind. start is cursor, raised as needed so that
+// the range never reaches back past what the ring still holds
+// (written-capacity: older slots have been overwritten, reading them
+// would return newer clauses again) and never holds more than
+// maxPerPeer clauses (a backlog larger than that skips its oldest
+// clauses, the same lossy trade the ring itself makes). A cursor that
+// is somehow ahead of written is clamped to it, giving an empty range.
+func importWindow(cursor, written, capacity uint64, maxPerPeer uint64) (start, end uint64) {
+	end = written
+	start = cursor
+	if start > end {
+		start = end
+	}
+	oldestKept := uint64(0)
+	if written > capacity {
+		oldestKept = written - capacity
+	}
+	if start < oldestKept {
+		start = oldestKept
+	}
+	if end-start > maxPerPeer {
+		start = end - maxPerPeer
+	}
+	return start, end
+}
+
 // maybeImport is runLoop's periodic opportunity (called once per
 // conflict from learnAndBackjump, gated by importCheckMask) to pull in
 // clauses other threads have learned. A no-op for every single-
-// threaded solver (s.peers == nil). For each peer, at most one
-// candidate clause is read and handed to importClause -- bounded work
-// per call, regardless of how many clauses a fast-learning peer has
-// published since the last check (excess ones are simply skipped over
-// as the cursor advances, again per the lossy contract above).
+// threaded solver (s.peers == nil). For each peer, importWindow picks
+// the clauses published since this thread's last check (at most
+// importMaxPerPeer of the newest ones, and never ones the ring has
+// already overwritten); each is handed to importClause, and the
+// peer's cursor is then moved to the peer's current write index. Work
+// per call is therefore bounded by numPeers * importMaxPerPeer however
+// fast the peers learn, with the excess skipped per the lossy
+// contract above. A peer that publishes while this loop reads can
+// overwrite a slot just before it is read; the read then returns that
+// newer clause, which is imported again on a later check (a harmless
+// duplicate, rare, and not a correctness issue).
 func (s *solver) maybeImport() {
 	if s.peers == nil {
 		return
@@ -130,10 +192,13 @@ func (s *solver) maybeImport() {
 		return
 	}
 	for i, peer := range s.peers {
-		if lits, ok := peer.tryRead(s.peerCursors[i]); ok {
-			s.importClause(lits)
+		start, end := importWindow(s.peerCursors[i], peer.published(), peer.capacity, importMaxPerPeer)
+		for idx := start; idx < end; idx++ {
+			if lits, ok := peer.tryRead(idx); ok {
+				s.importClause(lits)
+			}
 		}
-		s.peerCursors[i]++
+		s.peerCursors[i] = end
 	}
 }
 

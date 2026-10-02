@@ -66,6 +66,18 @@ pub(crate) const EXPORT_BUFFER_CAPACITY: usize = 256;
 /// applies here too).
 pub(crate) const IMPORT_CHECK_MASK: usize = 0x1f;
 
+/// Bounds how many of one peer's newly published clauses a single
+/// [`maybe_import`] check will read (see [`import_window`]); a larger
+/// backlog keeps only its newest `IMPORT_MAX_PER_PEER` clauses.
+/// STAGE55.md benchmarked 1, 8, 32 and 256 (see `reports/REPORT55.md`):
+/// every value beat the old one-clause-per-check cursor by 20-56% on
+/// the uuf250 set, and the four values were within run-to-run noise of
+/// one another, with 8 nominally best on average across 4/8/32 threads
+/// in both languages. The gain comes from keeping the cursor
+/// synchronized with the peer, not from importing more. It must not
+/// exceed [`EXPORT_BUFFER_CAPACITY`] to mean anything beyond "all".
+pub(crate) const IMPORT_MAX_PER_PEER: u64 = 8;
+
 /// An immutable published clause: constructed once by
 /// [`ExportBuffer::publish`] and never modified afterward, so any
 /// number of reader threads can safely hold an `Arc` to the same
@@ -129,16 +141,68 @@ impl ExportBuffer {
             .load_full()
             .map(|arc| arc.lits.clone())
     }
+
+    /// Returns how many clauses the owning thread has published in
+    /// total (the next sequence number it will write). Safe to call
+    /// from any thread.
+    pub(crate) fn published(&self) -> u64 {
+        self.write_idx.load(Ordering::SeqCst)
+    }
+}
+
+/// Decides which of one peer's published clauses a single
+/// [`maybe_import`] check should read. `cursor` is this thread's next
+/// unread sequence number for that peer, `written` is how many clauses
+/// the peer has published in total (its `write_idx`), `capacity` is
+/// the peer's ring size, and `max_per_peer` bounds the work done per
+/// check. Returns the half-open range `(start, end)` of sequence
+/// numbers to read; the caller reads them and then stores `end` as its
+/// new cursor.
+///
+/// `end` is always `written`, so the cursor is re-synchronized with
+/// the peer on every check: it can never run ahead of the peer (which
+/// would re-read slots already imported and import duplicates) and
+/// never falls permanently behind. `start` is `cursor`, raised as
+/// needed so that the range never reaches back past what the ring
+/// still holds (`written - capacity`: older slots have been
+/// overwritten, reading them would return newer clauses again) and
+/// never holds more than `max_per_peer` clauses (a backlog larger than
+/// that skips its oldest clauses, the same lossy trade the ring itself
+/// makes). A cursor that is somehow ahead of `written` is clamped to
+/// it, giving an empty range.
+pub(crate) fn import_window(
+    cursor: u64,
+    written: u64,
+    capacity: u64,
+    max_per_peer: u64,
+) -> (u64, u64) {
+    let end = written;
+    let mut start = cursor.min(end);
+    let oldest_kept = written.saturating_sub(capacity);
+    if start < oldest_kept {
+        start = oldest_kept;
+    }
+    if end - start > max_per_peer {
+        start = end - max_per_peer;
+    }
+    (start, end)
 }
 
 /// The main search loop's periodic opportunity (called once per
 /// conflict, gated by [`IMPORT_CHECK_MASK`]) to pull in clauses other
 /// threads have learned. A no-op whenever `peers` is empty (every
-/// single-threaded caller). For each peer, at most one candidate
-/// clause is read and handed to [`import_clause`] -- bounded work per
-/// call, regardless of how many clauses a fast-learning peer has
-/// published since the last check (excess ones are simply skipped
-/// over as the cursor advances, again per the lossy contract above).
+/// single-threaded caller). For each peer, [`import_window`] picks the
+/// clauses published since this thread's last check (at most
+/// [`IMPORT_MAX_PER_PEER`] of the newest ones, and never ones the ring
+/// has already overwritten); each is handed to [`import_clause`], and
+/// the peer's cursor is then moved to the peer's current write index.
+/// Work per call is therefore bounded by `peers.len() *
+/// IMPORT_MAX_PER_PEER` however fast the peers learn, with the excess
+/// skipped per the lossy contract above. A peer that publishes while
+/// this loop reads can overwrite a slot just before it is read; the
+/// read then returns that newer clause, which is imported again on a
+/// later check (a harmless duplicate, rare, and not a correctness
+/// issue).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn maybe_import(
     peers: &[&ExportBuffer],
@@ -162,22 +226,30 @@ pub(crate) fn maybe_import(
         return;
     }
     for (i, peer) in peers.iter().enumerate() {
-        if let Some(lits) = peer.try_read(peer_cursors[i]) {
-            import_clause(
-                &lits,
-                clauses,
-                lists,
-                watchers_positive,
-                watchers_negative,
-                watch,
-                x,
-                clause_activity,
-                clause_lbd,
-                choose_watch_pos,
-                estimated_bytes,
-            );
+        let (start, end) = import_window(
+            peer_cursors[i],
+            peer.published(),
+            peer.capacity,
+            IMPORT_MAX_PER_PEER,
+        );
+        for idx in start..end {
+            if let Some(lits) = peer.try_read(idx) {
+                import_clause(
+                    &lits,
+                    clauses,
+                    lists,
+                    watchers_positive,
+                    watchers_negative,
+                    watch,
+                    x,
+                    clause_activity,
+                    clause_lbd,
+                    choose_watch_pos,
+                    estimated_bytes,
+                );
+            }
         }
-        peer_cursors[i] += 1;
+        peer_cursors[i] = end;
     }
 }
 

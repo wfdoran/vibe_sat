@@ -428,6 +428,15 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 	return args, nil
 }
 
+// hasIterationCount reports whether algParams carries a real first
+// value -- the number of starts for hc, the number of tries for ws --
+// as opposed to being empty or having "_" (a nil element, STAGE44.md)
+// in that slot. hc and ws have no built-in stopping point, so without
+// either this or --time-limit-secs they would search forever.
+func hasIterationCount(algParams []*int64) bool {
+	return len(algParams) >= 1 && algParams[0] != nil
+}
+
 // validate checks that the parsed Args are complete and internally
 // consistent: that every required argument was supplied, and that the
 // combination of algorithm-specific arguments makes sense for the
@@ -457,8 +466,8 @@ func validate(args *Args, rawValues map[string][]string) error {
 		if len(args.AlgParams) > 1 {
 			return fmt.Errorf("for --algorithm=hc, --alg-params accepts at most one value (the number of starts)")
 		}
-		if args.TimeLimitSecs == nil && len(args.AlgParams) == 0 {
-			return fmt.Errorf("for --algorithm=hc, either --time-limit-secs or --alg-params (number of starts) must be given")
+		if args.TimeLimitSecs == nil && !hasIterationCount(args.AlgParams) {
+			return fmt.Errorf("for --algorithm=hc, either --time-limit-secs or a real (not \"_\") first --alg-params value (number of starts) must be given")
 		}
 		if len(args.AlgParams) == 1 && args.AlgParams[0] != nil && *args.AlgParams[0] < 1 {
 			return fmt.Errorf("for --algorithm=hc, the number of starts given via --alg-params must be a positive integer")
@@ -468,8 +477,8 @@ func validate(args *Args, rawValues map[string][]string) error {
 		}
 
 	case "ws":
-		if args.TimeLimitSecs == nil && len(args.AlgParams) == 0 {
-			return fmt.Errorf("for --algorithm=ws, either --time-limit-secs or --alg-params (number of tries) must be given")
+		if args.TimeLimitSecs == nil && !hasIterationCount(args.AlgParams) {
+			return fmt.Errorf("for --algorithm=ws, either --time-limit-secs or a real (not \"_\") first --alg-params value (number of tries) must be given")
 		}
 		if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil && *args.AlgParams[0] < 1 {
 			return fmt.Errorf("for --algorithm=ws, the number of tries given via --alg-params must be a positive integer")

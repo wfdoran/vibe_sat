@@ -42,14 +42,16 @@ Options:
 
   --time-limit-secs=<integer>, -t <integer>
         Optional time limit, in seconds, for the search. Required by
-        "hc"/"ws" unless --alg-params is given instead; optional for
+        "hc"/"ws" unless a real (not "_") first --alg-params value (the
+        number of restarts) is given instead; optional for
         "dfs" (which will otherwise run until it finds a solution or
         exhausts the search space, however long that takes).
 
   --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
-        Algorithm-specific parameters (1 to 4 integer values); at
-        least one of --alg-params or --time-limit-secs is required for
-        "hc"/"ws". Every value is positional -- to set val2 you must
+        Algorithm-specific parameters (1 to 4 integer values). For
+        "hc"/"ws", either --time-limit-secs or a real (not "_") val1
+        is required, since neither algorithm otherwise stops on its
+        own. Every value is positional -- to set val2 you must
         also supply val1, to set val3 you must also supply val1 and
         val2, and so on -- but any value may be given as "_"
         (STAGE44.md) instead of a real number to mean "use this slot's
