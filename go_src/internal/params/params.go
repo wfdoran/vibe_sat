@@ -25,6 +25,7 @@ package params
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 )
 
@@ -117,6 +118,10 @@ func Default() Params {
 // object) keeps its default rather than zeroing out, so a user's
 // .vibe_sat.json only needs to mention the handful of values they
 // actually want to override.
+//
+// The merged result is then range-checked by validate (STAGE56.md): an
+// out-of-range value, or a recognized field of the wrong JSON type, is
+// an error naming the field, never silently accepted.
 func Load(path string) (Params, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -132,16 +137,90 @@ func Load(path string) (Params, error) {
 	return p, nil
 }
 
-// validate rejects parameter values that would crash the solver rather
-// than merely tune it badly. Only GlucoseWindowSize qualifies today: it
-// sizes the LBD ring buffer allocated for every cdcl run (whichever
-// restart strategy is chosen), so a value below 1 panics with a
-// makeslice or index-out-of-range error. Every other field was checked
-// by hand with zero, negative and out-of-range values and only
-// degrades search quality, so it is deliberately left unrestricted.
+// MaxGlucoseWindowSize is the largest accepted cdcl.glucoseWindowSize.
+// The window is a ring buffer allocated up front for every cdcl run, so
+// an absurd size is a crash (out of memory), not just a bad tuning; ten
+// million is already about five orders of magnitude past the default of
+// 50 and costs at most 80 MB.
+const MaxGlucoseWindowSize = 10_000_000
+
+// validate rejects parameter values that either crash the solver
+// (glucoseWindowSize outside [1, MaxGlucoseWindowSize]: it sizes the LBD
+// ring buffer allocated for every cdcl run, so 0 or a negative size
+// panics and an enormous one runs out of memory) or silently wreck
+// search quality instead of tuning it (STAGE56.md: e.g. a
+// varActivityDecay of 2.0 makes activities shrink, and uf250-01 stops
+// reaching a verdict in 3 s). The accepted range of every field is
+// listed in --help and docs/internal-parameters.md; the checks below
+// are in struct field order and report only the first violation, as
+// "<section>.<key> must be <range> (got <value>)". NaN and infinities
+// are rejected wherever a float field has no upper bound.
 func validate(p Params) error {
-	if p.CDCL.GlucoseWindowSize < 1 {
-		return fmt.Errorf("cdcl.glucoseWindowSize must be at least 1 (got %d)", p.CDCL.GlucoseWindowSize)
+	c := p.CDCL
+	checks := []error{
+		minInt("cdcl.lubyBaseConflicts", c.LubyBaseConflicts, 1),
+		minInt("cdcl.polynomialBaseConflicts", c.PolynomialBaseConflicts, 1),
+		minInt("cdcl.geometricBaseConflicts", c.GeometricBaseConflicts, 1),
+		minFloat("cdcl.geometricGrowthFactor", c.GeometricGrowthFactor, 1),
+		unitFloat("cdcl.lrbAlpha", c.LRBAlpha),
+		unitFloat("cdcl.clauseActivityDecay", c.ClauseActivityDecay),
+		unitFloat("cdcl.varActivityDecay", c.VarActivityDecay),
+		minInt("cdcl.glueClauseLBDThreshold", c.GlueClauseLBDThreshold, 0),
+		rangeInt("cdcl.glucoseWindowSize", c.GlucoseWindowSize, 1, MaxGlucoseWindowSize),
+		positiveFloat("cdcl.glucoseK", c.GlucoseK),
+		minInt("cdcl.minimizeWorkBudgetFactor", c.MinimizeWorkBudgetFactor, 0),
+		minInt("cdcl.rephaseIntervalRestarts", c.RephaseIntervalRestarts, 1),
+		minInt("cdcl.rephaseMaxFlips", c.RephaseMaxFlips, 1),
+		minInt("preprocess.subsumptionWorkBudgetFactor", p.Preprocess.SubsumptionWorkBudgetFactor, 0),
+		minInt("preprocess.bveWorkBudgetFactor", p.Preprocess.BVEWorkBudgetFactor, 0),
+	}
+	for _, err := range checks {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// minInt returns an error naming key unless v >= min.
+func minInt(key string, v, min int) error {
+	if v < min {
+		return fmt.Errorf("%s must be at least %d (got %d)", key, min, v)
+	}
+	return nil
+}
+
+// rangeInt returns an error naming key unless min <= v <= max.
+func rangeInt(key string, v, min, max int) error {
+	if v < min || v > max {
+		return fmt.Errorf("%s must be between %d and %d (got %d)", key, min, max, v)
+	}
+	return nil
+}
+
+// minFloat returns an error naming key unless v is a finite number
+// that is at least min.
+func minFloat(key string, v, min float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < min {
+		return fmt.Errorf("%s must be a finite number at least %v (got %v)", key, min, v)
+	}
+	return nil
+}
+
+// positiveFloat returns an error naming key unless v is a finite
+// number greater than 0.
+func positiveFloat(key string, v float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+		return fmt.Errorf("%s must be a finite number greater than 0 (got %v)", key, v)
+	}
+	return nil
+}
+
+// unitFloat returns an error naming key unless 0 < v <= 1 (NaN fails
+// both comparisons and is rejected too).
+func unitFloat(key string, v float64) error {
+	if !(v > 0 && v <= 1) {
+		return fmt.Errorf("%s must be greater than 0 and at most 1 (got %v)", key, v)
 	}
 	return nil
 }

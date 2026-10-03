@@ -109,119 +109,315 @@ pub fn default() -> Params {
 /// loads under an older one.
 ///
 /// Returns an error if `path` cannot be read (including "does not
-/// exist") or its contents are not valid JSON.
+/// exist"), its contents are not valid JSON, a recognized field has the
+/// wrong JSON type (a string, or a fraction for an integer field), or a
+/// value is outside its accepted range (see [`validate`]). `null` leaves
+/// a field at its default, as in Go.
 pub fn load(path: &str) -> Result<Params, String> {
     let contents = fs::read_to_string(path).map_err(|e| format!("open {path}: {e}"))?;
     let value = json::parse(&contents).map_err(|e| format!("parse {path}: {e}"))?;
-    let mut params = default();
-    apply(&mut params, &value);
-    validate(&params).map_err(|e| format!("invalid {path}: {e}"))?;
-    Ok(params)
+    let mut fields = Fields::from_params(&default());
+    apply(&mut fields, &value).map_err(|e| format!("parse {path}: {e}"))?;
+    validate(&fields).map_err(|e| format!("invalid {path}: {e}"))?;
+    Ok(fields.into_params())
 }
 
-/// Rejects parameter values that would crash the solver rather than
-/// merely tune it badly. Only `glucose_window_size` qualifies today: it
-/// sizes the LBD ring buffer allocated for every cdcl run (whichever
-/// restart strategy is chosen), so a value below 1 panics with an
-/// index-out-of-bounds error. Every other field was checked by hand
-/// with zero, negative and out-of-range values and only degrades
-/// search quality, so it is deliberately left unrestricted.
-fn validate(p: &Params) -> Result<(), String> {
-    if p.cdcl.glucose_window_size < 1 {
+/// Largest accepted `cdcl.glucoseWindowSize`. The window is a vector
+/// allocated up front for every cdcl run, so an absurd size aborts the
+/// process with an allocation failure rather than merely tuning badly;
+/// ten million is about five orders of magnitude past the default of 50
+/// and costs at most 80 MB.
+pub const MAX_GLUCOSE_WINDOW_SIZE: i64 = 10_000_000;
+
+/// Every parameter as a signed 64-bit integer or an f64, mirroring Go's
+/// `int`/`float64` struct fields. [`Params`] stores counts as `usize`,
+/// which cannot represent a negative value, so a file's `-5` would be
+/// silently clamped to 0 if it were stored there directly; [`load`]
+/// instead reads into this struct, validates it, and only then converts
+/// to [`Params`], so Go and Rust reject exactly the same files.
+#[derive(Debug, Clone, Copy)]
+struct Fields {
+    luby_base_conflicts: i64,
+    polynomial_base_conflicts: i64,
+    geometric_base_conflicts: i64,
+    geometric_growth_factor: f64,
+    lrb_alpha: f64,
+    clause_activity_decay: f64,
+    var_activity_decay: f64,
+    glue_clause_lbd_threshold: i64,
+    glucose_window_size: i64,
+    glucose_k: f64,
+    minimize_work_budget_factor: i64,
+    rephase_interval_restarts: i64,
+    rephase_max_flips: i64,
+    subsumption_work_budget_factor: i64,
+    bve_work_budget_factor: i64,
+}
+
+impl Fields {
+    /// Widens `p` into the signed representation.
+    fn from_params(p: &Params) -> Fields {
+        Fields {
+            luby_base_conflicts: p.cdcl.luby_base_conflicts as i64,
+            polynomial_base_conflicts: p.cdcl.polynomial_base_conflicts as i64,
+            geometric_base_conflicts: p.cdcl.geometric_base_conflicts as i64,
+            geometric_growth_factor: p.cdcl.geometric_growth_factor,
+            lrb_alpha: p.cdcl.lrb_alpha,
+            clause_activity_decay: p.cdcl.clause_activity_decay,
+            var_activity_decay: p.cdcl.var_activity_decay,
+            glue_clause_lbd_threshold: p.cdcl.glue_clause_lbd_threshold as i64,
+            glucose_window_size: p.cdcl.glucose_window_size as i64,
+            glucose_k: p.cdcl.glucose_k,
+            minimize_work_budget_factor: p.cdcl.minimize_work_budget_factor as i64,
+            rephase_interval_restarts: p.cdcl.rephase_interval_restarts as i64,
+            rephase_max_flips: p.cdcl.rephase_max_flips as i64,
+            subsumption_work_budget_factor: p.preprocess.subsumption_work_budget_factor as i64,
+            bve_work_budget_factor: p.preprocess.bve_work_budget_factor as i64,
+        }
+    }
+
+    /// Narrows back to [`Params`]. Only called on a [`Fields`] that
+    /// [`validate`] accepted, so every integer is non-negative.
+    fn into_params(self) -> Params {
+        Params {
+            cdcl: Cdcl {
+                luby_base_conflicts: self.luby_base_conflicts as usize,
+                polynomial_base_conflicts: self.polynomial_base_conflicts as usize,
+                geometric_base_conflicts: self.geometric_base_conflicts as usize,
+                geometric_growth_factor: self.geometric_growth_factor,
+                lrb_alpha: self.lrb_alpha,
+                clause_activity_decay: self.clause_activity_decay,
+                var_activity_decay: self.var_activity_decay,
+                glue_clause_lbd_threshold: self.glue_clause_lbd_threshold as usize,
+                glucose_window_size: self.glucose_window_size as usize,
+                glucose_k: self.glucose_k,
+                minimize_work_budget_factor: self.minimize_work_budget_factor as usize,
+                rephase_interval_restarts: self.rephase_interval_restarts as usize,
+                rephase_max_flips: self.rephase_max_flips as usize,
+            },
+            preprocess: Preprocess {
+                subsumption_work_budget_factor: self.subsumption_work_budget_factor as usize,
+                bve_work_budget_factor: self.bve_work_budget_factor as usize,
+            },
+        }
+    }
+}
+
+/// Rejects parameter values that either crash the solver
+/// (`glucoseWindowSize` outside `[1, MAX_GLUCOSE_WINDOW_SIZE]`: it sizes
+/// the LBD vector allocated for every cdcl run, so 0 panics and an
+/// enormous size aborts on allocation failure) or silently wreck search
+/// quality instead of tuning it (STAGE56.md: e.g. a `varActivityDecay`
+/// of 2.0 makes activities shrink, and uf250-01 stops reaching a verdict
+/// in 3 s). The accepted range of every field is listed in `--help` and
+/// `docs/internal-parameters.md`; checks run in field order (the same
+/// order as Go's `validate`) and only the first violation is reported,
+/// as "<section>.<key> must be <range> (got <value>)". NaN and
+/// infinities are rejected wherever a float field has no upper bound.
+fn validate(f: &Fields) -> Result<(), String> {
+    min_int("cdcl.lubyBaseConflicts", f.luby_base_conflicts, 1)?;
+    min_int(
+        "cdcl.polynomialBaseConflicts",
+        f.polynomial_base_conflicts,
+        1,
+    )?;
+    min_int("cdcl.geometricBaseConflicts", f.geometric_base_conflicts, 1)?;
+    min_float("cdcl.geometricGrowthFactor", f.geometric_growth_factor, 1.0)?;
+    unit_float("cdcl.lrbAlpha", f.lrb_alpha)?;
+    unit_float("cdcl.clauseActivityDecay", f.clause_activity_decay)?;
+    unit_float("cdcl.varActivityDecay", f.var_activity_decay)?;
+    min_int(
+        "cdcl.glueClauseLBDThreshold",
+        f.glue_clause_lbd_threshold,
+        0,
+    )?;
+    range_int(
+        "cdcl.glucoseWindowSize",
+        f.glucose_window_size,
+        1,
+        MAX_GLUCOSE_WINDOW_SIZE,
+    )?;
+    positive_float("cdcl.glucoseK", f.glucose_k)?;
+    min_int(
+        "cdcl.minimizeWorkBudgetFactor",
+        f.minimize_work_budget_factor,
+        0,
+    )?;
+    min_int(
+        "cdcl.rephaseIntervalRestarts",
+        f.rephase_interval_restarts,
+        1,
+    )?;
+    min_int("cdcl.rephaseMaxFlips", f.rephase_max_flips, 1)?;
+    min_int(
+        "preprocess.subsumptionWorkBudgetFactor",
+        f.subsumption_work_budget_factor,
+        0,
+    )?;
+    min_int(
+        "preprocess.bveWorkBudgetFactor",
+        f.bve_work_budget_factor,
+        0,
+    )?;
+    Ok(())
+}
+
+/// Errors naming `key` unless `v >= min`.
+fn min_int(key: &str, v: i64, min: i64) -> Result<(), String> {
+    if v < min {
+        return Err(format!("{key} must be at least {min} (got {v})"));
+    }
+    Ok(())
+}
+
+/// Errors naming `key` unless `min <= v <= max`.
+fn range_int(key: &str, v: i64, min: i64, max: i64) -> Result<(), String> {
+    if v < min || v > max {
+        return Err(format!("{key} must be between {min} and {max} (got {v})"));
+    }
+    Ok(())
+}
+
+/// Errors naming `key` unless `v` is a finite number at least `min`.
+fn min_float(key: &str, v: f64, min: f64) -> Result<(), String> {
+    if !v.is_finite() || v < min {
         return Err(format!(
-            "cdcl.glucoseWindowSize must be at least 1 (got {})",
-            p.cdcl.glucose_window_size
+            "{key} must be a finite number at least {min} (got {v})"
         ));
     }
     Ok(())
 }
 
+/// Errors naming `key` unless `v` is a finite number greater than 0.
+fn positive_float(key: &str, v: f64) -> Result<(), String> {
+    if !v.is_finite() || v <= 0.0 {
+        return Err(format!(
+            "{key} must be a finite number greater than 0 (got {v})"
+        ));
+    }
+    Ok(())
+}
+
+/// Errors naming `key` unless `0 < v <= 1` (NaN fails both comparisons
+/// and is rejected too).
+fn unit_float(key: &str, v: f64) -> Result<(), String> {
+    if !(v > 0.0 && v <= 1.0) {
+        return Err(format!(
+            "{key} must be greater than 0 and at most 1 (got {v})"
+        ));
+    }
+    Ok(())
+}
+
+/// Reads `obj[key]` as an integer into `slot`. A missing key or `null`
+/// leaves `slot` alone; any other non-number, a number with a
+/// fractional part, or one beyond the i64 range is an error (Go's
+/// `encoding/json` rejects the same inputs when unmarshaling into an
+/// `int`).
+fn read_int(obj: &json::Value, section: &str, key: &str, slot: &mut i64) -> Result<(), String> {
+    match obj.get(key) {
+        None | Some(json::Value::Null) => Ok(()),
+        Some(json::Value::Number(n))
+            if n.fract() == 0.0 && n.abs() < 9_223_372_036_854_775_808.0 =>
+        {
+            *slot = *n as i64;
+            Ok(())
+        }
+        Some(_) => Err(format!("{section}.{key} must be an integer")),
+    }
+}
+
+/// Reads `obj[key]` as a float into `slot`; a missing key or `null`
+/// leaves `slot` alone and any other non-number is an error.
+fn read_float(obj: &json::Value, section: &str, key: &str, slot: &mut f64) -> Result<(), String> {
+    match obj.get(key) {
+        None | Some(json::Value::Null) => Ok(()),
+        Some(json::Value::Number(n)) => {
+            *slot = *n;
+            Ok(())
+        }
+        Some(_) => Err(format!("{section}.{key} must be a number")),
+    }
+}
+
 /// Overlays whatever fields `value` (a parsed JSON object, expected to
-/// have "cdcl"/"preprocess" sub-objects) specifies onto `params` in
-/// place, leaving every field it doesn't mention untouched.
-fn apply(params: &mut Params, value: &json::Value) {
-    if let Some(cdcl) = value.get("cdcl") {
-        if let Some(v) = cdcl
-            .get("lubyBaseConflicts")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.luby_base_conflicts = v;
+/// have "cdcl"/"preprocess" sub-objects) specifies onto `f` in place,
+/// leaving every field it doesn't mention untouched. A "cdcl" or
+/// "preprocess" entry that is present but is neither an object nor
+/// `null` is an error.
+fn apply(f: &mut Fields, value: &json::Value) -> Result<(), String> {
+    let section = |name: &str| -> Result<Option<&json::Value>, String> {
+        match value.get(name) {
+            None | Some(json::Value::Null) => Ok(None),
+            Some(v @ json::Value::Object(_)) => Ok(Some(v)),
+            Some(_) => Err(format!("{name} must be an object")),
         }
-        if let Some(v) = cdcl
-            .get("polynomialBaseConflicts")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.polynomial_base_conflicts = v;
-        }
-        if let Some(v) = cdcl
-            .get("geometricBaseConflicts")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.geometric_base_conflicts = v;
-        }
-        if let Some(v) = cdcl
-            .get("geometricGrowthFactor")
-            .and_then(json::Value::as_f64)
-        {
-            params.cdcl.geometric_growth_factor = v;
-        }
-        if let Some(v) = cdcl.get("lrbAlpha").and_then(json::Value::as_f64) {
-            params.cdcl.lrb_alpha = v;
-        }
-        if let Some(v) = cdcl
-            .get("clauseActivityDecay")
-            .and_then(json::Value::as_f64)
-        {
-            params.cdcl.clause_activity_decay = v;
-        }
-        if let Some(v) = cdcl.get("varActivityDecay").and_then(json::Value::as_f64) {
-            params.cdcl.var_activity_decay = v;
-        }
-        if let Some(v) = cdcl
-            .get("glueClauseLBDThreshold")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.glue_clause_lbd_threshold = v;
-        }
-        if let Some(v) = cdcl
-            .get("glucoseWindowSize")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.glucose_window_size = v;
-        }
-        if let Some(v) = cdcl.get("glucoseK").and_then(json::Value::as_f64) {
-            params.cdcl.glucose_k = v;
-        }
-        if let Some(v) = cdcl
-            .get("minimizeWorkBudgetFactor")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.minimize_work_budget_factor = v;
-        }
-        if let Some(v) = cdcl
-            .get("rephaseIntervalRestarts")
-            .and_then(json::Value::as_usize)
-        {
-            params.cdcl.rephase_interval_restarts = v;
-        }
-        if let Some(v) = cdcl.get("rephaseMaxFlips").and_then(json::Value::as_usize) {
-            params.cdcl.rephase_max_flips = v;
-        }
+    };
+    if let Some(c) = section("cdcl")? {
+        read_int(c, "cdcl", "lubyBaseConflicts", &mut f.luby_base_conflicts)?;
+        read_int(
+            c,
+            "cdcl",
+            "polynomialBaseConflicts",
+            &mut f.polynomial_base_conflicts,
+        )?;
+        read_int(
+            c,
+            "cdcl",
+            "geometricBaseConflicts",
+            &mut f.geometric_base_conflicts,
+        )?;
+        read_float(
+            c,
+            "cdcl",
+            "geometricGrowthFactor",
+            &mut f.geometric_growth_factor,
+        )?;
+        read_float(c, "cdcl", "lrbAlpha", &mut f.lrb_alpha)?;
+        read_float(
+            c,
+            "cdcl",
+            "clauseActivityDecay",
+            &mut f.clause_activity_decay,
+        )?;
+        read_float(c, "cdcl", "varActivityDecay", &mut f.var_activity_decay)?;
+        read_int(
+            c,
+            "cdcl",
+            "glueClauseLBDThreshold",
+            &mut f.glue_clause_lbd_threshold,
+        )?;
+        read_int(c, "cdcl", "glucoseWindowSize", &mut f.glucose_window_size)?;
+        read_float(c, "cdcl", "glucoseK", &mut f.glucose_k)?;
+        read_int(
+            c,
+            "cdcl",
+            "minimizeWorkBudgetFactor",
+            &mut f.minimize_work_budget_factor,
+        )?;
+        read_int(
+            c,
+            "cdcl",
+            "rephaseIntervalRestarts",
+            &mut f.rephase_interval_restarts,
+        )?;
+        read_int(c, "cdcl", "rephaseMaxFlips", &mut f.rephase_max_flips)?;
     }
-    if let Some(preprocess) = value.get("preprocess") {
-        if let Some(v) = preprocess
-            .get("subsumptionWorkBudgetFactor")
-            .and_then(json::Value::as_usize)
-        {
-            params.preprocess.subsumption_work_budget_factor = v;
-        }
-        if let Some(v) = preprocess
-            .get("bveWorkBudgetFactor")
-            .and_then(json::Value::as_usize)
-        {
-            params.preprocess.bve_work_budget_factor = v;
-        }
+    if let Some(pp) = section("preprocess")? {
+        read_int(
+            pp,
+            "preprocess",
+            "subsumptionWorkBudgetFactor",
+            &mut f.subsumption_work_budget_factor,
+        )?;
+        read_int(
+            pp,
+            "preprocess",
+            "bveWorkBudgetFactor",
+            &mut f.bve_work_budget_factor,
+        )?;
     }
+    Ok(())
 }
 
 /// Formats an `f64` the way `encoding/json` (and this module's own
@@ -322,21 +518,6 @@ mod json {
                 Value::Object(map) => map.get(key),
                 _ => None,
             }
-        }
-
-        pub fn as_f64(&self) -> Option<f64> {
-            match self {
-                Value::Number(n) => Some(*n),
-                _ => None,
-            }
-        }
-
-        pub fn as_i64(&self) -> Option<i64> {
-            self.as_f64().map(|n| n as i64)
-        }
-
-        pub fn as_usize(&self) -> Option<usize> {
-            self.as_i64().map(|n| n.max(0) as usize)
         }
     }
 
@@ -613,16 +794,16 @@ mod json {
         #[test]
         fn parses_flat_object() {
             let v = parse(r#"{"a": 1, "b": 2.5, "c": "x"}"#).unwrap();
-            assert_eq!(v.get("a").unwrap().as_i64(), Some(1));
-            assert_eq!(v.get("b").unwrap().as_f64(), Some(2.5));
+            assert_eq!(v.get("a"), Some(&Value::Number(1.0)));
+            assert_eq!(v.get("b"), Some(&Value::Number(2.5)));
         }
 
         #[test]
         fn parses_nested_object() {
             let v = parse(r#"{"outer": {"inner": 42}}"#).unwrap();
             assert_eq!(
-                v.get("outer").unwrap().get("inner").unwrap().as_i64(),
-                Some(42)
+                v.get("outer").unwrap().get("inner"),
+                Some(&Value::Number(42.0))
             );
         }
 
@@ -691,25 +872,217 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// Load refuses a glucoseWindowSize below 1 with an error naming
-    /// the field, instead of letting it through to panic inside the
-    /// solver, and still accepts 1.
+    /// Out-of-range values, one per row as (file body, "section.key"
+    /// the error must name): just outside every field's accepted range
+    /// plus a few wild ones. Mirrors `rejectedParamCases` in Go's
+    /// params_test.go.
+    const REJECTED: &[(&str, &str)] = &[
+        (
+            r#"{"cdcl":{"lubyBaseConflicts":0}}"#,
+            "cdcl.lubyBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"lubyBaseConflicts":-5}}"#,
+            "cdcl.lubyBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"polynomialBaseConflicts":0}}"#,
+            "cdcl.polynomialBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"geometricBaseConflicts":-1}}"#,
+            "cdcl.geometricBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"geometricGrowthFactor":0.99}}"#,
+            "cdcl.geometricGrowthFactor",
+        ),
+        (
+            r#"{"cdcl":{"geometricGrowthFactor":0}}"#,
+            "cdcl.geometricGrowthFactor",
+        ),
+        (
+            r#"{"cdcl":{"geometricGrowthFactor":-2}}"#,
+            "cdcl.geometricGrowthFactor",
+        ),
+        (r#"{"cdcl":{"lrbAlpha":0}}"#, "cdcl.lrbAlpha"),
+        (r#"{"cdcl":{"lrbAlpha":1.01}}"#, "cdcl.lrbAlpha"),
+        (
+            r#"{"cdcl":{"clauseActivityDecay":0}}"#,
+            "cdcl.clauseActivityDecay",
+        ),
+        (
+            r#"{"cdcl":{"clauseActivityDecay":-0.5}}"#,
+            "cdcl.clauseActivityDecay",
+        ),
+        (
+            r#"{"cdcl":{"clauseActivityDecay":2}}"#,
+            "cdcl.clauseActivityDecay",
+        ),
+        (
+            r#"{"cdcl":{"varActivityDecay":0}}"#,
+            "cdcl.varActivityDecay",
+        ),
+        (
+            r#"{"cdcl":{"varActivityDecay":2.0}}"#,
+            "cdcl.varActivityDecay",
+        ),
+        (
+            r#"{"cdcl":{"glueClauseLBDThreshold":-1}}"#,
+            "cdcl.glueClauseLBDThreshold",
+        ),
+        (
+            r#"{"cdcl":{"glucoseWindowSize":0}}"#,
+            "cdcl.glucoseWindowSize",
+        ),
+        (
+            r#"{"cdcl":{"glucoseWindowSize":-5}}"#,
+            "cdcl.glucoseWindowSize",
+        ),
+        (
+            r#"{"cdcl":{"glucoseWindowSize":10000001}}"#,
+            "cdcl.glucoseWindowSize",
+        ),
+        (
+            r#"{"cdcl":{"glucoseWindowSize":100000000000}}"#,
+            "cdcl.glucoseWindowSize",
+        ),
+        (r#"{"cdcl":{"glucoseK":0}}"#, "cdcl.glucoseK"),
+        (r#"{"cdcl":{"glucoseK":-0.6}}"#, "cdcl.glucoseK"),
+        (
+            r#"{"cdcl":{"minimizeWorkBudgetFactor":-1}}"#,
+            "cdcl.minimizeWorkBudgetFactor",
+        ),
+        (
+            r#"{"cdcl":{"rephaseIntervalRestarts":0}}"#,
+            "cdcl.rephaseIntervalRestarts",
+        ),
+        (
+            r#"{"cdcl":{"rephaseIntervalRestarts":-3}}"#,
+            "cdcl.rephaseIntervalRestarts",
+        ),
+        (r#"{"cdcl":{"rephaseMaxFlips":0}}"#, "cdcl.rephaseMaxFlips"),
+        (
+            r#"{"preprocess":{"subsumptionWorkBudgetFactor":-1}}"#,
+            "preprocess.subsumptionWorkBudgetFactor",
+        ),
+        (
+            r#"{"preprocess":{"bveWorkBudgetFactor":-1}}"#,
+            "preprocess.bveWorkBudgetFactor",
+        ),
+    ];
+
+    /// The inclusive ends of every range, which must still load.
+    const ACCEPTED: &[&str] = &[
+        r#"{"cdcl":{"lubyBaseConflicts":1,"polynomialBaseConflicts":1,"geometricBaseConflicts":1}}"#,
+        r#"{"cdcl":{"geometricGrowthFactor":1}}"#,
+        r#"{"cdcl":{"geometricGrowthFactor":1000}}"#,
+        r#"{"cdcl":{"lrbAlpha":1,"clauseActivityDecay":1,"varActivityDecay":1}}"#,
+        r#"{"cdcl":{"lrbAlpha":0.0001,"clauseActivityDecay":0.0001,"varActivityDecay":0.0001}}"#,
+        r#"{"cdcl":{"glueClauseLBDThreshold":0}}"#,
+        r#"{"cdcl":{"glucoseWindowSize":1}}"#,
+        r#"{"cdcl":{"glucoseWindowSize":10000000}}"#,
+        r#"{"cdcl":{"glucoseK":0.0001}}"#,
+        r#"{"cdcl":{"glucoseK":1000}}"#,
+        r#"{"cdcl":{"minimizeWorkBudgetFactor":0}}"#,
+        r#"{"cdcl":{"rephaseIntervalRestarts":1,"rephaseMaxFlips":1}}"#,
+        r#"{"preprocess":{"subsumptionWorkBudgetFactor":0,"bveWorkBudgetFactor":0}}"#,
+        "{}",
+    ];
+
+    /// Load refuses every out-of-range value with an error naming the
+    /// offending "section.key" and saying what is accepted, instead of
+    /// letting it through to wreck (or crash) the solver (STAGE56.md).
     #[test]
-    fn load_rejects_non_positive_glucose_window_size() {
-        for size in ["0", "-5"] {
-            let path = scratch_path("bad_window.json");
-            fs::write(
-                &path,
-                format!(r#"{{"cdcl": {{"glucoseWindowSize": {size}}}}}"#),
-            )
-            .unwrap();
-            let err = load(&path).unwrap_err();
-            assert!(err.contains("glucoseWindowSize"), "size {size}: {err}");
+    fn load_rejects_out_of_range_parameters() {
+        for (body, key) in REJECTED {
+            let path = scratch_path("bad.json");
+            fs::write(&path, body).unwrap();
+            let err = load(&path).expect_err(body);
+            assert!(err.contains(&format!("{key} must be ")), "{body}: {err}");
             fs::remove_file(&path).ok();
         }
-        let path = scratch_path("ok_window.json");
-        fs::write(&path, r#"{"cdcl": {"glucoseWindowSize": 1}}"#).unwrap();
-        assert_eq!(load(&path).unwrap().cdcl.glucose_window_size, 1);
+    }
+
+    /// The inclusive ends of every range still load, so validation is
+    /// not stricter than the documented ranges.
+    #[test]
+    fn load_accepts_boundary_parameters() {
+        for body in ACCEPTED {
+            let path = scratch_path("ok.json");
+            fs::write(&path, body).unwrap();
+            load(&path).unwrap_or_else(|e| panic!("{body}: {e}"));
+            fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The built-in defaults satisfy every range, so a run with no
+    /// config file can never be rejected.
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(validate(&Fields::from_params(&default())).is_ok());
+    }
+
+    /// The float checks cannot be bypassed by NaN or +/-Inf.
+    #[test]
+    fn validate_rejects_nan_and_infinity() {
+        let setters: [fn(&mut Fields, f64); 5] = [
+            |f, v| f.geometric_growth_factor = v,
+            |f, v| f.lrb_alpha = v,
+            |f, v| f.clause_activity_decay = v,
+            |f, v| f.var_activity_decay = v,
+            |f, v| f.glucose_k = v,
+        ];
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for set in setters {
+                let mut f = Fields::from_params(&default());
+                set(&mut f, bad);
+                assert!(validate(&f).is_err(), "accepted {bad}");
+            }
+        }
+    }
+
+    /// Only the first violation, in field order, is reported.
+    #[test]
+    fn load_reports_only_the_first_violation_in_field_order() {
+        let path = scratch_path("two.json");
+        fs::write(
+            &path,
+            r#"{"cdcl":{"varActivityDecay":2,"lubyBaseConflicts":0}}"#,
+        )
+        .unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(err.contains("cdcl.lubyBaseConflicts"), "{err}");
+        assert!(!err.contains("varActivityDecay"), "{err}");
+        fs::remove_file(&path).ok();
+    }
+
+    /// A value of the wrong JSON type (string for a number, fraction for
+    /// an integer field, non-object section) is an error rather than
+    /// being ignored or truncated, and null leaves the default in place.
+    /// Mirrors Go's behavior under encoding/json.
+    #[test]
+    fn load_rejects_wrong_json_types_and_accepts_null() {
+        for body in [
+            r#"{"cdcl":{"lubyBaseConflicts":"5"}}"#,
+            r#"{"cdcl":{"lubyBaseConflicts":1.5}}"#,
+            r#"{"cdcl":{"glucoseK":"0.6"}}"#,
+            r#"{"cdcl":{"glucoseK":true}}"#,
+            r#"{"cdcl":5}"#,
+            r#"{"preprocess":[1]}"#,
+        ] {
+            let path = scratch_path("type.json");
+            fs::write(&path, body).unwrap();
+            assert!(load(&path).is_err(), "{body} was accepted");
+            fs::remove_file(&path).ok();
+        }
+        let path = scratch_path("null.json");
+        fs::write(
+            &path,
+            r#"{"cdcl":{"lubyBaseConflicts":null,"glucoseK":null},"preprocess":null}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap(), default());
         fs::remove_file(&path).ok();
     }
 

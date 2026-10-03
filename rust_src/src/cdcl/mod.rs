@@ -4960,6 +4960,31 @@ mod tests {
         }
     }
 
+    /// STAGE56.md: the geometric threshold saturates instead of
+    /// overflowing (Rust's float-to-int `as` cast saturates; Go's
+    /// `geometricRestartThreshold` checks before converting to match).
+    /// Pins ordinary terms, a power that overflows to +Inf, and that
+    /// the saturated value is stable and the sequence never decreases.
+    #[test]
+    fn test_restart_threshold_geometric_saturates() {
+        let p = params::default().cdcl;
+        assert_eq!(restart_threshold(RestartStrategy::Geometric, 3, &p), 337);
+        assert_eq!(
+            restart_threshold(RestartStrategy::Geometric, 200, &p),
+            usize::MAX
+        );
+        assert_eq!(
+            restart_threshold(RestartStrategy::Geometric, 100_000, &p),
+            usize::MAX
+        );
+        let mut prev = 0;
+        for n in 0..400 {
+            let got = restart_threshold(RestartStrategy::Geometric, n, &p);
+            assert!(got >= prev, "threshold decreased at n={n}");
+            prev = got;
+        }
+    }
+
     /// Verifies restart_threshold's true geometric case directly:
     /// threshold at restart index k (0-indexed) is
     /// GEOMETRIC_BASE_CONFLICTS * GEOMETRIC_GROWTH_FACTOR^k, a

@@ -1111,6 +1111,44 @@ func TestRestartThresholdGeometric(t *testing.T) {
 	}
 }
 
+// TestGeometricRestartThresholdSaturates checks geometricRestartThreshold
+// directly: ordinary terms are the truncated product, the first product
+// at or above 2^63 and a power that overflows to +Inf both saturate at
+// MaxInt64 instead of wrapping to a negative number (STAGE56.md), and
+// the saturated value is stable for larger n.
+func TestGeometricRestartThresholdSaturates(t *testing.T) {
+	cases := []struct {
+		name   string
+		base   int
+		factor float64
+		n      int
+		want   int
+	}{
+		{"first term", 100, 1.5, 0, 100},
+		{"truncates, not rounds", 100, 1.5, 3, 337},
+		{"factor 1 stays constant", 7, 1, 1000000, 7},
+		{"just below 2^63 stays exact-ish", 1, 2, 62, 1 << 62},
+		{"exactly 2^63 saturates", 1, 2, 63, math.MaxInt64},
+		{"far past 2^63 saturates", 100, 1.5, 200, math.MaxInt64},
+		{"power overflows to +Inf", 100, 1.5, 100000, math.MaxInt64},
+		{"huge base saturates", math.MaxInt64, 2, 1, math.MaxInt64},
+		{"NaN gives 0", 1, math.NaN(), 1, 0},
+	}
+	for _, tc := range cases {
+		if got := geometricRestartThreshold(tc.base, tc.factor, tc.n); got != tc.want {
+			t.Errorf("%s: geometricRestartThreshold(%d, %v, %d) = %d, want %d", tc.name, tc.base, tc.factor, tc.n, got, tc.want)
+		}
+	}
+	prev := 0
+	for n := 0; n < 400; n++ {
+		got := geometricRestartThreshold(100, 1.5, n)
+		if got < prev {
+			t.Fatalf("threshold decreased from %d to %d at n=%d (overflow wrap)", prev, got, n)
+		}
+		prev = got
+	}
+}
+
 // TestMaybeRestartIsNoOpForRestartNone verifies that maybeRestart
 // never triggers a restart when s.restartStrategy is RestartNone,
 // regardless of how many conflicts have accumulated.

@@ -1947,10 +1947,38 @@ func (s *solver) restartThreshold() int {
 		k := s.restartCount + 1
 		return s.params.PolynomialBaseConflicts * k * k
 	case RestartGeometric:
-		return int(float64(s.params.GeometricBaseConflicts) * math.Pow(s.params.GeometricGrowthFactor, float64(s.restartCount)))
+		return geometricRestartThreshold(s.params.GeometricBaseConflicts, s.params.GeometricGrowthFactor, s.restartCount)
 	default: // RestartNone; never actually consulted (see maybeRestart)
 		return 0
 	}
+}
+
+// float64Exp63 is 2^63, the smallest float64 that no longer fits in an
+// int64 (math.MaxInt64 itself is not representable as a float64; the
+// nearest one rounds up to exactly this value).
+const float64Exp63 = 9223372036854775808.0
+
+// geometricRestartThreshold returns base * factor^n truncated to an int,
+// saturating at math.MaxInt64 instead of overflowing. Converting a
+// float64 at or above 2^63 to int is implementation-defined in Go (on
+// amd64 it wraps to the minimum int64, which would make every
+// restart due immediately), so the float is checked before converting:
+// any product >= 2^63 -- including +Inf, which math.Pow returns once the
+// power itself overflows -- yields math.MaxInt64. A NaN (unreachable
+// once params validation has accepted the factor) yields 0, matching
+// Rust's saturating "as usize" cast. The threshold is the number of
+// conflicts before the next restart, so a saturated value just means
+// "never restart again", which is the right limit of a growth sequence
+// that has outgrown any search that could actually be run.
+func geometricRestartThreshold(base int, factor float64, n int) int {
+	v := float64(base) * math.Pow(factor, float64(n))
+	if math.IsNaN(v) {
+		return 0
+	}
+	if v >= float64Exp63 {
+		return math.MaxInt64
+	}
+	return int(v)
 }
 
 // lubyTerm returns the i-th term (0-indexed) of the Luby, Sinclair &

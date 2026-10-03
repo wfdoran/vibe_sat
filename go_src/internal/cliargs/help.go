@@ -266,6 +266,28 @@ Options:
         present. Loading a config file (whether from this flag or the
         implicit .vibe_sat.json) is announced at --verbose=1 or
         higher.
+        Every value is range-checked when the file is loaded; a
+        value outside its range (or of the wrong JSON type, e.g. a
+        string or a fractional number for an integer field) makes
+        vibe_sat exit with an error naming the field, and only the
+        first problem is reported. Accepted ranges ("integer" means
+        a whole number; every float must be finite):
+          cdcl.lubyBaseConflicts, polynomialBaseConflicts,
+            geometricBaseConflicts            integer >= 1
+          cdcl.geometricGrowthFactor          >= 1
+          cdcl.lrbAlpha, clauseActivityDecay,
+            varActivityDecay                  > 0 and <= 1
+          cdcl.glueClauseLBDThreshold         integer >= 0
+          cdcl.glucoseWindowSize              integer, 1 to 10000000
+          cdcl.glucoseK                       > 0
+          cdcl.minimizeWorkBudgetFactor       integer >= 0
+          cdcl.rephaseIntervalRestarts,
+            rephaseMaxFlips                   integer >= 1
+          preprocess.subsumptionWorkBudgetFactor,
+            bveWorkBudgetFactor               integer >= 0
+        A work-budget factor of 0 effectively disables that bound or
+        technique. The built-in defaults are always inside these
+        ranges.
 
   --reset-internal-params, -q
         Write the file --internal-params would otherwise read from

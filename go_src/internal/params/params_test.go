@@ -1,6 +1,7 @@
 package params
 
 import (
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -130,27 +131,170 @@ func TestResolveExplicitPathMissingIsAnError(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsNonPositiveGlucoseWindowSize verifies Load refuses a
-// glucoseWindowSize below 1 with an error naming the field, instead of
-// letting it through to panic inside the solver, and still accepts 1.
-func TestLoadRejectsNonPositiveGlucoseWindowSize(t *testing.T) {
-	for _, size := range []string{"0", "-5"} {
+// paramCase is one file body for the range-validation tests, with
+// the "section.key" an error must name (rejected cases only).
+type paramCase struct {
+	body string
+	key  string
+}
+
+// rejectedParamCases has, for every field, values just outside its
+// accepted range (and a few wild ones), so Go and Rust (which mirrors
+// this table) are checked on exactly the same boundaries.
+var rejectedParamCases = []paramCase{
+	{`{"cdcl":{"lubyBaseConflicts":0}}`, "cdcl.lubyBaseConflicts"},
+	{`{"cdcl":{"lubyBaseConflicts":-5}}`, "cdcl.lubyBaseConflicts"},
+	{`{"cdcl":{"polynomialBaseConflicts":0}}`, "cdcl.polynomialBaseConflicts"},
+	{`{"cdcl":{"geometricBaseConflicts":-1}}`, "cdcl.geometricBaseConflicts"},
+	{`{"cdcl":{"geometricGrowthFactor":0.99}}`, "cdcl.geometricGrowthFactor"},
+	{`{"cdcl":{"geometricGrowthFactor":0}}`, "cdcl.geometricGrowthFactor"},
+	{`{"cdcl":{"geometricGrowthFactor":-2}}`, "cdcl.geometricGrowthFactor"},
+	{`{"cdcl":{"lrbAlpha":0}}`, "cdcl.lrbAlpha"},
+	{`{"cdcl":{"lrbAlpha":1.01}}`, "cdcl.lrbAlpha"},
+	{`{"cdcl":{"clauseActivityDecay":0}}`, "cdcl.clauseActivityDecay"},
+	{`{"cdcl":{"clauseActivityDecay":-0.5}}`, "cdcl.clauseActivityDecay"},
+	{`{"cdcl":{"clauseActivityDecay":2}}`, "cdcl.clauseActivityDecay"},
+	{`{"cdcl":{"varActivityDecay":0}}`, "cdcl.varActivityDecay"},
+	{`{"cdcl":{"varActivityDecay":2.0}}`, "cdcl.varActivityDecay"},
+	{`{"cdcl":{"glueClauseLBDThreshold":-1}}`, "cdcl.glueClauseLBDThreshold"},
+	{`{"cdcl":{"glucoseWindowSize":0}}`, "cdcl.glucoseWindowSize"},
+	{`{"cdcl":{"glucoseWindowSize":-5}}`, "cdcl.glucoseWindowSize"},
+	{`{"cdcl":{"glucoseWindowSize":10000001}}`, "cdcl.glucoseWindowSize"},
+	{`{"cdcl":{"glucoseWindowSize":100000000000}}`, "cdcl.glucoseWindowSize"},
+	{`{"cdcl":{"glucoseK":0}}`, "cdcl.glucoseK"},
+	{`{"cdcl":{"glucoseK":-0.6}}`, "cdcl.glucoseK"},
+	{`{"cdcl":{"minimizeWorkBudgetFactor":-1}}`, "cdcl.minimizeWorkBudgetFactor"},
+	{`{"cdcl":{"rephaseIntervalRestarts":0}}`, "cdcl.rephaseIntervalRestarts"},
+	{`{"cdcl":{"rephaseIntervalRestarts":-3}}`, "cdcl.rephaseIntervalRestarts"},
+	{`{"cdcl":{"rephaseMaxFlips":0}}`, "cdcl.rephaseMaxFlips"},
+	{`{"preprocess":{"subsumptionWorkBudgetFactor":-1}}`, "preprocess.subsumptionWorkBudgetFactor"},
+	{`{"preprocess":{"bveWorkBudgetFactor":-1}}`, "preprocess.bveWorkBudgetFactor"},
+}
+
+// acceptedParamCases has the boundary values that must still load.
+var acceptedParamCases = []string{
+	`{"cdcl":{"lubyBaseConflicts":1,"polynomialBaseConflicts":1,"geometricBaseConflicts":1}}`,
+	`{"cdcl":{"geometricGrowthFactor":1}}`,
+	`{"cdcl":{"geometricGrowthFactor":1000}}`,
+	`{"cdcl":{"lrbAlpha":1,"clauseActivityDecay":1,"varActivityDecay":1}}`,
+	`{"cdcl":{"lrbAlpha":0.0001,"clauseActivityDecay":0.0001,"varActivityDecay":0.0001}}`,
+	`{"cdcl":{"glueClauseLBDThreshold":0}}`,
+	`{"cdcl":{"glucoseWindowSize":1}}`,
+	`{"cdcl":{"glucoseWindowSize":10000000}}`,
+	`{"cdcl":{"glucoseK":0.0001}}`,
+	`{"cdcl":{"glucoseK":1000}}`,
+	`{"cdcl":{"minimizeWorkBudgetFactor":0}}`,
+	`{"cdcl":{"rephaseIntervalRestarts":1,"rephaseMaxFlips":1}}`,
+	`{"preprocess":{"subsumptionWorkBudgetFactor":0,"bveWorkBudgetFactor":0}}`,
+	`{}`,
+}
+
+// TestLoadRejectsOutOfRangeParameters verifies Load refuses every
+// out-of-range value with an error that names the offending
+// "section.key" and says what is accepted, instead of letting it
+// through to wreck (or crash) the solver (STAGE56.md).
+func TestLoadRejectsOutOfRangeParameters(t *testing.T) {
+	for _, tc := range rejectedParamCases {
 		path := filepath.Join(t.TempDir(), "bad.json")
-		if err := writeFile(path, `{"cdcl": {"glucoseWindowSize": `+size+`}}`); err != nil {
+		if err := writeFile(path, tc.body); err != nil {
 			t.Fatalf("writeFile: %v", err)
 		}
 		_, err := Load(path)
-		if err == nil || !strings.Contains(err.Error(), "glucoseWindowSize") {
-			t.Errorf("Load with glucoseWindowSize=%s: err = %v, want an error naming glucoseWindowSize", size, err)
+		if err == nil {
+			t.Errorf("Load(%s) succeeded, want an error naming %s", tc.body, tc.key)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.key+" must be ") {
+			t.Errorf("Load(%s) error = %q, want it to contain %q", tc.body, err, tc.key+" must be ")
 		}
 	}
+}
 
-	path := filepath.Join(t.TempDir(), "ok.json")
-	if err := writeFile(path, `{"cdcl": {"glucoseWindowSize": 1}}`); err != nil {
+// TestLoadAcceptsBoundaryParameters verifies the inclusive ends of
+// every range still load, so the validation is not stricter than the
+// documented ranges.
+func TestLoadAcceptsBoundaryParameters(t *testing.T) {
+	for _, body := range acceptedParamCases {
+		path := filepath.Join(t.TempDir(), "ok.json")
+		if err := writeFile(path, body); err != nil {
+			t.Fatalf("writeFile: %v", err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Errorf("Load(%s) = %v, want success", body, err)
+		}
+	}
+}
+
+// TestValidateAcceptsDefaults verifies the built-in defaults satisfy
+// every range, so a run with no config file can never be rejected.
+func TestValidateAcceptsDefaults(t *testing.T) {
+	if err := validate(Default()); err != nil {
+		t.Errorf("validate(Default()) = %v, want nil", err)
+	}
+}
+
+// TestValidateRejectsNaNAndInfinity verifies the float checks cannot be
+// bypassed by NaN or +/-Inf (which no JSON file can spell, but a
+// programmatic caller or a future loader could produce).
+func TestValidateRejectsNaNAndInfinity(t *testing.T) {
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, set := range []func(*Params, float64){
+			func(p *Params, v float64) { p.CDCL.GeometricGrowthFactor = v },
+			func(p *Params, v float64) { p.CDCL.LRBAlpha = v },
+			func(p *Params, v float64) { p.CDCL.ClauseActivityDecay = v },
+			func(p *Params, v float64) { p.CDCL.VarActivityDecay = v },
+			func(p *Params, v float64) { p.CDCL.GlucoseK = v },
+		} {
+			p := Default()
+			set(&p, bad)
+			if err := validate(p); err == nil {
+				t.Errorf("validate accepted %v", bad)
+			}
+		}
+	}
+}
+
+// TestLoadRejectsOnlyTheFirstViolationInFieldOrder pins that Load
+// reports one error, for the first field (in struct order) out of range.
+func TestLoadRejectsOnlyTheFirstViolationInFieldOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "two.json")
+	if err := writeFile(path, `{"cdcl":{"varActivityDecay":2,"lubyBaseConflicts":0}}`); err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "cdcl.lubyBaseConflicts") || strings.Contains(err.Error(), "varActivityDecay") {
+		t.Errorf("Load error = %v, want only cdcl.lubyBaseConflicts reported", err)
+	}
+}
+
+// TestLoadRejectsWrongJSONTypesAndAcceptsNull verifies a value of the
+// wrong JSON type (string for a number, fraction for an integer field,
+// non-object section) is an error rather than being ignored or
+// truncated, and that null leaves the default in place. Mirrored in
+// Rust, which parses JSON by hand and so must check these explicitly.
+func TestLoadRejectsWrongJSONTypesAndAcceptsNull(t *testing.T) {
+	for _, body := range []string{
+		`{"cdcl":{"lubyBaseConflicts":"5"}}`,
+		`{"cdcl":{"lubyBaseConflicts":1.5}}`,
+		`{"cdcl":{"glucoseK":"0.6"}}`,
+		`{"cdcl":{"glucoseK":true}}`,
+		`{"cdcl":5}`,
+		`{"preprocess":[1]}`,
+	} {
+		path := filepath.Join(t.TempDir(), "type.json")
+		if err := writeFile(path, body); err != nil {
+			t.Fatalf("writeFile: %v", err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Errorf("Load(%s) succeeded, want an error", body)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "null.json")
+	if err := writeFile(path, `{"cdcl":{"lubyBaseConflicts":null,"glucoseK":null},"preprocess":null}`); err != nil {
 		t.Fatalf("writeFile: %v", err)
 	}
 	p, err := Load(path)
-	if err != nil || p.CDCL.GlucoseWindowSize != 1 {
-		t.Errorf("Load with glucoseWindowSize=1: (%d, %v), want (1, nil)", p.CDCL.GlucoseWindowSize, err)
+	if err != nil || p != Default() {
+		t.Errorf("Load with nulls = (%+v, %v), want (Default(), nil)", p, err)
 	}
 }
