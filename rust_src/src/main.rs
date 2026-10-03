@@ -105,11 +105,18 @@ fn main() -> ExitCode {
     let original_num_vars = problem.num_vars;
     let mut preresult: Option<PreprocessResult> = None;
     if !args.no_preprocessing {
+        // STAGE57.md: with --time-limit-secs, preprocessing gets
+        // limit/preprocess::TIME_FRACTION (the search still gets the
+        // whole limit); without one it runs to its fixpoint.
+        let preprocess_limit = args
+            .time_limit_secs
+            .map(|secs| Duration::from_secs(secs as u64));
         let mut result = preprocess::run(
             &problem,
             args.verbose,
             args.num_threads,
             internal_params.preprocess,
+            preprocess::deadline(preprocess_limit, Instant::now()),
         );
         if result.unsat {
             // Preprocessing alone already proves the original problem

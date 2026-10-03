@@ -30,6 +30,30 @@ import (
 // converges in far fewer rounds; the bound is just a safety net.
 const maxRounds = 1000
 
+// TimeFraction is the share of --time-limit-secs preprocessing may use
+// (STAGE57.md): when a time limit is given, preprocessing stops
+// simplifying after limit/TimeFraction and hands whatever it has so far
+// to the search, which still gets the whole limit. With no time limit
+// preprocessing runs to its fixpoint, however long that takes.
+const TimeFraction = 10
+
+// Deadline returns the moment preprocessing must stop, given the run's
+// --time-limit-secs as timeLimit (nil meaning no limit) and now, the
+// moment preprocessing starts: now + timeLimit/TimeFraction. The zero
+// time.Time means "no deadline" and is what a nil timeLimit gives.
+func Deadline(timeLimit *time.Duration, now time.Time) time.Time {
+	if timeLimit == nil {
+		return time.Time{}
+	}
+	return now.Add(*timeLimit / TimeFraction)
+}
+
+// expired reports whether deadline has passed. The zero time.Time means
+// "no deadline", which never expires.
+func expired(deadline time.Time) bool {
+	return !deadline.IsZero() && !time.Now().Before(deadline)
+}
+
 // EliminationStep records enough information to reconstruct the
 // value of one variable removed by bounded variable elimination,
 // once every other variable's value is known. Positive and Negative
@@ -90,6 +114,12 @@ type Stats struct {
 	PureLiteralsFixed   int
 	ClausesSubsumed     int
 	VariablesEliminated int
+
+	// TimedOut is true if preprocessing stopped before reaching its
+	// fixpoint because the STAGE57.md deadline passed. The result is
+	// still a valid, satisfiability-equivalent problem, just possibly
+	// less simplified.
+	TimedOut bool
 }
 
 // Run preprocesses problem: it repeatedly applies unit propagation,
@@ -119,21 +149,16 @@ type Stats struct {
 // REPORT25.md for why BVE in particular was not also threaded this
 // stage.
 //
-// STAGE52.md: unlike dfs.bootstrap/cdcl.newSolver's own defensive
-// UnitPropagate call (now interruptible -- see UnitPropagate's doc
-// comment), Run itself is called from cmd/vibe_sat/main.go entirely
-// outside of --time-limit-secs's scope (before either algorithm's own
-// startTime is even captured), so it passes nil/the zero time.Time
-// everywhere it calls UnitPropagate/simplifyWithAssignment -- the same
-// unconditional, run-to-completion behavior as before this stage. This
-// is a real, disclosed, un-addressed gap this stage's investigation
-// surfaced but did not fix (a materially bigger change, since it would
-// mean adding time-limit awareness to subsumption/BVE too, both of
-// which already have their own separate work-budget safety caps -- see
-// reports/REPORT52.md); STAGE52.md's own scope, following REPORT35.md's
-// "known, disclosed limitation" wording exactly, is the narrower
-// bootstrap path each algorithm runs on its own, not this pipeline.
-func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess) *Result {
+// STAGE57.md: deadline (the zero time.Time meaning none; see Deadline)
+// bounds how long preprocessing may keep simplifying. It is checked
+// between rounds and techniques, between the passes of unit propagation
+// and pure literal elimination, and inside subsumption and variable
+// elimination, always at a point where the clause set and the
+// assignment are mutually consistent, so stopping early never produces
+// a wrong answer: it only leaves the formula less simplified, and sets
+// Stats.TimedOut. A single pass of unit propagation or pure literal
+// elimination (linear in the formula) is never interrupted midway.
+func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess, deadline time.Time) *Result {
 	clauses := append([]cnf.Clause(nil), problem.Clauses...)
 	assignment := assign.New(problem.NumVars)
 	var eliminated []EliminationStep
@@ -146,9 +171,13 @@ func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess)
 	bveBudget := p.BVEWorkBudgetFactor * len(problem.Clauses)
 
 	for round := 0; round < maxRounds; round++ {
+		if expired(deadline) {
+			stats.TimedOut = true
+			break
+		}
 		changed := false
 
-		unsat, unitsFixed, _ := UnitPropagate(&clauses, assignment, nil, time.Time{})
+		unsat, unitsFixed, timedOut := unitPropagateByDeadline(&clauses, assignment, deadline)
 		stats.UnitsPropagated += unitsFixed
 		if unsat {
 			return &Result{OriginalNumVars: problem.NumVars, Unsat: true, Stats: stats}
@@ -156,22 +185,40 @@ func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess)
 		if unitsFixed > 0 {
 			changed = true
 		}
+		if timedOut {
+			stats.TimedOut = true
+			break
+		}
 
-		if pureFixed := eliminatePureLiterals(&clauses, assignment); pureFixed > 0 {
+		pureFixed, timedOut := eliminatePureLiterals(&clauses, assignment, deadline)
+		if pureFixed > 0 {
 			stats.PureLiteralsFixed += pureFixed
 			changed = true
 		}
+		if timedOut {
+			stats.TimedOut = true
+			break
+		}
 
-		if subsumed := eliminateSubsumedClausesParallel(&clauses, problem.NumVars, numThreads, p.SubsumptionWorkBudgetFactor); subsumed > 0 {
+		subsumed, timedOut := eliminateSubsumedClausesParallel(&clauses, problem.NumVars, numThreads, p.SubsumptionWorkBudgetFactor, deadline)
+		if subsumed > 0 {
 			stats.ClausesSubsumed += subsumed
 			changed = true
 		}
+		if timedOut {
+			stats.TimedOut = true
+			break
+		}
 
-		newSteps := eliminateVariables(&clauses, assignment, problem.NumVars, &bveBudget)
+		newSteps, timedOut := eliminateVariables(&clauses, assignment, problem.NumVars, &bveBudget, deadline)
 		if len(newSteps) > 0 {
 			eliminated = append(eliminated, newSteps...)
 			stats.VariablesEliminated += len(newSteps)
 			changed = true
+		}
+		if timedOut {
+			stats.TimedOut = true
+			break
 		}
 
 		if !changed {
@@ -185,6 +232,9 @@ func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess)
 	stats.VarsAfter = reduced.NumVars
 
 	if verbose >= 1 {
+		if stats.TimedOut {
+			fmt.Println("preprocess: time budget reached; stopped before reaching a fixpoint")
+		}
 		fmt.Printf(
 			"preprocess: vars %d->%d clauses %d->%d (units=%d pure=%d subsumed=%d eliminated=%d)\n",
 			stats.VarsBefore, stats.VarsAfter, stats.ClausesBefore, stats.ClausesAfter,

@@ -27,10 +27,10 @@ fn main() {
     let problem = read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
     let start = Instant::now();
-    preprocess::run(&problem, 0, 1, params::default().preprocess);
+    preprocess::run(&problem, 0, 1, params::default().preprocess, None);
     println!("BenchmarkRunHard: {:?}", start.elapsed());
 
     let start = Instant::now();
-    preprocess::run(&problem, 0, 8, params::default().preprocess);
+    preprocess::run(&problem, 0, 8, params::default().preprocess, None);
     println!("BenchmarkRunHardParallel8: {:?}", start.elapsed());
 }

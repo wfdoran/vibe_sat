@@ -10,6 +10,15 @@ import (
 	"vibe_sat/internal/cnf"
 )
 
+// deadlineCheckInterval is how many units of work (subsumer clauses,
+// resolution calls, candidate variables) the STAGE57.md deadline checks
+// in subsumption and variable elimination let pass between clock reads.
+// Must be a power of two (it is used as a mask in eliminateVariables).
+// A clock read costs tens of nanoseconds; a unit of work is at least
+// that, so this keeps the checks unmeasurable while still noticing a
+// passed deadline within microseconds.
+const deadlineCheckInterval = 64
+
 // simplifyWithAssignment rewrites clauses in place under assignment:
 // every clause already satisfied by some true literal is dropped, and
 // every other clause has its false literals (if any) removed,
@@ -117,11 +126,11 @@ func simplifyWithAssignment(clauses *[]cnf.Clause, assignment assign.Assignment,
 // STAGE52.md: timeLimit/startTime (nil/zero meaning no limit) are
 // threaded straight through to simplifyWithAssignment, and also
 // checked once per clause in the unit-clause-finding loop below --
-// every call site that needs unbounded behavior (preprocess.Run's own
-// pipeline, which is not currently time-limited at all -- see the
-// package doc comment) simply passes nil/the zero time.Time, which is
-// exactly the previous, unconditional behavior. Callers doing
-// time-bounded bootstrap work (dfs.bootstrap, cdcl.newSolver) instead
+// every call site that needs unbounded behavior simply passes nil/the
+// zero time.Time, which is exactly the previous, unconditional
+// behavior (preprocess.Run's pipeline, which must keep its clauses
+// consistent when it stops, uses unitPropagateByDeadline instead).
+// Callers doing time-bounded bootstrap work (dfs.bootstrap, cdcl.newSolver) instead
 // get a real, prompt exit: timedOut is true the moment either loop
 // notices the deadline has passed, mid-round if necessary, rather than
 // only between whole rounds -- this was previously the one part of a
@@ -160,12 +169,65 @@ func UnitPropagate(clauses *[]cnf.Clause, assignment assign.Assignment, timeLimi
 	}
 }
 
+// unitPropagateByDeadline computes the same fixpoint as UnitPropagate
+// (every variable forced by a chain of unit clauses is fixed, satisfied
+// clauses are dropped, false literals removed) but stops at the first
+// round boundary at or after deadline, for preprocess.Run's STAGE57.md
+// time budget. The zero time.Time means no deadline.
+//
+// The check sits right after a complete simplifyWithAssignment pass and
+// before the unit scan assigns anything new, the one point where the
+// clause set is fully simplified under assignment: unit clauses found
+// but not yet applied just stay in clauses as ordinary clauses, which
+// every later stage (and every solver's own bootstrap) already handles.
+// That is why this does not reuse UnitPropagate's own timeLimit, which
+// aborts mid-scan and leaves clauses half-rewritten (fine for a caller
+// that throws them away, wrong for preprocessing, which keeps them).
+// Each round is linear in the formula, so a deadline is noticed within
+// one linear pass; a long implication chain still costs one pass per
+// link (see REPORT57.md), which is exactly what the deadline bounds.
+func unitPropagateByDeadline(clauses *[]cnf.Clause, assignment assign.Assignment, deadline time.Time) (unsat bool, numFixed int, timedOut bool) {
+	for {
+		clausesUnsat, _ := simplifyWithAssignment(clauses, assignment, nil, time.Time{})
+		if clausesUnsat {
+			return true, numFixed, false
+		}
+		if expired(deadline) {
+			return false, numFixed, true
+		}
+
+		foundUnit := false
+		for _, clause := range *clauses {
+			if len(clause) != 1 {
+				continue
+			}
+			lit := clause[0]
+			if lit.IsNegative() {
+				assignment[lit.Var()] = assign.False
+			} else {
+				assignment[lit.Var()] = assign.True
+			}
+			numFixed++
+			foundUnit = true
+		}
+		if !foundUnit {
+			return false, numFixed, false
+		}
+	}
+}
+
 // eliminatePureLiterals repeatedly finds variables that appear with
 // only one polarity across all of clauses (never negated, or always
 // negated) and fixes them to the value that satisfies every clause
 // containing them, removing those now-satisfied clauses. It returns
 // how many variables were fixed this way.
-func eliminatePureLiterals(clauses *[]cnf.Clause, assignment assign.Assignment) (numFixed int) {
+//
+// STAGE57.md: deadline (the zero time.Time meaning none) is checked after
+// each complete pass (fix, then simplify), the point where clauses and
+// assignment agree; timedOut is true if it stops there with work left.
+// Each pass is linear, but a chain where fixing one variable makes the
+// next one pure needs one pass per link.
+func eliminatePureLiterals(clauses *[]cnf.Clause, assignment assign.Assignment, deadline time.Time) (numFixed int, timedOut bool) {
 	for {
 		seenPositive := make([]bool, len(assignment))
 		seenNegative := make([]bool, len(assignment))
@@ -196,16 +258,18 @@ func eliminatePureLiterals(clauses *[]cnf.Clause, assignment assign.Assignment) 
 			fixedThisPass = true
 		}
 		if !fixedThisPass {
-			return numFixed
+			return numFixed, false
 		}
 		// Fixing a pure literal can only satisfy clauses (it never
 		// introduces a new false literal elsewhere, since the
 		// variable never appears with the opposite polarity), so this
-		// cannot discover a contradiction. Not time-limited (nil/zero):
-		// eliminatePureLiterals is only ever called from
-		// preprocess.Run's own pipeline, which has no time-limit
-		// awareness at all yet -- see the package doc comment.
+		// cannot discover a contradiction. This simplify is never
+		// interrupted (nil/zero): stopping mid-scan would leave
+		// clauses inconsistent with assignment.
 		_, _ = simplifyWithAssignment(clauses, assignment, nil, time.Time{})
+		if expired(deadline) {
+			return numFixed, true
+		}
 	}
 }
 
@@ -277,7 +341,11 @@ func isSubsetOf(small, big cnf.Clause) bool {
 // running time is unbounded." Running out of budget is always safe:
 // skipping a possible subsumption never changes whether the formula
 // is satisfiable, only how compact it ends up.
-func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int, workBudgetFactor int) (numRemoved int) {
+//
+// STAGE57.md: deadline (the zero time.Time meaning none) stops the scan
+// early, the same always-safe way running out of budget does; timedOut
+// reports that it did.
+func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int, workBudgetFactor int, deadline time.Time) (numRemoved int, timedOut bool) {
 	cs := *clauses
 	occ := buildLiteralOccurrenceLists(cs, numVars)
 	keep := make([]bool, len(cs))
@@ -286,10 +354,10 @@ func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int, workBudgetFact
 	}
 
 	budget := workBudgetFactor * len(cs)
-	trySubsumeFromGeneric(cs, occ, len(cs),
+	timedOut = trySubsumeFromGeneric(cs, occ, len(cs),
 		func(i int) bool { return keep[i] },
 		func(i int) { keep[i] = false },
-		0, len(cs), &budget)
+		0, len(cs), &budget, deadline)
 
 	kept := cs[:0]
 	for i, clause := range cs {
@@ -300,7 +368,7 @@ func eliminateSubsumedClauses(clauses *[]cnf.Clause, numVars int, workBudgetFact
 		}
 	}
 	*clauses = kept
-	return numRemoved
+	return numRemoved, timedOut
 }
 
 // literalOccurrence maps each literal (by variable and sign, the same
@@ -382,10 +450,19 @@ func rarestLiteralOccurrences(occ *literalOccurrence, clause cnf.Clause) (list [
 // no concurrency at all) and eliminateSubsumedClausesParallel
 // ([]atomic.Bool, shared across goroutines) without duplicating this
 // loop for each.
-func trySubsumeFromGeneric(cs []cnf.Clause, occ *literalOccurrence, n int, isKept func(int) bool, markRemoved func(int), lo, hi int, budget *int) {
+//
+// STAGE57.md: every deadlineCheckInterval subsumers (counted from lo) it
+// checks deadline (the zero time.Time meaning none) and, if it has
+// passed, stops exactly as an exhausted budget does and returns true.
+// Every keep bit set so far is a genuine subsumption, so the partial
+// result is valid.
+func trySubsumeFromGeneric(cs []cnf.Clause, occ *literalOccurrence, n int, isKept func(int) bool, markRemoved func(int), lo, hi int, budget *int, deadline time.Time) (timedOut bool) {
 	for i := lo; i < hi; i++ {
 		if *budget <= 0 {
-			return
+			return false
+		}
+		if (i-lo)%deadlineCheckInterval == 0 && expired(deadline) {
+			return true
 		}
 		candidates, ok := rarestLiteralOccurrences(occ, cs[i])
 		if !ok {
@@ -408,6 +485,7 @@ func trySubsumeFromGeneric(cs []cnf.Clause, occ *literalOccurrence, n int, isKep
 			}
 		}
 	}
+	return false
 }
 
 // eliminateSubsumedClausesParallel computes exactly the same result as
@@ -451,9 +529,12 @@ func trySubsumeFromGeneric(cs []cnf.Clause, occ *literalOccurrence, n int, isKep
 // pooled, which only matters for exactly how much subsumption gets
 // found in the (rare, already-degraded) case where the budget actually
 // runs out.
-func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThreads int, workBudgetFactor int) (numRemoved int) {
+//
+// STAGE57.md: deadline (the zero time.Time meaning none) is handed to
+// every goroutine; timedOut is true if any of them stopped early.
+func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThreads int, workBudgetFactor int, deadline time.Time) (numRemoved int, timedOut bool) {
 	if numThreads <= 1 {
-		return eliminateSubsumedClauses(clauses, numVars, workBudgetFactor)
+		return eliminateSubsumedClauses(clauses, numVars, workBudgetFactor, deadline)
 	}
 
 	cs := *clauses
@@ -467,6 +548,7 @@ func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThr
 	perThreadBudget := (workBudgetFactor * n) / numThreads
 
 	chunk := (n + numThreads - 1) / numThreads
+	var anyTimedOut atomic.Bool
 	var wg sync.WaitGroup
 	for start := 0; start < n; start += chunk {
 		end := min(start+chunk, n)
@@ -474,10 +556,12 @@ func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThr
 		go func(start, end int) {
 			defer wg.Done()
 			budget := perThreadBudget
-			trySubsumeFromGeneric(cs, occ, n,
+			if trySubsumeFromGeneric(cs, occ, n,
 				func(i int) bool { return keep[i].Load() },
 				func(i int) { keep[i].Store(false) },
-				start, end, &budget)
+				start, end, &budget, deadline) {
+				anyTimedOut.Store(true)
+			}
 		}(start, end)
 	}
 	wg.Wait()
@@ -491,7 +575,7 @@ func eliminateSubsumedClausesParallel(clauses *[]cnf.Clause, numVars int, numThr
 		}
 	}
 	*clauses = kept
-	return numRemoved
+	return numRemoved, anyTimedOut.Load()
 }
 
 // resolve computes the resolvent of clauses pos and neg on variable
@@ -713,8 +797,17 @@ func compactLiveOccurrences(list []int, live []bool) []int {
 // later call in the same Run bails out on its very first candidate
 // pair, for the cost of a handful of array accesses, rather than
 // re-attempting the same expensive variable from zero each time.
-func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, numVars int, budget *int) []EliminationStep {
-	var steps []EliminationStep
+//
+// STAGE57.md: deadline (the zero time.Time meaning none) stops the
+// search for more eliminations, the same always-safe way an exhausted
+// budget does, and timedOut reports that it did. It is checked once per
+// restart of the variable scan, once per deadlineCheckInterval
+// variables scanned within a pass (the restart-from-1 scan itself is
+// O(numVars) per elimination), and once per deadlineCheckInterval
+// resolutions. A variable whose resolvents were only partly computed
+// when the deadline hit is not eliminated, exactly as for budget
+// exhaustion; every elimination already accepted is complete and valid.
+func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, numVars int, budget *int, deadline time.Time) (steps []EliminationStep, timedOut bool) {
 
 	cs := *clauses
 	live := make([]bool, len(cs))
@@ -753,7 +846,15 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 	for {
 		eliminatedThisPass := false
 		budgetExhausted := false
+		if expired(deadline) {
+			timedOut = true
+			break
+		}
 		for v := 1; v <= numVars; v++ {
+			if v%deadlineCheckInterval == 0 && expired(deadline) {
+				timedOut = true
+				break
+			}
 			if assignment[v] != assign.Unassigned || rejected[v] {
 				continue
 			}
@@ -772,6 +873,10 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 				for _, ni := range negIdx {
 					if *budget <= 0 {
 						budgetExhausted = true
+						break resolveLoop
+					}
+					if *budget%deadlineCheckInterval == 0 && expired(deadline) {
+						timedOut = true
 						break resolveLoop
 					}
 					*budget--
@@ -796,11 +901,11 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 					}
 				}
 			}
-			if budgetExhausted {
-				// Not enough budget left to even fully evaluate this
-				// variable, let alone any variable after it -- stop
-				// attempting further eliminations entirely rather
-				// than accept v based on an incomplete resolvent set.
+			if budgetExhausted || timedOut {
+				// Not enough budget (or time) left to even fully evaluate
+				// this variable, let alone any variable after it -- stop
+				// attempting further eliminations entirely rather than
+				// accept v based on an incomplete resolvent set.
 				break
 			}
 			if exceeded {
@@ -847,7 +952,7 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 			break // restart from v=1, exactly as before STAGE31.md
 		}
 
-		if budgetExhausted || !eliminatedThisPass {
+		if budgetExhausted || timedOut || !eliminatedThisPass {
 			break
 		}
 	}
@@ -859,5 +964,5 @@ func eliminateVariables(clauses *[]cnf.Clause, assignment assign.Assignment, num
 		}
 	}
 	*clauses = final
-	return steps
+	return steps, timedOut
 }

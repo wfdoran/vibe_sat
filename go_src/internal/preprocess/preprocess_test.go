@@ -188,7 +188,7 @@ func TestEliminatePureLiterals(t *testing.T) {
 	}
 	assignment := assign.New(2)
 
-	numFixed := eliminatePureLiterals(&clauses, assignment)
+	numFixed, _ := eliminatePureLiterals(&clauses, assignment, time.Time{})
 	if numFixed != 1 {
 		t.Fatalf("numFixed = %d, want 1", numFixed)
 	}
@@ -219,7 +219,7 @@ func TestTrySubsumeFromGenericRespectsZeroWorkBudget(t *testing.T) {
 	trySubsumeFromGeneric(clauses, occ, len(clauses),
 		func(i int) bool { return keep[i] },
 		func(i int) { keep[i] = false },
-		0, len(clauses), &budget)
+		0, len(clauses), &budget, time.Time{})
 
 	if !keep[0] || !keep[1] {
 		t.Errorf("a zero work budget should have removed nothing; keep = %v", keep)
@@ -233,7 +233,7 @@ func TestEliminateSubsumedClausesRemovesSuperset(t *testing.T) {
 		{cnf.Literal(1), cnf.Literal(2)},
 		{cnf.Literal(1), cnf.Literal(2), cnf.Literal(3)},
 	}
-	numRemoved := eliminateSubsumedClauses(&clauses, 3, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+	numRemoved, _ := eliminateSubsumedClauses(&clauses, 3, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 	if numRemoved != 1 {
 		t.Fatalf("numRemoved = %d, want 1", numRemoved)
 	}
@@ -249,7 +249,7 @@ func TestEliminateSubsumedClausesRemovesDuplicates(t *testing.T) {
 		{cnf.Literal(1), cnf.Literal(-2)},
 		{cnf.Literal(1), cnf.Literal(-2)},
 	}
-	numRemoved := eliminateSubsumedClauses(&clauses, 2, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+	numRemoved, _ := eliminateSubsumedClauses(&clauses, 2, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 	if numRemoved != 1 {
 		t.Fatalf("numRemoved = %d, want 1", numRemoved)
 	}
@@ -287,11 +287,11 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialChained(t *testing.T) 
 	}
 
 	want := cloneClauses(original)
-	wantRemoved := eliminateSubsumedClauses(&want, 4, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+	wantRemoved, _ := eliminateSubsumedClauses(&want, 4, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 
 	for _, numThreads := range []int{1, 2, 3, 4, 8} {
 		got := cloneClauses(original)
-		gotRemoved := eliminateSubsumedClausesParallel(&got, 4, numThreads, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+		gotRemoved, _ := eliminateSubsumedClausesParallel(&got, 4, numThreads, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 		if gotRemoved != wantRemoved {
 			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
 		}
@@ -318,14 +318,14 @@ func TestEliminateSubsumedClausesParallelMatchesSequentialOnRealFile(t *testing.
 	}
 
 	want := cloneClauses(problem.Clauses)
-	wantRemoved := eliminateSubsumedClauses(&want, problem.NumVars, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+	wantRemoved, _ := eliminateSubsumedClauses(&want, problem.NumVars, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 	if wantRemoved == 0 {
 		t.Fatal("test file has nothing to subsume; pick a different file")
 	}
 
 	for _, numThreads := range []int{1, 2, 3, 4, 8, 16} {
 		got := cloneClauses(problem.Clauses)
-		gotRemoved := eliminateSubsumedClausesParallel(&got, problem.NumVars, numThreads, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+		gotRemoved, _ := eliminateSubsumedClausesParallel(&got, problem.NumVars, numThreads, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 		if gotRemoved != wantRemoved {
 			t.Errorf("numThreads=%d: numRemoved = %d, want %d", numThreads, gotRemoved, wantRemoved)
 		}
@@ -429,7 +429,7 @@ func TestEliminateSubsumedClausesMatchesBruteForceOnRandomFormulas(t *testing.T)
 		want := bruteForceSubsumedClauses(original)
 
 		got := cloneClauses(original)
-		eliminateSubsumedClauses(&got, numVars, params.Default().Preprocess.SubsumptionWorkBudgetFactor)
+		eliminateSubsumedClauses(&got, numVars, params.Default().Preprocess.SubsumptionWorkBudgetFactor, time.Time{})
 
 		if len(got) != len(want) {
 			t.Fatalf("trial %d (numVars=%d, clauses=%v): got %d surviving clauses %v, want %d %v",
@@ -457,9 +457,9 @@ func TestRunProducesIdenticalResultsRegardlessOfNumThreads(t *testing.T) {
 		t.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
 	}
 
-	want := Run(problem, 0, 1, params.Default().Preprocess)
+	want := Run(problem, 0, 1, params.Default().Preprocess, time.Time{})
 	for _, numThreads := range []int{1, 2, 4, 8, 16} {
-		got := Run(problem, 0, numThreads, params.Default().Preprocess)
+		got := Run(problem, 0, numThreads, params.Default().Preprocess, time.Time{})
 		if got.Stats != want.Stats {
 			t.Errorf("numThreads=%d: Stats = %+v, want %+v", numThreads, got.Stats, want.Stats)
 		}
@@ -524,7 +524,7 @@ func TestEliminateVariablesNonIncreasing(t *testing.T) {
 	}
 	assignment := assign.New(3)
 
-	steps := eliminateVariables(&clauses, assignment, 3, hugeBudget())
+	steps, _ := eliminateVariables(&clauses, assignment, 3, hugeBudget(), time.Time{})
 	if len(steps) != 1 || steps[0].Var != 1 {
 		t.Fatalf("steps = %v, want one step eliminating variable 1", steps)
 	}
@@ -547,7 +547,7 @@ func TestEliminateVariablesSkipsWhenIncreasing(t *testing.T) {
 	}
 	assignment := assign.New(6)
 
-	steps := eliminateVariables(&clauses, assignment, 6, hugeBudget())
+	steps, _ := eliminateVariables(&clauses, assignment, 6, hugeBudget(), time.Time{})
 	if len(steps) != 0 {
 		t.Fatalf("steps = %v, want none (elimination would increase clause count 5 -> 6)", steps)
 	}
@@ -572,7 +572,7 @@ func TestEliminateVariablesDoesNotReEvaluateRejected(t *testing.T) {
 	assignment := assign.New(9)
 	budget := 100
 
-	steps := eliminateVariables(&clauses, assignment, 9, &budget)
+	steps, _ := eliminateVariables(&clauses, assignment, 9, &budget, time.Time{})
 	if len(steps) != 1 || steps[0].Var != 7 {
 		t.Fatalf("steps = %v, want exactly one step eliminating variable 7", steps)
 	}
@@ -597,7 +597,7 @@ func TestEliminateVariablesRejectionInvalidatedByNeighbour(t *testing.T) {
 	}
 	assignment := assign.New(7)
 
-	steps := eliminateVariables(&clauses, assignment, 7, hugeBudget())
+	steps, _ := eliminateVariables(&clauses, assignment, 7, hugeBudget(), time.Time{})
 	if len(steps) != 2 || steps[0].Var != 7 || steps[1].Var != 1 {
 		t.Fatalf("steps = %v, want eliminations of variable 7 then variable 1", steps)
 	}
@@ -797,7 +797,7 @@ func TestEliminateVariablesMatchesBruteForceOnRandomFormulas(t *testing.T) {
 		wantSteps := bruteForceEliminateVariables(&want, assign.New(numVars), numVars)
 
 		got := cloneClauses(original)
-		gotSteps := eliminateVariables(&got, assign.New(numVars), numVars, hugeBudget())
+		gotSteps, _ := eliminateVariables(&got, assign.New(numVars), numVars, hugeBudget(), time.Time{})
 
 		if !slices.EqualFunc(gotSteps, wantSteps, sameEliminationStep) {
 			t.Fatalf("trial %d (numVars=%d, clauses=%v): steps = %v, want %v",
@@ -831,7 +831,7 @@ func TestRunSimplifiesAndPreservesSatisfiability(t *testing.T) {
 		},
 	}
 
-	result := Run(problem, 0, 1, params.Default().Preprocess)
+	result := Run(problem, 0, 1, params.Default().Preprocess, time.Time{})
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}
@@ -860,7 +860,7 @@ func TestRunDetectsUnsat(t *testing.T) {
 			{cnf.Literal(-1)},
 		},
 	}
-	result := Run(problem, 0, 1, params.Default().Preprocess)
+	result := Run(problem, 0, 1, params.Default().Preprocess, time.Time{})
 	if !result.Unsat {
 		t.Fatalf("expected Unsat = true")
 	}
@@ -890,7 +890,7 @@ func TestRunWithVariableEliminationReconstructsCorrectly(t *testing.T) {
 		},
 	}
 
-	result := Run(problem, 0, 1, params.Default().Preprocess)
+	result := Run(problem, 0, 1, params.Default().Preprocess, time.Time{})
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}
@@ -942,7 +942,7 @@ func TestRunLeavesUnconstrainedVariablesArbitrarilyFalse(t *testing.T) {
 			{cnf.Literal(1)},
 		},
 	}
-	result := Run(problem, 0, 1, params.Default().Preprocess)
+	result := Run(problem, 0, 1, params.Default().Preprocess, time.Time{})
 	if result.Unsat {
 		t.Fatalf("expected a satisfiable problem")
 	}

@@ -29,6 +29,33 @@ use crate::params;
 /// fewer rounds; the bound is just a safety net.
 const MAX_ROUNDS: usize = 1000;
 
+/// The share of `--time-limit-secs` preprocessing may use (STAGE57.md):
+/// when a time limit is given, preprocessing stops simplifying after
+/// `limit / TIME_FRACTION` and hands whatever it has so far to the
+/// search, which still gets the whole limit. With no time limit
+/// preprocessing runs to its fixpoint, however long that takes.
+pub const TIME_FRACTION: u32 = 10;
+
+/// How many subsumers (or variables, in the elimination scan) are
+/// processed between two looks at the clock; a power of two so the
+/// check is a cheap modulus.
+const DEADLINE_CHECK_INTERVAL: usize = 64;
+
+/// Returns the moment preprocessing must stop, given the run's
+/// `--time-limit-secs` as `time_limit` (`None` meaning no limit) and
+/// `now`, the moment preprocessing starts: `now + time_limit /
+/// TIME_FRACTION`. `None` means "no deadline" and is what a `None`
+/// limit gives.
+pub fn deadline(time_limit: Option<Duration>, now: Instant) -> Option<Instant> {
+    time_limit.map(|limit| now + limit / TIME_FRACTION)
+}
+
+/// Reports whether `deadline` has passed. `None` means "no deadline",
+/// which never expires.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
 /// Records enough information to reconstruct the value of one
 /// variable removed by bounded variable elimination, once every other
 /// variable's value is known. `positive` and `negative` are every
@@ -58,6 +85,12 @@ pub struct Stats {
     pub pure_literals_fixed: usize,
     pub clauses_subsumed: usize,
     pub variables_eliminated: usize,
+
+    /// True if preprocessing stopped before reaching its fixpoint
+    /// because the STAGE57.md deadline passed. The result is still a
+    /// valid, satisfiability-equivalent problem, just possibly less
+    /// simplified.
+    pub timed_out: bool,
 }
 
 /// Describes the outcome of preprocessing a [`Problem`].
@@ -126,27 +159,22 @@ pub struct PreprocessResult {
 /// regardless of `num_threads`; see REPORT25.md for why BVE in
 /// particular was not also threaded this stage.
 ///
-/// STAGE52.md: unlike `dfs::bootstrap`/`cdcl::bootstrap`'s own
-/// defensive `unit_propagate` call (now interruptible -- see
-/// `unit_propagate`'s doc comment), `run` itself is called from
-/// `cmd/vibe_sat`'s `main` entirely outside `--time-limit-secs`'s scope
-/// (before either algorithm's own `start_time` is even captured), so
-/// it passes `None`/`Instant::now()` everywhere it calls
-/// `unit_propagate`/`simplify_with_assignment` -- the same
-/// unconditional, run-to-completion behavior as before this stage.
-/// This is a real, disclosed, un-addressed gap this stage's
-/// investigation surfaced but did not fix (a materially bigger change,
-/// since it would mean adding time-limit awareness to subsumption/BVE
-/// too, both of which already have their own separate work-budget
-/// safety caps -- see `reports/REPORT52.md`); STAGE52.md's own scope,
-/// following `REPORT35.md`'s "known, disclosed limitation" wording
-/// exactly, is the narrower bootstrap path each algorithm runs on its
-/// own, not this pipeline.
+/// STAGE57.md: `deadline` (`None` meaning none; see [`deadline`]) bounds
+/// how long preprocessing may keep simplifying. It is checked between
+/// rounds and techniques, between the passes of unit propagation and
+/// pure literal elimination, and inside subsumption and variable
+/// elimination, always at a point where the clause set and the
+/// assignment are mutually consistent, so stopping early never produces
+/// a wrong answer: it only leaves the formula less simplified, and sets
+/// `Stats::timed_out`. A single pass of unit propagation or pure
+/// literal elimination (linear in the formula) is never interrupted
+/// midway.
 pub fn run(
     problem: &Problem,
     verbose: i32,
     num_threads: usize,
     p: params::Preprocess,
+    deadline: Option<Instant>,
 ) -> PreprocessResult {
     let mut clauses = problem.clauses.clone();
     let mut assignment = assignment::new(problem.num_vars);
@@ -164,14 +192,14 @@ pub fn run(
     let mut bve_budget = p.bve_work_budget_factor * problem.clauses.len();
 
     for _ in 0..MAX_ROUNDS {
+        if expired(deadline) {
+            stats.timed_out = true;
+            break;
+        }
         let mut changed = false;
 
-        // STAGE52.md: not time-limited (None/Instant::now()) -- run is
-        // called from cmd/vibe_sat entirely outside --time-limit-secs's
-        // scope (before either algorithm's own start_time is even
-        // captured); see run's own doc comment.
-        let (unsat, units_fixed, _) =
-            unit_propagate(&mut clauses, &mut assignment, None, Instant::now());
+        let (unsat, units_fixed, timed_out) =
+            unit_propagate_by_deadline(&mut clauses, &mut assignment, deadline);
         stats.units_propagated += units_fixed;
         if unsat {
             return PreprocessResult {
@@ -185,26 +213,49 @@ pub fn run(
             };
         }
         changed |= units_fixed > 0;
+        if timed_out {
+            stats.timed_out = true;
+            break;
+        }
 
-        let pure_fixed = eliminate_pure_literals(&mut clauses, &mut assignment);
+        let (pure_fixed, timed_out) =
+            eliminate_pure_literals(&mut clauses, &mut assignment, deadline);
         stats.pure_literals_fixed += pure_fixed;
         changed |= pure_fixed > 0;
+        if timed_out {
+            stats.timed_out = true;
+            break;
+        }
 
-        let subsumed = eliminate_subsumed_clauses_parallel(
+        let (subsumed, timed_out) = eliminate_subsumed_clauses_parallel(
             &mut clauses,
             problem.num_vars,
             num_threads,
             p.subsumption_work_budget_factor,
+            deadline,
         );
         stats.clauses_subsumed += subsumed;
         changed |= subsumed > 0;
+        if timed_out {
+            stats.timed_out = true;
+            break;
+        }
 
-        let new_steps =
-            eliminate_variables(&mut clauses, &assignment, problem.num_vars, &mut bve_budget);
+        let (new_steps, timed_out) = eliminate_variables(
+            &mut clauses,
+            &assignment,
+            problem.num_vars,
+            &mut bve_budget,
+            deadline,
+        );
         if !new_steps.is_empty() {
             stats.variables_eliminated += new_steps.len();
             eliminated.extend(new_steps);
             changed = true;
+        }
+        if timed_out {
+            stats.timed_out = true;
+            break;
         }
 
         if !changed {
@@ -221,6 +272,9 @@ pub fn run(
     stats.vars_after = reduced.num_vars;
 
     if verbose >= 1 {
+        if stats.timed_out {
+            println!("preprocess: time budget reached; stopped before reaching a fixpoint");
+        }
         println!(
             "preprocess: vars {}->{} clauses {}->{} (units={} pure={} subsumed={} eliminated={})",
             stats.vars_before,
@@ -562,12 +616,78 @@ pub fn unit_propagate(
     }
 }
 
+/// Computes the same fixpoint as [`unit_propagate`] (every variable
+/// forced by a chain of unit clauses is fixed, satisfied clauses are
+/// dropped, false literals removed) but stops at the first round
+/// boundary at or after `deadline`, for [`run`]'s STAGE57.md time
+/// budget. `None` means no deadline.
+///
+/// The check sits right after a complete [`simplify_with_assignment`]
+/// pass and before the unit scan assigns anything new, the one point
+/// where the clause set is fully simplified under `assignment`: unit
+/// clauses found but not yet applied just stay in `clauses` as ordinary
+/// clauses, which every later stage (and every solver's own bootstrap)
+/// already handles. That is why this does not reuse `unit_propagate`'s
+/// own `time_limit`, which aborts mid-scan and leaves `clauses`
+/// half-rewritten (fine for a caller that throws them away, wrong for
+/// preprocessing, which keeps them). Each round is linear in the
+/// formula, so a deadline is noticed within one linear pass; a long
+/// implication chain still costs one pass per link (see REPORT57.md),
+/// which is exactly what the deadline bounds.
+///
+/// Returns `(unsat, num_fixed, timed_out)`.
+fn unit_propagate_by_deadline(
+    clauses: &mut Vec<Clause>,
+    assignment: &mut Assignment,
+    deadline: Option<Instant>,
+) -> (bool, usize, bool) {
+    let mut num_fixed = 0;
+    loop {
+        let (clauses_unsat, _) =
+            simplify_with_assignment(clauses, assignment, None, Instant::now());
+        if clauses_unsat {
+            return (true, num_fixed, false);
+        }
+        if expired(deadline) {
+            return (false, num_fixed, true);
+        }
+
+        let mut found_unit = false;
+        for clause in clauses.iter() {
+            if clause.len() != 1 {
+                continue;
+            }
+            let lit = clause[0];
+            assignment[cnf::literal_var(lit)] = if cnf::literal_is_negative(lit) {
+                Value::False
+            } else {
+                Value::True
+            };
+            num_fixed += 1;
+            found_unit = true;
+        }
+        if !found_unit {
+            return (false, num_fixed, false);
+        }
+    }
+}
+
 /// Repeatedly finds variables that appear with only one polarity
 /// across all of `clauses` (never negated, or always negated) and
 /// fixes them to the value that satisfies every clause containing
 /// them, removing those now-satisfied clauses. Returns how many
 /// variables were fixed this way.
-fn eliminate_pure_literals(clauses: &mut Vec<Clause>, assignment: &mut Assignment) -> usize {
+///
+/// STAGE57.md: `deadline` (`None` meaning none) is checked after each
+/// complete pass (fix, then simplify), the point where `clauses` and
+/// `assignment` agree; the returned flag is true if it stops there with
+/// work possibly left. Each pass is linear, but a chain where fixing
+/// one variable makes the next one pure needs one pass per link.
+fn eliminate_pure_literals(
+    clauses: &mut Vec<Clause>,
+    assignment: &mut Assignment,
+    deadline: Option<Instant>,
+) -> (usize, bool) {
     let mut num_fixed = 0;
     loop {
         let n = assignment.len();
@@ -600,16 +720,18 @@ fn eliminate_pure_literals(clauses: &mut Vec<Clause>, assignment: &mut Assignmen
             fixed_this_pass = true;
         }
         if !fixed_this_pass {
-            return num_fixed;
+            return (num_fixed, false);
         }
         // Fixing a pure literal can only satisfy clauses (it never
         // introduces a new false literal elsewhere, since the
         // variable never appears with the opposite polarity), so this
-        // cannot discover a contradiction.
-        // Not time-limited (None/Instant::now()): eliminate_pure_literals
-        // is only ever called from run's own pipeline, which has no
-        // time-limit awareness at all yet -- see run's doc comment.
+        // cannot discover a contradiction. This simplify is never
+        // interrupted (None): stopping mid-scan would leave `clauses`
+        // inconsistent with `assignment`.
         let _ = simplify_with_assignment(clauses, assignment, None, Instant::now());
+        if expired(deadline) {
+            return (num_fixed, true);
+        }
     }
 }
 
@@ -706,6 +828,12 @@ fn rarest_literal_occurrences<'a>(
 /// -- see `eliminate_subsumed_clauses`'s doc comment for why that is
 /// always a safe (if possibly less thorough) outcome.
 ///
+/// STAGE57.md: `deadline` (`None` meaning none) is looked at every
+/// `DEADLINE_CHECK_INTERVAL` subsumers, counted from `lo`; the return
+/// value is true if the loop stopped because it had passed. Stopping
+/// there is safe for the same reason running out of budget is: keep
+/// bits already cleared stay valid, the rest are untouched.
+///
 /// `is_kept`/`mark_removed` read and write the caller's "keep" bits,
 /// rather than this function taking a keep slice directly, so this one
 /// implementation serves both `eliminate_subsumed_clauses` (plain
@@ -722,10 +850,14 @@ fn try_subsume_from(
     lo: usize,
     hi: usize,
     budget: &mut usize,
-) {
+    deadline: Option<Instant>,
+) -> bool {
     for i in lo..hi {
         if *budget == 0 {
-            return;
+            return false;
+        }
+        if (i - lo).is_multiple_of(DEADLINE_CHECK_INTERVAL) && expired(deadline) {
+            return true;
         }
         let Some(candidates) = rarest_literal_occurrences(occ, &cs[i]) else {
             continue;
@@ -747,6 +879,7 @@ fn try_subsume_from(
             }
         }
     }
+    false
 }
 
 /// Removes every clause that is subsumed by some other (shorter or
@@ -792,11 +925,16 @@ fn try_subsume_from(
 /// "this function's running time is unbounded." Running out of budget
 /// is always safe: skipping a possible subsumption never changes
 /// whether the formula is satisfiable, only how compact it ends up.
+///
+/// STAGE57.md: `deadline` (`None` meaning none) makes it stop early, at
+/// a subsumer boundary, removing only what it had already found; the
+/// returned flag is true if it did. Returns `(num_removed, timed_out)`.
 fn eliminate_subsumed_clauses(
     clauses: &mut Vec<Clause>,
     num_vars: usize,
     work_budget_factor: usize,
-) -> usize {
+    deadline: Option<Instant>,
+) -> (usize, bool) {
     let occ = LiteralOccurrence::build(clauses, num_vars);
     // Cell, not a plain bool, purely so the read closure and the write
     // closure below can both capture `keep` (immutably, via Cell's
@@ -806,7 +944,7 @@ fn eliminate_subsumed_clauses(
     let keep: Vec<Cell<bool>> = vec![Cell::new(true); clauses.len()];
 
     let mut budget = work_budget_factor * clauses.len();
-    try_subsume_from(
+    let timed_out = try_subsume_from(
         clauses,
         &occ,
         clauses.len(),
@@ -815,6 +953,7 @@ fn eliminate_subsumed_clauses(
         0,
         clauses.len(),
         &mut budget,
+        deadline,
     );
 
     let mut num_removed = 0;
@@ -828,7 +967,7 @@ fn eliminate_subsumed_clauses(
         }
     }
     *clauses = kept;
-    num_removed
+    (num_removed, timed_out)
 }
 
 /// Computes exactly the same result as [`eliminate_subsumed_clauses`]
@@ -872,14 +1011,18 @@ fn eliminate_subsumed_clauses(
 /// rather than pooled, which only matters for exactly how much
 /// subsumption gets found in the (rare, already-degraded) case where
 /// the budget actually runs out.
+///
+/// STAGE57.md: `deadline` is handed to every thread; the returned flag
+/// is true if any thread stopped early because of it.
 fn eliminate_subsumed_clauses_parallel(
     clauses: &mut Vec<Clause>,
     num_vars: usize,
     num_threads: usize,
     work_budget_factor: usize,
-) -> usize {
+    deadline: Option<Instant>,
+) -> (usize, bool) {
     if num_threads <= 1 {
-        return eliminate_subsumed_clauses(clauses, num_vars, work_budget_factor);
+        return eliminate_subsumed_clauses(clauses, num_vars, work_budget_factor, deadline);
     }
 
     let n = clauses.len();
@@ -888,6 +1031,7 @@ fn eliminate_subsumed_clauses_parallel(
     let cs: &Vec<Clause> = clauses;
     let chunk = n.div_ceil(num_threads).max(1);
     let per_thread_budget = (work_budget_factor * n) / num_threads;
+    let any_timed_out = AtomicBool::new(false);
 
     thread::scope(|scope| {
         let mut start = 0;
@@ -895,9 +1039,10 @@ fn eliminate_subsumed_clauses_parallel(
             let end = (start + chunk).min(n);
             let keep = &keep;
             let occ = &occ;
+            let any_timed_out = &any_timed_out;
             scope.spawn(move || {
                 let mut budget = per_thread_budget;
-                try_subsume_from(
+                if try_subsume_from(
                     cs,
                     occ,
                     n,
@@ -906,7 +1051,10 @@ fn eliminate_subsumed_clauses_parallel(
                     start,
                     end,
                     &mut budget,
-                );
+                    deadline,
+                ) {
+                    any_timed_out.store(true, Ordering::SeqCst);
+                }
             });
             start = end;
         }
@@ -923,7 +1071,7 @@ fn eliminate_subsumed_clauses_parallel(
         }
     }
     *clauses = kept;
-    num_removed
+    (num_removed, any_timed_out.load(Ordering::SeqCst))
 }
 
 /// Computes the resolvent of clauses `pos` and `neg` on variable `v`
@@ -1080,13 +1228,24 @@ fn compact_live_occurrences(list: &mut Vec<usize>, live: &[bool]) {
 /// call in the same `run` bails out on its very first candidate pair,
 /// for the cost of a handful of array accesses, rather than
 /// re-attempting the same expensive variable from zero each time.
+///
+/// STAGE57.md: `deadline` (`None` meaning none) is checked at the top of
+/// every scan restart, every `DEADLINE_CHECK_INTERVAL` variables within
+/// a scan, and every `DEADLINE_CHECK_INTERVAL` resolutions. A variable
+/// whose resolvents were only partly computed when time ran out is not
+/// eliminated, so stopping leaves every clause and every recorded step
+/// consistent. The scan restarting from `v=1` after each elimination is
+/// itself `O(num_vars)` per elimination (see REPORT57.md), which is
+/// what this deadline bounds. Returns `(steps, timed_out)`.
 fn eliminate_variables(
     clauses: &mut Vec<Clause>,
     assignment: &Assignment,
     num_vars: usize,
     budget: &mut usize,
-) -> Vec<EliminationStep> {
+    deadline: Option<Instant>,
+) -> (Vec<EliminationStep>, bool) {
     let mut steps = Vec::new();
+    let mut timed_out = false;
 
     let mut cs: Vec<Clause> = std::mem::take(clauses);
     let mut live: Vec<bool> = vec![true; cs.len()];
@@ -1123,7 +1282,15 @@ fn eliminate_variables(
     loop {
         let mut eliminated_this_pass = false;
         let mut budget_exhausted = false;
+        if expired(deadline) {
+            timed_out = true;
+            break;
+        }
         for v in 1..=num_vars {
+            if v.is_multiple_of(DEADLINE_CHECK_INTERVAL) && expired(deadline) {
+                timed_out = true;
+                break;
+            }
             if assignment[v] != Value::Unassigned || rejected[v] {
                 continue;
             }
@@ -1142,6 +1309,10 @@ fn eliminate_variables(
                 for &ni in &neg_idx {
                     if *budget == 0 {
                         budget_exhausted = true;
+                        break 'resolve_loop;
+                    }
+                    if (*budget).is_multiple_of(DEADLINE_CHECK_INTERVAL) && expired(deadline) {
+                        timed_out = true;
                         break 'resolve_loop;
                     }
                     *budget -= 1;
@@ -1167,9 +1338,9 @@ fn eliminate_variables(
                     }
                 }
             }
-            if budget_exhausted {
-                // Not enough budget left to even fully evaluate this
-                // variable, let alone any variable after it -- stop
+            if budget_exhausted || timed_out {
+                // Not enough budget (or time) left to even fully evaluate
+                // this variable, let alone any variable after it -- stop
                 // attempting further eliminations entirely rather
                 // than accept v based on an incomplete resolvent set.
                 break;
@@ -1212,7 +1383,7 @@ fn eliminate_variables(
             break; // restart from v=1, exactly as before STAGE31.md
         }
 
-        if budget_exhausted || !eliminated_this_pass {
+        if budget_exhausted || timed_out || !eliminated_this_pass {
             break;
         }
     }
@@ -1224,7 +1395,7 @@ fn eliminate_variables(
         .map(|(clause, _)| clause)
         .collect();
     *clauses = final_clauses;
-    steps
+    (steps, timed_out)
 }
 
 #[cfg(test)]
@@ -1423,7 +1594,8 @@ mod tests {
         let mut clauses = vec![vec![1, 2], vec![1, -2]];
         let mut assignment = assignment::new(2);
 
-        let num_fixed = eliminate_pure_literals(&mut clauses, &mut assignment);
+        let (num_fixed, timed_out) = eliminate_pure_literals(&mut clauses, &mut assignment, None);
+        assert!(!timed_out);
         assert_eq!(num_fixed, 1);
         assert_eq!(assignment[1], Value::True);
         assert!(clauses.is_empty());
@@ -1451,6 +1623,7 @@ mod tests {
             0,
             clauses.len(),
             &mut budget,
+            None,
         );
 
         assert!(
@@ -1464,10 +1637,11 @@ mod tests {
     #[test]
     fn test_eliminate_subsumed_clauses_removes_superset() {
         let mut clauses = vec![vec![1, 2], vec![1, 2, 3]];
-        let num_removed = eliminate_subsumed_clauses(
+        let (num_removed, _) = eliminate_subsumed_clauses(
             &mut clauses,
             3,
             params::default().preprocess.subsumption_work_budget_factor,
+            None,
         );
         assert_eq!(num_removed, 1);
         assert_eq!(clauses.len(), 1);
@@ -1476,10 +1650,11 @@ mod tests {
     #[test]
     fn test_eliminate_subsumed_clauses_removes_duplicates() {
         let mut clauses = vec![vec![1, -2], vec![1, -2]];
-        let num_removed = eliminate_subsumed_clauses(
+        let (num_removed, _) = eliminate_subsumed_clauses(
             &mut clauses,
             2,
             params::default().preprocess.subsumption_work_budget_factor,
+            None,
         );
         assert_eq!(num_removed, 1);
         assert_eq!(clauses.len(), 1);
@@ -1500,19 +1675,21 @@ mod tests {
         let original: Vec<Clause> = vec![vec![1], vec![1, 2], vec![1, 2, 4]];
 
         let mut want = original.clone();
-        let want_removed = eliminate_subsumed_clauses(
+        let (want_removed, _) = eliminate_subsumed_clauses(
             &mut want,
             4,
             params::default().preprocess.subsumption_work_budget_factor,
+            None,
         );
 
         for num_threads in [1, 2, 3, 4, 8] {
             let mut got = original.clone();
-            let got_removed = eliminate_subsumed_clauses_parallel(
+            let (got_removed, _) = eliminate_subsumed_clauses_parallel(
                 &mut got,
                 4,
                 num_threads,
                 params::default().preprocess.subsumption_work_budget_factor,
+                None,
             );
             assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
             assert_eq!(got, want, "num_threads={num_threads}");
@@ -1529,10 +1706,11 @@ mod tests {
             cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
         let mut want = problem.clauses.clone();
-        let want_removed = eliminate_subsumed_clauses(
+        let (want_removed, _) = eliminate_subsumed_clauses(
             &mut want,
             problem.num_vars,
             params::default().preprocess.subsumption_work_budget_factor,
+            None,
         );
         assert!(
             want_removed > 0,
@@ -1541,11 +1719,12 @@ mod tests {
 
         for num_threads in [1, 2, 3, 4, 8, 16] {
             let mut got = problem.clauses.clone();
-            let got_removed = eliminate_subsumed_clauses_parallel(
+            let (got_removed, _) = eliminate_subsumed_clauses_parallel(
                 &mut got,
                 problem.num_vars,
                 num_threads,
                 params::default().preprocess.subsumption_work_budget_factor,
+                None,
             );
             assert_eq!(got_removed, want_removed, "num_threads={num_threads}");
             assert_eq!(got, want, "num_threads={num_threads}");
@@ -1641,6 +1820,7 @@ mod tests {
                 &mut got,
                 num_vars as usize,
                 params::default().preprocess.subsumption_work_budget_factor,
+                None,
             );
 
             assert_eq!(
@@ -1661,13 +1841,13 @@ mod tests {
         let problem =
             cnf::read_dimacs(path, 0).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
 
-        let want = run(&problem, 0, 1, params::default().preprocess);
+        let want = run(&problem, 0, 1, params::default().preprocess, None);
         let want_problem = want
             .problem
             .as_ref()
             .expect("expected a simplified problem");
         for num_threads in [1, 2, 4, 8, 16] {
-            let got = run(&problem, 0, num_threads, params::default().preprocess);
+            let got = run(&problem, 0, num_threads, params::default().preprocess, None);
             let got_problem = got.problem.as_ref().expect("expected a simplified problem");
             assert_eq!(
                 got.stats.clauses_before, want.stats.clauses_before,
@@ -1781,7 +1961,8 @@ mod tests {
         let mut clauses = vec![vec![1, 2], vec![-1, 3]];
         let assignment = assignment::new(3);
 
-        let steps = eliminate_variables(&mut clauses, &assignment, 3, &mut huge_budget());
+        let (steps, _) =
+            eliminate_variables(&mut clauses, &assignment, 3, &mut huge_budget(), None);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].var, 1);
         assert_eq!(clauses.len(), 1);
@@ -1800,7 +1981,8 @@ mod tests {
         ];
         let assignment = assignment::new(6);
 
-        let steps = eliminate_variables(&mut clauses, &assignment, 6, &mut huge_budget());
+        let (steps, _) =
+            eliminate_variables(&mut clauses, &assignment, 6, &mut huge_budget(), None);
         assert!(steps.is_empty());
     }
 
@@ -1824,7 +2006,7 @@ mod tests {
         let assignment = assignment::new(9);
         let mut budget = 100;
 
-        let steps = eliminate_variables(&mut clauses, &assignment, 9, &mut budget);
+        let (steps, _) = eliminate_variables(&mut clauses, &assignment, 9, &mut budget, None);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].var, 7);
         assert_eq!(
@@ -1851,7 +2033,8 @@ mod tests {
         ];
         let assignment = assignment::new(7);
 
-        let steps = eliminate_variables(&mut clauses, &assignment, 7, &mut huge_budget());
+        let (steps, _) =
+            eliminate_variables(&mut clauses, &assignment, 7, &mut huge_budget(), None);
         let vars: Vec<usize> = steps.iter().map(|s| s.var).collect();
         assert_eq!(vars, vec![7, 1]);
     }
@@ -1979,11 +2162,12 @@ mod tests {
             );
 
             let mut got = original.clone();
-            let got_steps = eliminate_variables(
+            let (got_steps, _) = eliminate_variables(
                 &mut got,
                 &assignment::new(num_vars as usize),
                 num_vars as usize,
                 &mut huge_budget(),
+                None,
             );
 
             assert_eq!(
@@ -2016,7 +2200,7 @@ mod tests {
             ],
         };
 
-        let result = run(&problem, 0, 1, params::default().preprocess);
+        let result = run(&problem, 0, 1, params::default().preprocess, None);
         assert!(!result.unsat);
         let reduced = result.problem.as_ref().expect("expected a reduced problem");
         assert!(reduced.num_vars <= 2);
@@ -2036,7 +2220,7 @@ mod tests {
             num_vars: 1,
             clauses: vec![vec![1], vec![-1]],
         };
-        let result = run(&problem, 0, 1, params::default().preprocess);
+        let result = run(&problem, 0, 1, params::default().preprocess, None);
         assert!(result.unsat);
         assert!(result.problem.is_none());
     }
@@ -2062,7 +2246,7 @@ mod tests {
             clauses: vec![vec![1, 2], vec![-1, 3], vec![-2, -3]],
         };
 
-        let result = run(&problem, 0, 1, params::default().preprocess);
+        let result = run(&problem, 0, 1, params::default().preprocess, None);
         assert!(!result.unsat);
         assert!(
             !result.eliminated.is_empty(),
@@ -2100,7 +2284,7 @@ mod tests {
             num_vars: 2, // variable 2 never appears in any clause
             clauses: vec![vec![1]],
         };
-        let result = run(&problem, 0, 1, params::default().preprocess);
+        let result = run(&problem, 0, 1, params::default().preprocess, None);
         assert!(!result.unsat);
         let reduced = result.problem.as_ref().expect("expected a reduced problem");
 
@@ -2111,5 +2295,325 @@ mod tests {
         let full = result.reconstruct(&solution);
         assert_ne!(full[2], Value::Unassigned);
         all_clauses_satisfied(&problem, &full);
+    }
+
+    // ---- STAGE57.md: preprocessing deadline ----
+
+    /// A deadline that has certainly already expired.
+    fn past_deadline() -> Option<Instant> {
+        Instant::now().checked_sub(Duration::from_secs(3600))
+    }
+
+    /// A deadline that will not expire during a test.
+    fn future_deadline() -> Option<Instant> {
+        Some(Instant::now() + Duration::from_secs(3600))
+    }
+
+    /// `(x1), (-x1 v x2), ..., (-x_{n-1} v x_n)`.
+    fn chain_clauses(n: i32) -> Vec<Clause> {
+        let mut clauses: Vec<Clause> = vec![vec![1]];
+        for i in 1..n {
+            clauses.push(vec![-i, i + 1]);
+        }
+        clauses
+    }
+
+    fn brute_force_satisfiable(clauses: &[Clause], num_vars: usize) -> bool {
+        (0u32..(1 << num_vars)).any(|mask| {
+            let mut a = assignment::new(num_vars);
+            for (v, value) in a.iter_mut().enumerate().skip(1) {
+                *value = if mask & (1 << (v - 1)) != 0 {
+                    Value::True
+                } else {
+                    Value::False
+                };
+            }
+            all_satisfied(clauses, &a)
+        })
+    }
+
+    #[test]
+    fn test_deadline_none_limit_means_no_deadline() {
+        assert!(deadline(None, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn test_deadline_is_one_tenth_of_limit() {
+        let now = Instant::now();
+        for (limit, want) in [
+            (Duration::from_secs(10), Duration::from_secs(1)),
+            (Duration::from_secs(100), Duration::from_secs(10)),
+            (Duration::from_secs(1), Duration::from_millis(100)),
+            (Duration::ZERO, Duration::ZERO),
+        ] {
+            assert_eq!(deadline(Some(limit), now), Some(now + want), "{limit:?}");
+        }
+    }
+
+    #[test]
+    fn test_expired() {
+        assert!(!expired(None), "no deadline must never expire");
+        assert!(expired(past_deadline()), "a past deadline must be expired");
+        assert!(
+            !expired(future_deadline()),
+            "a future deadline must not be expired"
+        );
+    }
+
+    #[test]
+    fn test_unit_propagate_by_deadline_matches_unit_propagate_without_deadline() {
+        let mut rng = StdRng::seed_from_u64(57);
+        for trial in 0..200 {
+            let num_vars: i32 = 3 + rng.random_range(0..8);
+            let num_base = 2 + rng.random_range(0..14);
+            let mut base = random_clause_set(&mut rng, num_vars, num_base);
+            for _ in 0..(1 + rng.random_range(0..3)) {
+                let v = 1 + rng.random_range(0..num_vars);
+                base.push(vec![if rng.random_range(0..2) == 0 { -v } else { v }]);
+            }
+
+            let mut want = base.clone();
+            let mut want_assignment = assignment::new(num_vars as usize);
+            let (want_unsat, want_fixed, _) =
+                unit_propagate(&mut want, &mut want_assignment, None, Instant::now());
+
+            let mut got = base.clone();
+            let mut got_assignment = assignment::new(num_vars as usize);
+            let (got_unsat, got_fixed, got_timed_out) =
+                unit_propagate_by_deadline(&mut got, &mut got_assignment, None);
+
+            assert!(!got_timed_out, "trial {trial}: timed out with no deadline");
+            assert_eq!(got_unsat, want_unsat, "trial {trial}");
+            if got_unsat {
+                continue;
+            }
+            assert_eq!(got_fixed, want_fixed, "trial {trial}");
+            assert_eq!(got_assignment, want_assignment, "trial {trial}");
+            assert_eq!(got.len(), want.len(), "trial {trial}");
+        }
+    }
+
+    #[test]
+    fn test_unit_propagate_by_deadline_stops_consistently_when_expired() {
+        let mut clauses = chain_clauses(5);
+        let original = clauses.clone();
+        let mut assignment = assignment::new(5);
+
+        let (unsat, num_fixed, timed_out) =
+            unit_propagate_by_deadline(&mut clauses, &mut assignment, past_deadline());
+        assert!(!unsat);
+        assert!(timed_out);
+        assert_eq!(num_fixed, 0, "stop before the first unit scan");
+        assert_eq!(clauses, original);
+    }
+
+    #[test]
+    fn test_unit_propagate_by_deadline_reaches_fixpoint_with_far_deadline() {
+        let mut clauses = chain_clauses(6);
+        let mut assignment = assignment::new(6);
+        let (_, _, timed_out) =
+            unit_propagate_by_deadline(&mut clauses, &mut assignment, future_deadline());
+        assert!(!timed_out);
+        for (v, &value) in assignment.iter().enumerate().skip(1) {
+            assert_eq!(value, Value::True, "variable {v}");
+        }
+        assert!(clauses.is_empty());
+    }
+
+    #[test]
+    fn test_eliminate_pure_literals_stops_after_one_pass_when_expired() {
+        // (x1 v -x2), (x2 v -x3), (x3 v -x4): x1 is pure, then x2
+        // becomes pure, and so on; one pass per link.
+        let chain = || -> Vec<Clause> { vec![vec![1, -2], vec![2, -3], vec![3, -4]] };
+
+        let mut clauses = chain();
+        let mut assignment = assignment::new(4);
+        let (num_fixed, timed_out) =
+            eliminate_pure_literals(&mut clauses, &mut assignment, past_deadline());
+        assert!(timed_out);
+        assert!(num_fixed >= 1, "want at least one full pass");
+        for clause in &clauses {
+            for &lit in clause {
+                assert_eq!(
+                    assignment[cnf::literal_var(lit)],
+                    Value::Unassigned,
+                    "clause {clause:?} still mentions an assigned variable"
+                );
+            }
+        }
+
+        // Without a deadline the whole chain resolves.
+        let mut clauses = chain();
+        let mut assignment = assignment::new(4);
+        let (num_fixed, timed_out) = eliminate_pure_literals(&mut clauses, &mut assignment, None);
+        assert!(!timed_out);
+        assert!(clauses.is_empty());
+        assert!(num_fixed >= 3);
+    }
+
+    #[test]
+    fn test_eliminate_subsumed_clauses_removes_nothing_when_expired() {
+        let mut clauses: Vec<Clause> = vec![vec![1, 2], vec![1, 2, 3]];
+        let (num_removed, timed_out) =
+            eliminate_subsumed_clauses(&mut clauses, 3, 64, past_deadline());
+        assert!(timed_out);
+        assert_eq!(num_removed, 0);
+        assert_eq!(clauses.len(), 2);
+
+        let (num_removed, timed_out) = eliminate_subsumed_clauses(&mut clauses, 3, 64, None);
+        assert!(!timed_out);
+        assert_eq!(num_removed, 1);
+        assert_eq!(clauses.len(), 1);
+    }
+
+    #[test]
+    fn test_eliminate_subsumed_clauses_parallel_reports_timed_out() {
+        let mut clauses: Vec<Clause> = vec![vec![1, 2], vec![1, 2, 3]];
+        let (num_removed, timed_out) =
+            eliminate_subsumed_clauses_parallel(&mut clauses, 3, 4, 64, past_deadline());
+        assert!(timed_out);
+        assert_eq!(num_removed, 0);
+        assert_eq!(clauses.len(), 2);
+    }
+
+    #[test]
+    fn test_eliminate_variables_does_nothing_when_expired() {
+        let mut clauses: Vec<Clause> = vec![vec![1, 2], vec![-1, 3], vec![-2, -3]];
+        let assignment = assignment::new(3);
+        let (steps, timed_out) = eliminate_variables(
+            &mut clauses,
+            &assignment,
+            3,
+            &mut huge_budget(),
+            past_deadline(),
+        );
+        assert!(timed_out);
+        assert!(steps.is_empty());
+        assert_eq!(clauses.len(), 3);
+
+        let (steps, timed_out) =
+            eliminate_variables(&mut clauses, &assignment, 3, &mut huge_budget(), None);
+        assert!(!timed_out);
+        assert!(!steps.is_empty());
+    }
+
+    /// The safety property: an early stop at any point leaves a problem
+    /// that is satisfiable exactly when the original is, and every model
+    /// of it reconstructs to a model of the original.
+    #[test]
+    fn test_run_with_expired_deadline_stays_equivalent() {
+        let mut rng = StdRng::seed_from_u64(58);
+        for trial in 0..150 {
+            let num_vars: i32 = 3 + rng.random_range(0..7);
+            let num_clauses = 3 + rng.random_range(0..20);
+            let problem = Problem {
+                num_vars: num_vars as usize,
+                clauses: random_clause_set(&mut rng, num_vars, num_clauses),
+            };
+            let want_sat = brute_force_satisfiable(&problem.clauses, problem.num_vars);
+
+            let result = run(
+                &problem,
+                0,
+                1,
+                params::default().preprocess,
+                past_deadline(),
+            );
+            if result.unsat {
+                assert!(
+                    !want_sat,
+                    "trial {trial}: UNSAT claimed on a satisfiable formula"
+                );
+                continue;
+            }
+            assert!(
+                result.stats.timed_out,
+                "trial {trial}: an expired deadline must set stats.timed_out"
+            );
+            let reduced = result.problem.as_ref().expect("expected a reduced problem");
+            let n = reduced.num_vars;
+            assert_eq!(
+                brute_force_satisfiable(&reduced.clauses, n),
+                want_sat,
+                "trial {trial}"
+            );
+            for mask in 0u32..(1 << n) {
+                let mut solution = assignment::new(n);
+                for (v, value) in solution.iter_mut().enumerate().skip(1) {
+                    *value = if mask & (1 << (v - 1)) != 0 {
+                        Value::True
+                    } else {
+                        Value::False
+                    };
+                }
+                if all_satisfied(&reduced.clauses, &solution) {
+                    all_clauses_satisfied(&problem, &result.reconstruct(&solution));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_with_far_deadline_matches_run_without_deadline() {
+        let mut rng = StdRng::seed_from_u64(59);
+        for trial in 0..50 {
+            let num_vars: i32 = 4 + rng.random_range(0..10);
+            let num_clauses = 4 + rng.random_range(0..30);
+            let problem = Problem {
+                num_vars: num_vars as usize,
+                clauses: random_clause_set(&mut rng, num_vars, num_clauses),
+            };
+
+            let none = run(&problem, 0, 1, params::default().preprocess, None);
+            let far = run(
+                &problem,
+                0,
+                1,
+                params::default().preprocess,
+                future_deadline(),
+            );
+            assert!(
+                !none.stats.timed_out && !far.stats.timed_out,
+                "trial {trial}"
+            );
+            assert_eq!(none.unsat, far.unsat, "trial {trial}");
+            if none.unsat {
+                continue;
+            }
+            let (a, b) = (none.problem.unwrap(), far.problem.unwrap());
+            assert_eq!(a.num_vars, b.num_vars, "trial {trial}");
+            assert_eq!(a.clauses, b.clauses, "trial {trial}");
+        }
+    }
+
+    #[test]
+    fn test_run_stops_promptly_on_long_unit_chain() {
+        // The chain needs one linear pass per link (quadratic overall); a
+        // short deadline must cut it off long before it finishes.
+        const N: i32 = 60000;
+        let problem = Problem {
+            num_vars: N as usize,
+            clauses: chain_clauses(N),
+        };
+        let limit = Duration::from_millis(200);
+        let start = Instant::now();
+        let result = run(
+            &problem,
+            0,
+            1,
+            params::default().preprocess,
+            deadline(Some(limit), start),
+        );
+        // The deadline here is limit/10 = 20 ms; allow generous slack for
+        // a loaded machine, but far below the many seconds a full run takes.
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "run took {:?} with a 20 ms deadline",
+            start.elapsed()
+        );
+        assert!(
+            result.stats.timed_out,
+            "expected stats.timed_out on a 60000-link chain with a 20 ms deadline"
+        );
     }
 }

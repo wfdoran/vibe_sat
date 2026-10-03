@@ -3,6 +3,7 @@ package preprocess
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"vibe_sat/internal/cnf"
 	"vibe_sat/internal/params"
@@ -34,7 +35,7 @@ func BenchmarkRunHard(b *testing.B) {
 		b.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
 	}
 	for i := 0; i < b.N; i++ {
-		Run(problem, 0, 1, params.Default().Preprocess)
+		Run(problem, 0, 1, params.Default().Preprocess, time.Time{})
 	}
 }
 
@@ -47,6 +48,6 @@ func BenchmarkRunHardParallel8(b *testing.B) {
 		b.Fatalf("failed to read benchmark CNF file %s: %v", path, err)
 	}
 	for i := 0; i < b.N; i++ {
-		Run(problem, 0, 8, params.Default().Preprocess)
+		Run(problem, 0, 8, params.Default().Preprocess, time.Time{})
 	}
 }

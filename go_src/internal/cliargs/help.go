@@ -45,7 +45,11 @@ Options:
         "hc"/"ws" unless a real (not "_") first --alg-params value (the
         number of restarts) is given instead; optional for
         "dfs" (which will otherwise run until it finds a solution or
-        exhausts the search space, however long that takes).
+        exhausts the search space, however long that takes). When a
+        time limit is given, preprocessing may use at most one tenth
+        of it (it then stops simplifying and hands what it has to
+        the search, which still gets the whole limit); with no time
+        limit, preprocessing runs to completion.
 
   --alg-params <val1> [<val2> <val3> <val4>], -p <val1> [<val2> <val3> <val4>]
         Algorithm-specific parameters (1 to 4 integer values). For

@@ -99,7 +99,15 @@ func main() {
 	originalNumVars := problem.NumVars
 	var preResult *preprocess.Result
 	if !args.NoPreprocessing {
-		preResult = preprocess.Run(problem, args.Verbose, args.NumThreads, internalParams.Preprocess)
+		// STAGE57.md: with --time-limit-secs, preprocessing gets
+		// limit/preprocess.TimeFraction (the search still gets the whole
+		// limit); without one it runs to its fixpoint.
+		var preprocessLimit *time.Duration
+		if args.TimeLimitSecs != nil {
+			limit := timeLimitDuration(*args.TimeLimitSecs)
+			preprocessLimit = &limit
+		}
+		preResult = preprocess.Run(problem, args.Verbose, args.NumThreads, internalParams.Preprocess, preprocess.Deadline(preprocessLimit, time.Now()))
 		if preResult.Unsat {
 			// Preprocessing alone already proves the original problem
 			// has no solution, regardless of which algorithm was
