@@ -480,22 +480,26 @@ Options:
         vibe_sat exit with an error naming the field, and only the
         first problem is reported. Accepted ranges ("integer" means
         a whole number; every float must be finite):
-          cdcl.lubyBaseConflicts, polynomialBaseConflicts,
-            geometricBaseConflicts            integer >= 1
+          cdcl.lubyBaseConflicts,
+            polynomialBaseConflicts           integer, 1 to 1000000000
+          cdcl.geometricBaseConflicts         integer >= 1
           cdcl.geometricGrowthFactor          >= 1
           cdcl.lrbAlpha, clauseActivityDecay,
             varActivityDecay                  > 0 and <= 1
           cdcl.glueClauseLBDThreshold         integer >= 0
           cdcl.glucoseWindowSize              integer, 1 to 10000000
           cdcl.glucoseK                       > 0
-          cdcl.minimizeWorkBudgetFactor       integer >= 0
+          cdcl.minimizeWorkBudgetFactor       integer, 0 to 1000000000
           cdcl.rephaseIntervalRestarts,
             rephaseMaxFlips                   integer >= 1
           preprocess.subsumptionWorkBudgetFactor,
-            bveWorkBudgetFactor               integer >= 0
+            bveWorkBudgetFactor               integer, 0 to 1000000000
         A work-budget factor of 0 effectively disables that bound or
-        technique. The built-in defaults are always inside these
-        ranges.
+        technique. The upper limit of 1000000000 (far beyond
+        anything that ever binds) keeps these values, which get
+        multiplied by clause counts and restart counts, from
+        overflowing; to make a bound effectively unlimited, use it.
+        The built-in defaults are always inside these ranges.
 
   --reset-internal-params, -q
         Write the built-in default internal tuning parameters to

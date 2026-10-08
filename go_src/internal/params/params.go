@@ -144,6 +144,19 @@ func Load(path string) (Params, error) {
 // 50 and costs at most 80 MB.
 const MaxGlucoseWindowSize = 10_000_000
 
+// MaxScaleFactor is the largest accepted value of the five integer
+// parameters that get multiplied by a problem- or run-sized quantity:
+// the three work-budget factors (times a clause count, or a learned
+// clause's length times its log) and the Luby and polynomial restart
+// bases (times a Luby term or a squared restart count). One billion is
+// over five orders of magnitude past the largest default (18000) and
+// already means "never binds" in practice, but keeps every such product
+// far below 2^63 for any formula or run that fits in memory. Without a
+// cap, a value like INT64_MAX (a natural way to spell "unlimited")
+// silently wraps: in Go it disabled BVE on formulas with an even clause
+// count (STAGE58.md / reports/REPORT58.md).
+const MaxScaleFactor = 1_000_000_000
+
 // validate rejects parameter values that either crash the solver
 // (glucoseWindowSize outside [1, MaxGlucoseWindowSize]: it sizes the LBD
 // ring buffer allocated for every cdcl run, so 0 or a negative size
@@ -158,8 +171,8 @@ const MaxGlucoseWindowSize = 10_000_000
 func validate(p Params) error {
 	c := p.CDCL
 	checks := []error{
-		minInt("cdcl.lubyBaseConflicts", c.LubyBaseConflicts, 1),
-		minInt("cdcl.polynomialBaseConflicts", c.PolynomialBaseConflicts, 1),
+		rangeInt("cdcl.lubyBaseConflicts", c.LubyBaseConflicts, 1, MaxScaleFactor),
+		rangeInt("cdcl.polynomialBaseConflicts", c.PolynomialBaseConflicts, 1, MaxScaleFactor),
 		minInt("cdcl.geometricBaseConflicts", c.GeometricBaseConflicts, 1),
 		minFloat("cdcl.geometricGrowthFactor", c.GeometricGrowthFactor, 1),
 		unitFloat("cdcl.lrbAlpha", c.LRBAlpha),
@@ -168,11 +181,11 @@ func validate(p Params) error {
 		minInt("cdcl.glueClauseLBDThreshold", c.GlueClauseLBDThreshold, 0),
 		rangeInt("cdcl.glucoseWindowSize", c.GlucoseWindowSize, 1, MaxGlucoseWindowSize),
 		positiveFloat("cdcl.glucoseK", c.GlucoseK),
-		minInt("cdcl.minimizeWorkBudgetFactor", c.MinimizeWorkBudgetFactor, 0),
+		rangeInt("cdcl.minimizeWorkBudgetFactor", c.MinimizeWorkBudgetFactor, 0, MaxScaleFactor),
 		minInt("cdcl.rephaseIntervalRestarts", c.RephaseIntervalRestarts, 1),
 		minInt("cdcl.rephaseMaxFlips", c.RephaseMaxFlips, 1),
-		minInt("preprocess.subsumptionWorkBudgetFactor", p.Preprocess.SubsumptionWorkBudgetFactor, 0),
-		minInt("preprocess.bveWorkBudgetFactor", p.Preprocess.BVEWorkBudgetFactor, 0),
+		rangeInt("preprocess.subsumptionWorkBudgetFactor", p.Preprocess.SubsumptionWorkBudgetFactor, 0, MaxScaleFactor),
+		rangeInt("preprocess.bveWorkBudgetFactor", p.Preprocess.BVEWorkBudgetFactor, 0, MaxScaleFactor),
 	}
 	for _, err := range checks {
 		if err != nil {

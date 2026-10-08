@@ -129,6 +129,15 @@ pub fn load(path: &str) -> Result<Params, String> {
 /// and costs at most 80 MB.
 pub const MAX_GLUCOSE_WINDOW_SIZE: i64 = 10_000_000;
 
+/// Largest accepted value of the five integer parameters that get
+/// multiplied by a problem- or run-sized quantity (the three work-budget
+/// factors and the Luby and polynomial restart bases); the same value
+/// as Go's `MaxScaleFactor`, and the reason is the same: it is over five
+/// orders of magnitude past the largest default and never binds in
+/// practice, yet keeps every such product far below 2^63 (without a cap
+/// a huge value silently wraps in a release build).
+pub const MAX_SCALE_FACTOR: i64 = 1_000_000_000;
+
 /// Every parameter as a signed 64-bit integer or an f64, mirroring Go's
 /// `int`/`float64` struct fields. [`Params`] stores counts as `usize`,
 /// which cannot represent a negative value, so a file's `-5` would be
@@ -215,11 +224,17 @@ impl Fields {
 /// as "<section>.<key> must be <range> (got <value>)". NaN and
 /// infinities are rejected wherever a float field has no upper bound.
 fn validate(f: &Fields) -> Result<(), String> {
-    min_int("cdcl.lubyBaseConflicts", f.luby_base_conflicts, 1)?;
-    min_int(
+    range_int(
+        "cdcl.lubyBaseConflicts",
+        f.luby_base_conflicts,
+        1,
+        MAX_SCALE_FACTOR,
+    )?;
+    range_int(
         "cdcl.polynomialBaseConflicts",
         f.polynomial_base_conflicts,
         1,
+        MAX_SCALE_FACTOR,
     )?;
     min_int("cdcl.geometricBaseConflicts", f.geometric_base_conflicts, 1)?;
     min_float("cdcl.geometricGrowthFactor", f.geometric_growth_factor, 1.0)?;
@@ -238,10 +253,11 @@ fn validate(f: &Fields) -> Result<(), String> {
         MAX_GLUCOSE_WINDOW_SIZE,
     )?;
     positive_float("cdcl.glucoseK", f.glucose_k)?;
-    min_int(
+    range_int(
         "cdcl.minimizeWorkBudgetFactor",
         f.minimize_work_budget_factor,
         0,
+        MAX_SCALE_FACTOR,
     )?;
     min_int(
         "cdcl.rephaseIntervalRestarts",
@@ -249,15 +265,17 @@ fn validate(f: &Fields) -> Result<(), String> {
         1,
     )?;
     min_int("cdcl.rephaseMaxFlips", f.rephase_max_flips, 1)?;
-    min_int(
+    range_int(
         "preprocess.subsumptionWorkBudgetFactor",
         f.subsumption_work_budget_factor,
         0,
+        MAX_SCALE_FACTOR,
     )?;
-    min_int(
+    range_int(
         "preprocess.bveWorkBudgetFactor",
         f.bve_work_budget_factor,
         0,
+        MAX_SCALE_FACTOR,
     )?;
     Ok(())
 }
@@ -878,6 +896,46 @@ mod tests {
     /// params_test.go.
     const REJECTED: &[(&str, &str)] = &[
         (
+            r#"{"cdcl":{"lubyBaseConflicts":9223372036854775807}}"#,
+            "cdcl.lubyBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"polynomialBaseConflicts":9223372036854775807}}"#,
+            "cdcl.polynomialBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"minimizeWorkBudgetFactor":9223372036854775807}}"#,
+            "cdcl.minimizeWorkBudgetFactor",
+        ),
+        (
+            r#"{"preprocess":{"subsumptionWorkBudgetFactor":9223372036854775807}}"#,
+            "preprocess.subsumptionWorkBudgetFactor",
+        ),
+        (
+            r#"{"preprocess":{"bveWorkBudgetFactor":9223372036854775807}}"#,
+            "preprocess.bveWorkBudgetFactor",
+        ),
+        (
+            r#"{"cdcl":{"lubyBaseConflicts":1000000001}}"#,
+            "cdcl.lubyBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"polynomialBaseConflicts":1000000001}}"#,
+            "cdcl.polynomialBaseConflicts",
+        ),
+        (
+            r#"{"cdcl":{"minimizeWorkBudgetFactor":1000000001}}"#,
+            "cdcl.minimizeWorkBudgetFactor",
+        ),
+        (
+            r#"{"preprocess":{"subsumptionWorkBudgetFactor":1000000001}}"#,
+            "preprocess.subsumptionWorkBudgetFactor",
+        ),
+        (
+            r#"{"preprocess":{"bveWorkBudgetFactor":1000000001}}"#,
+            "preprocess.bveWorkBudgetFactor",
+        ),
+        (
             r#"{"cdcl":{"lubyBaseConflicts":0}}"#,
             "cdcl.lubyBaseConflicts",
         ),
@@ -982,6 +1040,8 @@ mod tests {
         r#"{"cdcl":{"glueClauseLBDThreshold":0}}"#,
         r#"{"cdcl":{"glucoseWindowSize":1}}"#,
         r#"{"cdcl":{"glucoseWindowSize":10000000}}"#,
+        r#"{"cdcl":{"lubyBaseConflicts":1000000000,"polynomialBaseConflicts":1000000000,"minimizeWorkBudgetFactor":1000000000}}"#,
+        r#"{"preprocess":{"subsumptionWorkBudgetFactor":1000000000,"bveWorkBudgetFactor":1000000000}}"#,
         r#"{"cdcl":{"glucoseK":0.0001}}"#,
         r#"{"cdcl":{"glucoseK":1000}}"#,
         r#"{"cdcl":{"minimizeWorkBudgetFactor":0}}"#,
