@@ -373,14 +373,14 @@ learned clauses' "Literal Block Distance" (LBD — the number of
 distinct decision levels among a clause's literals, also used by
 clause-database management below) alongside the all-time average
 since the search began, and restarts whenever the recent average
-looks close to `K` times the global one. `K` was tuned by benchmark
-sweep (`reports/REPORT35.md`) to 0.6, not Glucose's own published 0.8
-— restarting less often than the literature default turned out to
-matter on this project's own benchmark mix (roughly halving mean
-solve time at an equal or better solved count), the same pattern
-already found for VSIDS-over-LRB and polynomial-over-Luby above. Not
-(yet) this project's own default regardless; see `reports/REPORT34.md`/
-`reports/REPORT35.md` for why.
+looks close to `K` times the global one. `K` was first tuned by
+benchmark sweep (`reports/REPORT35.md`) to 0.6, below Glucose's own
+published 0.8, but that sweep never tried values above 0.8. A wider
+sweep (`reports/REPORT60.md`) found 0.8 about 15% faster than 0.6 on
+two independent file samples, with 0.9 and 1.0 slower, so `K` is back
+at 0.8. Glucose restarts are still not this project's single-thread
+default regardless; see `reports/REPORT34.md`/`reports/REPORT35.md`
+for why.
 
 With more than one thread, the default instead becomes **round-robin**
 (`val2=5`): worker 0 gets the polynomial schedule, worker 1 the
@@ -762,5 +762,5 @@ identical work. A few concrete things fell out of that comparison:
   hardcoded, via `--internal-params`/`.vibe_sat.json` — see
   [internal-parameters.md](internal-parameters.md) for the full list
   and every value's default. The numbers quoted throughout this page
-  (e.g. `glucoseK`'s `0.6`, LRB's `alpha = 0.4`) are these parameters'
+  (e.g. `glucoseK`'s `0.8`, LRB's `alpha = 0.1`) are these parameters'
   built-in defaults, not fixed constants.

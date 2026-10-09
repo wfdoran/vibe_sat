@@ -24,4 +24,11 @@ Planning (contributed by Henry Kautz and Bart Selman)
 
 DIMACS Benchmark Instances (original source: DIMACS Benchmark set for SAT) - overview (ps-file, 72k)
 
-    SSA: Circuit fault analysis: single-stuck-at fault - 4 instances satisfiable, 4 instances unsatisfiable description (html) 	 
+    SSA: Circuit fault analysis: single-stuck-at fault - 4 instances satisfiable, 4 instances unsatisfiable description (html)
+
+    BF: Circuit fault analysis: bridge fault - 4 instances, all unsatisfiable
+
+    PHOLE: Pigeon hole problem - 5 instances, all unsatisfiable description (html)
+    
+    PRET: Encoded 2-colouring forced to be unsatisfiable - 8 instances, all unsatisfiable description (html) 
+

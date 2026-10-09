@@ -63,8 +63,8 @@ func TestFormatByPathRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("formatByPath: %v", err)
 	}
-	if got != "0.6" {
-		t.Errorf("formatByPath(cdcl.glucoseK) = %q, want %q", got, "0.6")
+	if got != "0.8" {
+		t.Errorf("formatByPath(cdcl.glucoseK) = %q, want %q", got, "0.8")
 	}
 }
 
@@ -83,8 +83,8 @@ func TestAllParamPathsCoversKnownFields(t *testing.T) {
 			t.Errorf("allParamPaths() missing %q", w)
 		}
 	}
-	if len(paths) != 13 {
-		t.Errorf("allParamPaths() returned %d paths, want 13 (11 cdcl + 2 preprocess)", len(paths))
+	if len(paths) != 15 {
+		t.Errorf("allParamPaths() returned %d paths, want 15 (13 cdcl + 2 preprocess)", len(paths))
 	}
 }
 

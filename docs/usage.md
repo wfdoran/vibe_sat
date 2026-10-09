@@ -68,6 +68,13 @@ unless `--alg-params` is given instead (they need *some* stopping
 condition). Optional for `dfs`/`cdcl`, which otherwise run until they
 find a solution or exhaust the search space — however long that takes.
 
+Preprocessing time does not count against the limit. When a limit is
+given, preprocessing may use at most one tenth of it (it then stops
+simplifying and hands what it has to the search, which still gets the
+whole limit), so total wall time can reach 1.1 times the limit. With no
+limit, preprocessing runs to completion. See
+[internal-parameters.md](internal-parameters.md#preprocessing-and---time-limit-secs).
+
 ### `--no-preprocessing`, `-x`
 
 Skip preprocessing and hand the CNF file to the chosen algorithm

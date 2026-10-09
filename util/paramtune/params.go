@@ -31,6 +31,11 @@ type cdclParams struct {
 	GlucoseWindowSize        int     `json:"glucoseWindowSize"`
 	GlucoseK                 float64 `json:"glucoseK"`
 	MinimizeWorkBudgetFactor int     `json:"minimizeWorkBudgetFactor"`
+
+	// STAGE43.md's periodic WalkSAT rephasing parameters (added to
+	// this copy in STAGE60.md so they can be swept).
+	RephaseIntervalRestarts int `json:"rephaseIntervalRestarts"`
+	RephaseMaxFlips         int `json:"rephaseMaxFlips"`
 }
 
 type preprocessParams struct {
@@ -54,13 +59,15 @@ func defaultParams() vibeSatParams {
 			PolynomialBaseConflicts:  18000,
 			GeometricBaseConflicts:   100,
 			GeometricGrowthFactor:    1.5,
-			LRBAlpha:                 0.4,
+			LRBAlpha:                 0.1,
 			ClauseActivityDecay:      0.999,
 			VarActivityDecay:         0.95,
 			GlueClauseLBDThreshold:   2,
 			GlucoseWindowSize:        50,
-			GlucoseK:                 0.6,
+			GlucoseK:                 0.8,
 			MinimizeWorkBudgetFactor: 20,
+			RephaseIntervalRestarts:  50,
+			RephaseMaxFlips:          1000,
 		},
 		Preprocess: preprocessParams{
 			SubsumptionWorkBudgetFactor: 64,

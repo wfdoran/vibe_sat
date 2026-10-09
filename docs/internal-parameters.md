@@ -32,12 +32,12 @@ A parameter's JSON key (where it has one) is the name used inside
 | `polynomialBaseConflicts` | `18000` | same | Scale factor for the polynomial restart schedule (`RestartPolynomial`). No literature standard exists for this one; chosen by this project's own benchmarking (see `REPORT18.md`/`REPORT19.md`). |
 | `geometricBaseConflicts` | `100` | same | Base interval for the geometric restart schedule (`RestartGeometric`); previously tied to `lubyBaseConflicts` by definition, now independently tunable. |
 | `geometricGrowthFactor` | `1.5` | same | Growth ratio ("c") applied to `geometricBaseConflicts` after every restart. |
-| `lrbAlpha` | `0.4` | same | *Starting* exponential-moving-average learning-rate weight for the LRB (`SelectVarVariant::Lrb`) branching heuristic's Q-values (`STAGE49.md`: annealed once per conflict down to a floor thereafter — see the compile-time constants below). |
+| `lrbAlpha` | `0.1` | same | *Starting* exponential-moving-average learning-rate weight for the LRB (`SelectVarVariant::Lrb`) branching heuristic's Q-values (`STAGE49.md`: annealed once per conflict down to a floor thereafter — see the compile-time constants below). Recalibrated from `0.4` to `0.1` by `STAGE60.md`'s sweep: with `0.4`, 9–10 of 24 sampled files were unsolved in 20 s; `0.06`–`0.1` solved all of them and was the fastest — see `REPORT60.md`. |
 | `clauseActivityDecay` | `0.999` | same | Per-conflict decay applied to the clause-activity increment (VSIDS-style clause bumping). |
 | `varActivityDecay` | `0.95` | same | Per-conflict decay applied to the variable-activity increment (`SelectVarVsids`'s analogue of `clauseActivityDecay`). |
 | `glueClauseLBDThreshold` | `2` | same | LBD at or below which a learned clause is a "glue clause," permanently exempt from `reduceClauseDatabase`'s deletion. |
 | `glucoseWindowSize` | `50` | same | Size of the recent-LBD window `RestartGlucose` averages over (Glucose's own published value). Must be at least 1 (and at most 10,000,000, since the window is allocated up front). |
-| `glucoseK` | `0.6` | same | Multiplier on the recent-window LBD average that `RestartGlucose` compares against the global average to decide whether to restart. Benchmark-tuned away from Glucose's own published `0.8` — see `REPORT35.md`. |
+| `glucoseK` | `0.8` | same | Multiplier on the recent-window LBD average that `RestartGlucose` compares against the global average to decide whether to restart. `STAGE35.md` tuned it from Glucose's published `0.8` down to `0.6`; `STAGE60.md`'s wider sweep, with `0.8` and `0.9` and `1.0` now tested, found `0.8` about 15% faster than `0.6` on two independent file samples and `0.9`/`1.0` slower, so it is back at `0.8` — see `REPORT60.md`. |
 | `minimizeWorkBudgetFactor` | `20` | same | Scales `minimizeClause`'s hard work-budget cap (`factor * n * (bits.Len(n)+1)`), bounding how much recursive-minimization work one learned clause can cost. |
 | `rephaseIntervalRestarts` | `50` | `cdcl.go` / `cdcl/mod.rs` | How many restarts elapse between periodic WalkSAT rephasing bursts (`--alg-params` val4=2, `STAGE43.md`); meaningless for every other phase strategy. |
 | `rephaseMaxFlips` | `1000` | same | Caps how many flips one WalkSAT rephasing burst may make, so the periodic "nudge" stays cheap relative to how rarely it fires. |
@@ -49,9 +49,62 @@ A parameter's JSON key (where it has one) is the name used inside
 | `subsumptionWorkBudgetFactor` | `64` | `techniques.go` / `preprocess.rs` | Scales the work budget (`factor * len(clauses)`) that bounds subsumption elimination's cost per round. |
 | `bveWorkBudgetFactor` | `2000` | same | Scales the work budget (`factor * len(clauses)`) that bounds bounded variable elimination's cost per round. Known to leave one pathological benchmark file (`apn-sbox5-cut3-symmbreak.cnf`, see `REPORT31.md`) short of BVE's full benefit; a candidate for `--internal-params` tuning (`STAGE39.md` item 25).
 
-All 13 defaults above match the values these constants held before
-`STAGE39.md`; enabling runtime configuration did not change any
-existing default behavior in either language.
+All 15 defaults above match the values these constants held before
+`STAGE39.md`, except the ones later recalibrated by a benchmark sweep
+(`lubyBaseConflicts`, `lrbAlpha`, `glucoseK`; see their rows); enabling runtime configuration did not change
+any existing default behavior in either language.
+
+### Valid ranges
+
+`vibe_sat` validates every parameter when the config file is loaded
+(`STAGE56.md`, `STAGE58.md`) and stops with an error naming the first
+offending field, e.g. `cdcl.varActivityDecay must be greater than 0 and
+at most 1 (got 2)`. The ranges are identical in Go and Rust and are also
+listed in `--help`. A value of the wrong JSON type is an error too (the
+exact wording of that message differs between the two languages).
+
+| JSON key | Valid range | Why |
+|---|---|---|
+| `cdcl.lubyBaseConflicts` | integer, 1 to 1,000,000,000 | Positive scale factor; the upper cap keeps `base * Luby term` far below 2^63 (see the cap note below). |
+| `cdcl.polynomialBaseConflicts` | integer, 1 to 1,000,000,000 | Same; multiplied by the square of the restart count. |
+| `cdcl.geometricBaseConflicts` | integer, at least 1 | Base interval of the geometric schedule. The threshold computation saturates at INT64_MAX (`STAGE56.md`), so no upper cap is needed. |
+| `cdcl.geometricGrowthFactor` | finite number, at least 1 | A ratio below 1 would shrink the restart interval toward zero. |
+| `cdcl.lrbAlpha` | number, greater than 0 and at most 1 | An exponential-moving-average weight. |
+| `cdcl.clauseActivityDecay` | number, greater than 0 and at most 1 | A decay of 0 or above 1 makes activities collapse or shrink; `varActivityDecay: 2.0` stopped uf250-01 from reaching a verdict in 3 s. |
+| `cdcl.varActivityDecay` | number, greater than 0 and at most 1 | Same. |
+| `cdcl.glueClauseLBDThreshold` | integer, at least 0 | 0 exempts no clause. |
+| `cdcl.glucoseWindowSize` | integer, 1 to 10,000,000 | The LBD window is allocated up front: 0 or a negative size crashed, and an enormous one runs out of memory. |
+| `cdcl.glucoseK` | finite number, greater than 0 | |
+| `cdcl.minimizeWorkBudgetFactor` | integer, 0 to 1,000,000,000 | 0 leaves minimization no work budget. |
+| `cdcl.rephaseIntervalRestarts` | integer, at least 1 | |
+| `cdcl.rephaseMaxFlips` | integer, at least 1 | |
+| `preprocess.subsumptionWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
+| `preprocess.bveWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
+
+**The 1,000,000,000 cap** (`MaxScaleFactor` in `go_src/internal/params`,
+`MAX_SCALE_FACTOR` in `rust_src/src/params.rs`) applies to the five
+integer parameters that are multiplied by something large. It is over
+four orders of magnitude above the largest default (18,000), so it can
+stand in for "unlimited", and it keeps every product far below 2^63.
+Without it, a value like INT64_MAX silently wrapped in Go and switched
+bounded variable elimination off on formulas with an even clause count
+(`REPORT58.md`). In Rust the INT64_MAX literal is rejected with a
+different message (`must be an integer`), because its JSON reader
+holds numbers as f64.
+
+NaN and infinities are rejected for every float field. Only the first
+violation is reported per load.
+
+### Preprocessing and `--time-limit-secs`
+
+Preprocessing time does **not** count against `--time-limit-secs`
+(`STAGE60.md`). When a limit is given, preprocessing is allowed at most
+one tenth of it and then stops, leaving a less-simplified but still
+equivalent formula; the search then gets the full limit. Total wall time
+can therefore reach 1.1 times the limit. With no limit, preprocessing
+runs to completion. The one tenth is the constant `TimeFraction`
+(`preprocess.Deadline` in Go, `preprocess::deadline` in Rust), not a
+`.vibe_sat.json` parameter.
 
 ## Constants considered but not exposed
 

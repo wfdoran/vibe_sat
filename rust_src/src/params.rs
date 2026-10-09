@@ -81,12 +81,12 @@ pub fn default() -> Params {
             polynomial_base_conflicts: 18000,
             geometric_base_conflicts: 100,
             geometric_growth_factor: 1.5,
-            lrb_alpha: 0.4,
+            lrb_alpha: 0.1,
             clause_activity_decay: 0.999,
             var_activity_decay: 0.95,
             glue_clause_lbd_threshold: 2,
             glucose_window_size: 50,
-            glucose_k: 0.6,
+            glucose_k: 0.8,
             minimize_work_budget_factor: 20,
             rephase_interval_restarts: 50,
             rephase_max_flips: 1000,
@@ -866,12 +866,12 @@ mod tests {
         assert_eq!(d.cdcl.polynomial_base_conflicts, 18000);
         assert_eq!(d.cdcl.geometric_base_conflicts, 100);
         assert_eq!(d.cdcl.geometric_growth_factor, 1.5);
-        assert_eq!(d.cdcl.lrb_alpha, 0.4);
+        assert_eq!(d.cdcl.lrb_alpha, 0.1);
         assert_eq!(d.cdcl.clause_activity_decay, 0.999);
         assert_eq!(d.cdcl.var_activity_decay, 0.95);
         assert_eq!(d.cdcl.glue_clause_lbd_threshold, 2);
         assert_eq!(d.cdcl.glucose_window_size, 50);
-        assert_eq!(d.cdcl.glucose_k, 0.6);
+        assert_eq!(d.cdcl.glucose_k, 0.8);
         assert_eq!(d.cdcl.minimize_work_budget_factor, 20);
         assert_eq!(d.cdcl.rephase_interval_restarts, 50);
         assert_eq!(d.cdcl.rephase_max_flips, 1000);
