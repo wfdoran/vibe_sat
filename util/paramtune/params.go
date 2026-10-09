@@ -41,6 +41,7 @@ type cdclParams struct {
 type preprocessParams struct {
 	SubsumptionWorkBudgetFactor int `json:"subsumptionWorkBudgetFactor"`
 	BVEWorkBudgetFactor         int `json:"bveWorkBudgetFactor"`
+	BVAWorkBudgetFactor         int `json:"bvaWorkBudgetFactor"`
 }
 
 // vibeSatParams is the top-level shape of a .vibe_sat.json file --
@@ -72,6 +73,7 @@ func defaultParams() vibeSatParams {
 		Preprocess: preprocessParams{
 			SubsumptionWorkBudgetFactor: 64,
 			BVEWorkBudgetFactor:         2000,
+			BVAWorkBudgetFactor:         0,
 		},
 	}
 }

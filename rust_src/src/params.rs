@@ -57,6 +57,11 @@ pub struct Cdcl {
 pub struct Preprocess {
     pub subsumption_work_budget_factor: usize,
     pub bve_work_budget_factor: usize,
+    /// Work budget for Bounded Variable Addition (STAGE61.md), as a
+    /// multiple of the clause count; 0 turns BVA off, and 0 is the
+    /// default: STAGE61.md's benchmarks found no solve-time benefit
+    /// (reports/REPORT61.md), so BVA is opt-in.
+    pub bva_work_budget_factor: usize,
 }
 
 /// The full set of runtime-configurable internal parameters, as read
@@ -94,6 +99,7 @@ pub fn default() -> Params {
         preprocess: Preprocess {
             subsumption_work_budget_factor: 64,
             bve_work_budget_factor: 2000,
+            bva_work_budget_factor: 0,
         },
     }
 }
@@ -161,6 +167,7 @@ struct Fields {
     rephase_max_flips: i64,
     subsumption_work_budget_factor: i64,
     bve_work_budget_factor: i64,
+    bva_work_budget_factor: i64,
 }
 
 impl Fields {
@@ -182,6 +189,7 @@ impl Fields {
             rephase_max_flips: p.cdcl.rephase_max_flips as i64,
             subsumption_work_budget_factor: p.preprocess.subsumption_work_budget_factor as i64,
             bve_work_budget_factor: p.preprocess.bve_work_budget_factor as i64,
+            bva_work_budget_factor: p.preprocess.bva_work_budget_factor as i64,
         }
     }
 
@@ -207,6 +215,7 @@ impl Fields {
             preprocess: Preprocess {
                 subsumption_work_budget_factor: self.subsumption_work_budget_factor as usize,
                 bve_work_budget_factor: self.bve_work_budget_factor as usize,
+                bva_work_budget_factor: self.bva_work_budget_factor as usize,
             },
         }
     }
@@ -274,6 +283,12 @@ fn validate(f: &Fields) -> Result<(), String> {
     range_int(
         "preprocess.bveWorkBudgetFactor",
         f.bve_work_budget_factor,
+        0,
+        MAX_SCALE_FACTOR,
+    )?;
+    range_int(
+        "preprocess.bvaWorkBudgetFactor",
+        f.bva_work_budget_factor,
         0,
         MAX_SCALE_FACTOR,
     )?;
@@ -434,6 +449,12 @@ fn apply(f: &mut Fields, value: &json::Value) -> Result<(), String> {
             "bveWorkBudgetFactor",
             &mut f.bve_work_budget_factor,
         )?;
+        read_int(
+            pp,
+            "preprocess",
+            "bvaWorkBudgetFactor",
+            &mut f.bva_work_budget_factor,
+        )?;
     }
     Ok(())
 }
@@ -462,7 +483,7 @@ fn format_f64(v: f64) -> String {
 /// `json.MarshalIndent(p, "", "  ")`), with a trailing newline.
 fn render(p: &Params) -> String {
     format!(
-        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {}\n  }}\n}}\n",
+        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {},\n    \"bvaWorkBudgetFactor\": {}\n  }}\n}}\n",
         p.cdcl.luby_base_conflicts,
         p.cdcl.polynomial_base_conflicts,
         p.cdcl.geometric_base_conflicts,
@@ -478,6 +499,7 @@ fn render(p: &Params) -> String {
         p.cdcl.rephase_max_flips,
         p.preprocess.subsumption_work_budget_factor,
         p.preprocess.bve_work_budget_factor,
+        p.preprocess.bva_work_budget_factor,
     )
 }
 
@@ -877,6 +899,7 @@ mod tests {
         assert_eq!(d.cdcl.rephase_max_flips, 1000);
         assert_eq!(d.preprocess.subsumption_work_budget_factor, 64);
         assert_eq!(d.preprocess.bve_work_budget_factor, 2000);
+        assert_eq!(d.preprocess.bva_work_budget_factor, 0);
     }
 
     #[test]

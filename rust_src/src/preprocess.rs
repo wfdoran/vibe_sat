@@ -85,6 +85,10 @@ pub struct Stats {
     pub pure_literals_fixed: usize,
     pub clauses_subsumed: usize,
     pub variables_eliminated: usize,
+    /// How many new variables Bounded Variable Addition introduced
+    /// (STAGE61.md). They are numbered after the original problem's
+    /// variables and only ever appear in the reduced problem.
+    pub variables_added: usize,
 
     /// True if preprocessing stopped before reaching its fixpoint
     /// because the STAGE57.md deadline passed. The result is still a
@@ -263,7 +267,24 @@ pub fn run(
         }
     }
 
-    let (new_clauses, new_to_original) = renumber(&clauses, problem.num_vars);
+    // STAGE61.md: Bounded Variable Addition runs once, after the other
+    // techniques have reached their fixpoint, so its new variables are
+    // never seen by (and never undone by) variable elimination. It is
+    // skipped if preprocessing already ran out of time, and when
+    // bva_work_budget_factor is 0.
+    let mut work_vars = problem.num_vars;
+    if !stats.timed_out && p.bva_work_budget_factor > 0 {
+        let mut bva_budget = (p.bva_work_budget_factor * clauses.len()) as i64;
+        let (added, timed_out) =
+            add_bounded_variables(&mut clauses, problem.num_vars, &mut bva_budget, deadline);
+        stats.variables_added = added;
+        work_vars += added;
+        if timed_out {
+            stats.timed_out = true;
+        }
+    }
+
+    let (new_clauses, new_to_original) = renumber(&clauses, work_vars);
     let reduced = Problem {
         num_vars: new_to_original.len() - 1,
         clauses: new_clauses,
@@ -276,7 +297,7 @@ pub fn run(
             println!("preprocess: time budget reached; stopped before reaching a fixpoint");
         }
         println!(
-            "preprocess: vars {}->{} clauses {}->{} (units={} pure={} subsumed={} eliminated={})",
+            "preprocess: vars {}->{} clauses {}->{} (units={} pure={} subsumed={} eliminated={} added={})",
             stats.vars_before,
             stats.vars_after,
             stats.clauses_before,
@@ -285,6 +306,7 @@ pub fn run(
             stats.pure_literals_fixed,
             stats.clauses_subsumed,
             stats.variables_eliminated,
+            stats.variables_added,
         );
     }
 
@@ -365,6 +387,13 @@ impl PreprocessResult {
         let mut full = assignment::new(self.original_num_vars);
 
         for (new_var, &orig) in self.new_to_original.iter().enumerate().skip(1) {
+            // Variables added by Bounded Variable Addition (STAGE61.md)
+            // are numbered past original_num_vars and have no original
+            // counterpart: they are only an encoding aid, so their
+            // values are dropped.
+            if orig > self.original_num_vars {
+                continue;
+            }
             full[orig] = solution[new_var];
         }
         for (v, &value) in self.fixed_assignment.iter().enumerate() {
@@ -1396,6 +1425,320 @@ fn eliminate_variables(
         .collect();
     *clauses = final_clauses;
     (steps, timed_out)
+}
+
+// STAGE61.md: Bounded Variable Addition (BVA), the complement of
+// bounded variable elimination. Where BVE removes a variable by
+// resolving it away, BVA introduces a fresh variable `x` to replace a
+// grid of clauses that share structure, shrinking the clause count.
+//
+// If a formula contains every clause `(lit_i OR C_j)` for a set of
+// literals `{lit_1..lit_a}` and a set of clause remainders
+// `{C_1..C_b}`, that is `a*b` clauses. Adding a variable `x` and
+// replacing the grid with
+//
+//     (lit_i OR x)       for every i      (a clauses)
+//     (NOT x OR C_j)     for every j      (b clauses)
+//
+// gives `a+b` clauses, and resolving the new clauses on `x` gives back
+// exactly the old grid. So the new formula is satisfiable iff the old
+// one is, and every model of the new formula, restricted to the old
+// variables, is a model of the old one. The reduction is `a*b - a - b`,
+// which is positive from a 2x3 grid up.
+//
+// This is the SimpleBVA procedure of Manthey, Heule & Biere,
+// "Automated Reencoding of Boolean Formulas," HVC 2012: take the
+// literal with the most occurrences, grow the set of literals greedily
+// by whichever literal pairs with the most clauses, and keep growing
+// while the reduction improves. The classic target is a pairwise
+// at-most-one constraint, which BVA reencodes with far fewer clauses.
+//
+// Reference: Manthey, Heule & Biere, "Automated Reencoding of Boolean
+// Formulas," Haifa Verification Conference 2012.
+
+/// Maps a literal to a dense non-negative index: `2*var` for a positive
+/// literal and `2*var+1` for a negative one. Ties between equally good
+/// choices in BVA always go to the smaller code, which keeps the Go and
+/// Rust implementations making identical choices.
+fn literal_code(lit: Literal) -> usize {
+    2 * cnf::literal_var(lit) + usize::from(cnf::literal_is_negative(lit))
+}
+
+/// Returns how many clauses replacing a grid of `num_lits` literals by
+/// `num_clauses` clause remainders saves: `num_lits*num_clauses`
+/// clauses become `num_lits+num_clauses`.
+fn bva_reduction(num_lits: usize, num_clauses: usize) -> i64 {
+    (num_lits * num_clauses) as i64 - num_lits as i64 - num_clauses as i64
+}
+
+/// Applies Bounded Variable Addition once to `clauses`, whose variables
+/// are numbered `1..=num_vars`, and returns how many new variables it
+/// added plus whether the deadline (not the budget) stopped it. New
+/// variables are numbered `num_vars+1`, `num_vars+2`, ... in the order
+/// they are added; the clause set is rewritten in place (replaced
+/// clauses are dropped and the new clauses go at the end).
+///
+/// The formula must already be free of unit clauses, tautologies, and
+/// variables fixed by an assignment, as [`run`] guarantees; a clause
+/// with fewer than two literals is simply never used. The result is
+/// satisfiability-equivalent to the input and every model of it,
+/// restricted to variables `1..=num_vars`, is a model of the input.
+///
+/// `budget` is the remaining work allowance, in clause comparisons (one
+/// per candidate partner clause examined); when it reaches zero no
+/// further literal is tried. `deadline` is checked every
+/// `DEADLINE_CHECK_INTERVAL` units of work. Both limits are always
+/// safe: a replacement is applied only after it has been fully worked
+/// out, so stopping just leaves the formula less reduced.
+fn add_bounded_variables(
+    clauses: &mut Vec<Clause>,
+    num_vars: usize,
+    budget: &mut i64,
+    deadline: Option<Instant>,
+) -> (usize, bool) {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap, HashSet};
+
+    let mut cs = std::mem::take(clauses);
+    let mut num_vars = num_vars;
+    let mut num_added = 0usize;
+    let mut timed_out = false;
+    let mut live = vec![true; cs.len()];
+
+    // occurrences[code] lists the indices of clauses containing that
+    // literal, in increasing order; dead clauses are dropped lazily.
+    // count[code] is the number of live clauses containing it.
+    let mut occurrences: Vec<Vec<usize>> = vec![Vec::new(); 2 * (num_vars + 1)];
+    let mut count = vec![0usize; 2 * (num_vars + 1)];
+    for (i, clause) in cs.iter().enumerate() {
+        for &lit in clause {
+            let code = literal_code(lit);
+            occurrences[code].push(i);
+            count[code] += 1;
+        }
+    }
+    // mark[code] == stamp means "in the current clause".
+    let mut mark = vec![0usize; 2 * (num_vars + 1)];
+    let mut stamp = 0usize;
+
+    // Max-heap by higher count first, then smaller code first. An entry
+    // goes stale when its count changes; a stale entry is skipped when
+    // popped (a fresh one was pushed at the change).
+    let mut queue: BinaryHeap<(usize, Reverse<usize>)> = BinaryHeap::new();
+    for (code, &c) in count.iter().enumerate().skip(2) {
+        if c >= 2 {
+            queue.push((c, Reverse(code)));
+        }
+    }
+
+    let mut work_since_check = 0usize;
+    'literals: while let Some((entry_count, Reverse(l))) = queue.pop() {
+        if expired(deadline) {
+            timed_out = true;
+            break;
+        }
+        if *budget <= 0 {
+            break;
+        }
+        if entry_count != count[l] {
+            continue; // stale
+        }
+        compact_live_occurrences(&mut occurrences[l], &live);
+
+        // grid: the clauses still in the candidate grid. chosen: the
+        // literals chosen so far (always starting with l itself).
+        let mut grid: Vec<usize> = occurrences[l]
+            .iter()
+            .copied()
+            .filter(|&idx| cs[idx].len() >= 2)
+            .collect();
+        if grid.len() < 2 {
+            continue;
+        }
+        let mut chosen = vec![l];
+        // partner_of[k][c] = clause for chosen[k+1] paired with clause c.
+        let mut partner_of: Vec<HashMap<usize, usize>> = Vec::new();
+
+        loop {
+            let mut pairs: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+            for &c in &grid {
+                stamp += 1;
+                let clause_len = cs[c].len();
+                let mut lmin: Option<usize> = None;
+                for &lit in &cs[c] {
+                    let code = literal_code(lit);
+                    if code == l {
+                        continue;
+                    }
+                    mark[code] = stamp;
+                    if lmin.is_none_or(|m| count[code] < count[m]) {
+                        lmin = Some(code);
+                    }
+                }
+                let Some(lmin) = lmin else {
+                    continue; // a clause of one repeated literal; nothing to pair
+                };
+                compact_live_occurrences(&mut occurrences[lmin], &live);
+                for &d in &occurrences[lmin] {
+                    if d == c || cs[d].len() != clause_len {
+                        continue;
+                    }
+                    *budget -= 1;
+                    work_since_check += 1;
+                    if work_since_check >= DEADLINE_CHECK_INTERVAL {
+                        work_since_check = 0;
+                        if expired(deadline) {
+                            timed_out = true;
+                            break 'literals;
+                        }
+                    }
+                    if *budget <= 0 {
+                        break 'literals;
+                    }
+                    let mut marked = 0usize;
+                    let mut other: Option<usize> = None;
+                    for &lit in &cs[d] {
+                        let code = literal_code(lit);
+                        if mark[code] == stamp {
+                            marked += 1;
+                        } else {
+                            other = Some(code);
+                        }
+                    }
+                    // d must hold every literal of c except l, plus exactly
+                    // one other literal, which is not on l's variable.
+                    let Some(other) = other else { continue };
+                    if marked != clause_len - 1 || other >> 1 == l >> 1 {
+                        continue;
+                    }
+                    pairs.entry(other).or_default().push((c, d));
+                }
+            }
+
+            let mut best: Option<usize> = None;
+            for (&code, list) in &pairs {
+                if chosen.contains(&code) {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some(b) => {
+                        list.len() > pairs[&b].len() || (list.len() == pairs[&b].len() && code < b)
+                    }
+                };
+                if better {
+                    best = Some(code);
+                }
+            }
+            let Some(best) = best else { break };
+            if bva_reduction(chosen.len() + 1, pairs[&best].len())
+                <= bva_reduction(chosen.len(), grid.len())
+            {
+                break;
+            }
+            let mut partners = HashMap::with_capacity(pairs[&best].len());
+            grid.clear();
+            for &(c, d) in &pairs[&best] {
+                partners.insert(c, d);
+                grid.push(c);
+            }
+            chosen.push(best);
+            partner_of.push(partners);
+        }
+        if chosen.len() < 2 || bva_reduction(chosen.len(), grid.len()) <= 0 {
+            continue;
+        }
+
+        // The grid can name the same clause twice (clause {a,b,r} is both
+        // "a with remainder {b,r}" and "b with remainder {a,r}"), so count
+        // the distinct clauses actually removed: a replacement that does
+        // not strictly shrink the formula is skipped, which also rules out
+        // an endless cycle of replacements.
+        let mut removed_ids: HashSet<usize> = HashSet::new();
+        for &c in &grid {
+            removed_ids.insert(c);
+            for partners in &partner_of {
+                removed_ids.insert(partners[&c]);
+            }
+        }
+        if removed_ids.len() <= chosen.len() + grid.len() {
+            continue;
+        }
+        *budget -= removed_ids.len() as i64;
+
+        // Apply the replacement. Remove the grid first, collecting the
+        // literals whose counts drop so they can be requeued.
+        let mut touched: Vec<usize> = Vec::new();
+        let mut remove =
+            |idx: usize, live: &mut Vec<bool>, count: &mut Vec<usize>, cs: &Vec<Clause>| {
+                if !live[idx] {
+                    return;
+                }
+                live[idx] = false;
+                for &lit in &cs[idx] {
+                    let code = literal_code(lit);
+                    count[code] -= 1;
+                    touched.push(code);
+                }
+            };
+        for &c in &grid {
+            remove(c, &mut live, &mut count, &cs);
+            for partners in &partner_of {
+                remove(partners[&c], &mut live, &mut count, &cs);
+            }
+        }
+
+        num_vars += 1;
+        num_added += 1;
+        occurrences.push(Vec::new());
+        occurrences.push(Vec::new());
+        count.push(0);
+        count.push(0);
+        mark.push(0);
+        mark.push(0);
+        let x = num_vars as Literal;
+        let mut new_clauses: Vec<Clause> = Vec::with_capacity(chosen.len() + grid.len());
+        for &code in &chosen {
+            let lit = (code >> 1) as Literal;
+            new_clauses.push(vec![if code & 1 == 1 { -lit } else { lit }, x]);
+        }
+        for &c in &grid {
+            let mut rest: Clause = cs[c]
+                .iter()
+                .copied()
+                .filter(|&lit| literal_code(lit) != l)
+                .collect();
+            rest.push(-x);
+            new_clauses.push(rest);
+        }
+        for clause in new_clauses {
+            let idx = cs.len();
+            for &lit in &clause {
+                let code = literal_code(lit);
+                occurrences[code].push(idx);
+                count[code] += 1;
+                touched.push(code);
+            }
+            cs.push(clause);
+            live.push(true);
+        }
+
+        stamp += 1;
+        for code in touched {
+            if mark[code] == stamp || count[code] < 2 {
+                continue;
+            }
+            mark[code] = stamp;
+            queue.push((count[code], Reverse(code)));
+        }
+    }
+
+    *clauses = cs
+        .into_iter()
+        .zip(live)
+        .filter_map(|(clause, alive)| alive.then_some(clause))
+        .collect();
+    (num_added, timed_out)
 }
 
 #[cfg(test)]
@@ -2615,5 +2958,279 @@ mod tests {
             result.stats.timed_out,
             "expected stats.timed_out on a 60000-link chain with a 20 ms deadline"
         );
+    }
+
+    // ---- STAGE61.md: Bounded Variable Addition ----
+
+    /// A work budget large enough never to bind.
+    fn bva_huge_budget() -> i64 {
+        1 << 40
+    }
+
+    /// Builds a complete assignment of variables 1..=n where bit v-1 of
+    /// `mask` gives variable v's value.
+    fn assignment_from_mask(n: usize, mask: usize) -> Assignment {
+        let mut a = assignment::new(n);
+        for (v, slot) in a.iter_mut().enumerate().skip(1) {
+            *slot = if mask & (1 << (v - 1)) != 0 {
+                Value::True
+            } else {
+                Value::False
+            };
+        }
+        a
+    }
+
+    /// For each assignment of the original variables 1..=old_vars,
+    /// reports whether the clause set (which may use up to total_vars
+    /// variables, the extras being existentially quantified) has a
+    /// satisfying extension, indexed by the old-variable mask.
+    fn satisfiable_over_original(
+        clauses: &[Clause],
+        old_vars: usize,
+        total_vars: usize,
+    ) -> Vec<bool> {
+        let mut result = vec![false; 1 << old_vars];
+        for mask in 0..(1usize << total_vars) {
+            if all_satisfied(clauses, &assignment_from_mask(total_vars, mask)) {
+                result[mask & ((1 << old_vars) - 1)] = true;
+            }
+        }
+        result
+    }
+
+    /// Verifies the defining property of Bounded Variable Addition: an
+    /// assignment of the original variables satisfies the original
+    /// formula exactly when it extends to a model of the new one.
+    fn check_bva_equivalent(
+        original: &[Clause],
+        rewritten: &[Clause],
+        old_vars: usize,
+        new_vars: usize,
+    ) {
+        let before = satisfiable_over_original(original, old_vars, old_vars);
+        let after = satisfiable_over_original(rewritten, old_vars, new_vars);
+        for mask in 0..before.len() {
+            assert_eq!(
+                before[mask], after[mask],
+                "assignment {mask:b}: original satisfied={}, rewritten extendable={}\noriginal: {original:?}\nrewritten: {rewritten:?}",
+                before[mask], after[mask]
+            );
+        }
+    }
+
+    /// The clauses (NOT a OR NOT b) for every pair of variables 1..=n,
+    /// the classic target of Bounded Variable Addition.
+    fn pairwise_at_most_one(n: i32) -> Vec<Clause> {
+        let mut clauses = Vec::new();
+        for i in 1..=n {
+            for j in (i + 1)..=n {
+                clauses.push(vec![-i, -j]);
+            }
+        }
+        clauses
+    }
+
+    /// A pairwise at-most-one over 8 variables (28 clauses) is
+    /// reencoded with fewer clauses and one or more added variables,
+    /// and stays equivalent.
+    #[test]
+    fn bva_reencodes_pairwise_at_most_one() {
+        let original = pairwise_at_most_one(8);
+        let mut clauses = original.clone();
+        let mut budget = bva_huge_budget();
+        let (added, timed_out) = add_bounded_variables(&mut clauses, 8, &mut budget, None);
+        assert!(!timed_out);
+        assert!(added > 0, "expected BVA to add at least one variable");
+        assert!(clauses.len() < original.len());
+        check_bva_equivalent(&original, &clauses, 8, 8 + added);
+    }
+
+    /// The textbook case exactly: the 3x3 grid (a OR C_j) for a in
+    /// {1,2,3} and C_j in {4,5,6} (9 clauses) becomes 3+3 clauses over
+    /// one new variable.
+    #[test]
+    fn bva_grid_is_replaced_by_two_sets() {
+        let mut original = Vec::new();
+        for a in 1..=3 {
+            for c in 4..=6 {
+                original.push(vec![a, c]);
+            }
+        }
+        let mut clauses = original.clone();
+        let mut budget = bva_huge_budget();
+        let (added, _) = add_bounded_variables(&mut clauses, 6, &mut budget, None);
+        assert_eq!(added, 1);
+        assert_eq!(clauses.len(), 6, "{clauses:?}");
+        check_bva_equivalent(&original, &clauses, 6, 7);
+    }
+
+    /// A formula with no shared structure is returned untouched.
+    #[test]
+    fn bva_leaves_formula_without_pattern_alone() {
+        let original = vec![
+            vec![1, 2, 3],
+            vec![-1, 4, 5],
+            vec![-2, -4, 6],
+            vec![3, -5, -6],
+        ];
+        let mut clauses = original.clone();
+        let mut budget = bva_huge_budget();
+        let (added, _) = add_bounded_variables(&mut clauses, 6, &mut budget, None);
+        assert_eq!(added, 0);
+        assert_eq!(clauses, original);
+    }
+
+    /// An exhausted budget leaves the formula alone and does not report
+    /// a timeout.
+    #[test]
+    fn bva_zero_budget_does_nothing() {
+        let original = pairwise_at_most_one(8);
+        let mut clauses = original.clone();
+        let mut budget = 0;
+        let (added, timed_out) = add_bounded_variables(&mut clauses, 8, &mut budget, None);
+        assert_eq!(added, 0);
+        assert!(!timed_out);
+        assert_eq!(clauses, original);
+    }
+
+    /// An already-passed deadline stops BVA before it changes anything
+    /// and reports a timeout.
+    #[test]
+    fn bva_expired_deadline_does_nothing() {
+        let original = pairwise_at_most_one(8);
+        let mut clauses = original.clone();
+        let mut budget = bva_huge_budget();
+        let deadline = Instant::now().checked_sub(Duration::from_secs(1));
+        let (added, timed_out) = add_bounded_variables(&mut clauses, 8, &mut budget, deadline);
+        assert_eq!(added, 0);
+        assert!(timed_out);
+        assert_eq!(clauses, original);
+    }
+
+    /// A random formula over 8 variables made of a product grid
+    /// (literals over variables 1..=4 each paired with several
+    /// remainders over variables 5..=8), plus a few unrelated random
+    /// clauses.
+    fn random_grid_formula(rng: &mut StdRng) -> Vec<Clause> {
+        fn random_lit(rng: &mut StdRng, lo: i32, hi: i32) -> Literal {
+            let v = rng.random_range(lo..=hi);
+            if rng.random_range(0..2) == 0 { -v } else { v }
+        }
+        let mut heads: Vec<Literal> = Vec::new();
+        let wanted = 2 + rng.random_range(0..3);
+        while heads.len() < wanted {
+            let lit = random_lit(rng, 1, 4);
+            if !heads.iter().any(|h| h.abs() == lit.abs()) {
+                heads.push(lit);
+            }
+        }
+        let mut clauses = Vec::new();
+        for _ in 0..(3 + rng.random_range(0..3)) {
+            let a = random_lit(rng, 5, 8);
+            let b = random_lit(rng, 5, 8);
+            if a.abs() == b.abs() {
+                continue;
+            }
+            for &h in &heads {
+                clauses.push(vec![h, a, b]);
+            }
+        }
+        for _ in 0..rng.random_range(0..5) {
+            let x = random_lit(rng, 1, 8);
+            let y = random_lit(rng, 1, 8);
+            let z = random_lit(rng, 1, 8);
+            if x.abs() == y.abs() || y.abs() == z.abs() || x.abs() == z.abs() {
+                continue;
+            }
+            clauses.push(vec![x, y, z]);
+        }
+        clauses
+    }
+
+    /// Fuzzes `add_bounded_variables` against exhaustive enumeration: on
+    /// every random formula, the rewritten clauses must be equivalent
+    /// over the original variables.
+    #[test]
+    fn bva_preserves_satisfiability_on_random_grids() {
+        let mut rng = StdRng::seed_from_u64(61);
+        let mut rewritten_at_least_once = 0;
+        for trial in 0..300 {
+            let original = random_grid_formula(&mut rng);
+            let mut clauses = original.clone();
+            let mut budget = bva_huge_budget();
+            let (added, _) = add_bounded_variables(&mut clauses, 8, &mut budget, None);
+            if added > 0 {
+                rewritten_at_least_once += 1;
+            }
+            assert!(
+                added <= 6,
+                "trial {trial}: {added} added variables is more than this test can enumerate"
+            );
+            check_bva_equivalent(&original, &clauses, 8, 8 + added);
+        }
+        assert!(
+            rewritten_at_least_once >= 50,
+            "only {rewritten_at_least_once} of 300 random formulas were rewritten; the generator is not exercising BVA"
+        );
+    }
+
+    /// Runs the whole pipeline on a satisfiable formula BVA rewrites,
+    /// then reconstructs every model of the reduced problem and checks
+    /// it satisfies the original.
+    #[test]
+    fn run_with_bva_reconstructs_correctly() {
+        // "at most one of 1..7" plus (1 OR ... OR 7) forces exactly one.
+        let mut original = pairwise_at_most_one(7);
+        original.push(vec![1, 2, 3, 4, 5, 6, 7]);
+        let problem = Problem {
+            num_vars: 7,
+            clauses: original,
+        };
+
+        // Variable elimination would remove these low-degree variables
+        // before BVA ever runs, so turn it off to hand BVA the formula
+        // intact.
+        let mut pp = params::default().preprocess;
+        pp.bva_work_budget_factor = 100;
+        pp.bve_work_budget_factor = 0;
+        let result = run(&problem, 0, 1, pp, None);
+        assert!(!result.unsat);
+        assert!(
+            result.stats.variables_added > 0,
+            "expected BVA to add a variable"
+        );
+        let reduced = result.problem.as_ref().unwrap();
+        let n = reduced.num_vars;
+        assert!(
+            n <= 18,
+            "reduced problem has {n} variables, too many to enumerate"
+        );
+        let mut models = 0;
+        for mask in 0..(1usize << n) {
+            let solution = assignment_from_mask(n, mask);
+            if !all_satisfied(&reduced.clauses, &solution) {
+                continue;
+            }
+            models += 1;
+            all_clauses_satisfied(&problem, &result.reconstruct(&solution));
+        }
+        assert!(
+            models > 0,
+            "reduced problem has no models, but the original is satisfiable"
+        );
+    }
+
+    /// A factor of 0 turns BVA off.
+    #[test]
+    fn run_with_bva_zero_factor_adds_nothing() {
+        let problem = Problem {
+            num_vars: 8,
+            clauses: pairwise_at_most_one(8),
+        };
+        let mut pp = params::default().preprocess;
+        pp.bva_work_budget_factor = 0;
+        let result = run(&problem, 0, 1, pp, None);
+        assert_eq!(result.stats.variables_added, 0);
     }
 }

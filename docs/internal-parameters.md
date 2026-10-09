@@ -48,8 +48,9 @@ A parameter's JSON key (where it has one) is the name used inside
 |---|---|---|---|
 | `subsumptionWorkBudgetFactor` | `64` | `techniques.go` / `preprocess.rs` | Scales the work budget (`factor * len(clauses)`) that bounds subsumption elimination's cost per round. |
 | `bveWorkBudgetFactor` | `2000` | same | Scales the work budget (`factor * len(clauses)`) that bounds bounded variable elimination's cost per round. Known to leave one pathological benchmark file (`apn-sbox5-cut3-symmbreak.cnf`, see `REPORT31.md`) short of BVE's full benefit; a candidate for `--internal-params` tuning (`STAGE39.md` item 25).
+| `bvaWorkBudgetFactor` | `0` | `bva.go` / `preprocess.rs` | Scales the work budget (`factor * len(clauses)`, counted in clause comparisons) for Bounded Variable Addition (`STAGE61.md`), which runs once after the other techniques. **`0` (the default) turns BVA off**: it shrinks many industrial formulas in clauses (a median of about 4% and up to 41% on a SAT Competition sample), but it adds variables and `REPORT61.md` found no solve-time benefit, so it is opt-in. A value around `100` enables it. |
 
-All 15 defaults above match the values these constants held before
+All 16 defaults above match the values these constants held before
 `STAGE39.md`, except the ones later recalibrated by a benchmark sweep
 (`lubyBaseConflicts`, `lrbAlpha`, `glucoseK`; see their rows); enabling runtime configuration did not change
 any existing default behavior in either language.
@@ -80,6 +81,7 @@ exact wording of that message differs between the two languages).
 | `cdcl.rephaseMaxFlips` | integer, at least 1 | |
 | `preprocess.subsumptionWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
 | `preprocess.bveWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
+| `preprocess.bvaWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count; 0 turns Bounded Variable Addition off. |
 
 **The 1,000,000,000 cap** (`MaxScaleFactor` in `go_src/internal/params`,
 `MAX_SCALE_FACTOR` in `rust_src/src/params.rs`) applies to the five

@@ -252,6 +252,24 @@ of four simplification techniques (disable with `--no-preprocessing`):
    clause that contains it positively against every clause that
    contains it negatively — but *only* if doing so doesn't increase
    the total clause count.
+5. **Bounded variable addition (BVA)** — optional and **off by default**
+   (set `preprocess.bvaWorkBudgetFactor` above 0 in the internal
+   parameters file to enable it). The opposite move to BVE: where a
+   set of clauses shares structure, a *new* variable `x` replaces the
+   shared part. If a formula contains every clause `(a OR C)` for
+   literals `a` in a set A and remainders `C` in a set R, those are
+   |A|·|R| clauses; adding `x` and writing `(a OR x)` for each `a` and
+   `(NOT x OR C)` for each `C` takes |A|+|R|, and resolving on `x`
+   gives the original clauses back, so satisfiability is unchanged.
+   The classic target is a pairwise at-most-one constraint, which is
+   `n(n-1)/2` clauses but needs far fewer after BVA (on the 8-variable
+   case in the tests, 28 clauses shrink to fewer than that). It runs once,
+   after the loop above has reached its fixpoint, so BVE never undoes
+   it, and the new variables are dropped again when a solution is
+   mapped back to the original problem. It shrinks many SAT Competition
+   formulas in clauses (a median of about 4%, up to 41% on a sample), but on this project's benchmarks the
+   smaller formula did not solve faster (`reports/REPORT61.md`), which
+   is why it stays opt-in.
 
 Eliminated/fixed variables are renumbered out of the problem entirely
 (so later algorithms never waste effort on them), with enough

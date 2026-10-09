@@ -115,6 +115,11 @@ type Stats struct {
 	ClausesSubsumed     int
 	VariablesEliminated int
 
+	// VariablesAdded is how many new variables Bounded Variable Addition
+	// introduced (STAGE61.md). They are numbered after the original
+	// problem's variables and only ever appear in Result.Problem.
+	VariablesAdded int
+
 	// TimedOut is true if preprocessing stopped before reaching its
 	// fixpoint because the STAGE57.md deadline passed. The result is
 	// still a valid, satisfiability-equivalent problem, just possibly
@@ -226,7 +231,23 @@ func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess,
 		}
 	}
 
-	newClauses, newToOriginal := renumber(clauses, problem.NumVars)
+	// STAGE61.md: Bounded Variable Addition runs once, after the other
+	// techniques have reached their fixpoint, so its new variables are
+	// never seen by (and never undone by) variable elimination. It is
+	// skipped if preprocessing already ran out of time, and when
+	// BVAWorkBudgetFactor is 0.
+	workVars := problem.NumVars
+	if !stats.TimedOut && p.BVAWorkBudgetFactor > 0 {
+		bvaBudget := p.BVAWorkBudgetFactor * len(clauses)
+		added, timedOut := addBoundedVariables(&clauses, problem.NumVars, &bvaBudget, deadline)
+		stats.VariablesAdded = added
+		workVars += added
+		if timedOut {
+			stats.TimedOut = true
+		}
+	}
+
+	newClauses, newToOriginal := renumber(clauses, workVars)
 	reduced := &cnf.Problem{NumVars: len(newToOriginal) - 1, Clauses: newClauses}
 	stats.ClausesAfter = len(newClauses)
 	stats.VarsAfter = reduced.NumVars
@@ -236,9 +257,9 @@ func Run(problem *cnf.Problem, verbose int, numThreads int, p params.Preprocess,
 			fmt.Println("preprocess: time budget reached; stopped before reaching a fixpoint")
 		}
 		fmt.Printf(
-			"preprocess: vars %d->%d clauses %d->%d (units=%d pure=%d subsumed=%d eliminated=%d)\n",
+			"preprocess: vars %d->%d clauses %d->%d (units=%d pure=%d subsumed=%d eliminated=%d added=%d)\n",
 			stats.VarsBefore, stats.VarsAfter, stats.ClausesBefore, stats.ClausesAfter,
-			stats.UnitsPropagated, stats.PureLiteralsFixed, stats.ClausesSubsumed, stats.VariablesEliminated,
+			stats.UnitsPropagated, stats.PureLiteralsFixed, stats.ClausesSubsumed, stats.VariablesEliminated, stats.VariablesAdded,
 		)
 	}
 
@@ -312,6 +333,12 @@ func (r *Result) Reconstruct(solution assign.Assignment) assign.Assignment {
 	full := assign.New(r.OriginalNumVars)
 
 	for newVar := 1; newVar < len(r.NewToOriginal); newVar++ {
+		// Variables added by Bounded Variable Addition (STAGE61.md) are
+		// numbered past OriginalNumVars and have no original counterpart:
+		// they are only an encoding aid, so their values are dropped.
+		if r.NewToOriginal[newVar] > r.OriginalNumVars {
+			continue
+		}
 		full[r.NewToOriginal[newVar]] = solution[newVar]
 	}
 	for v, value := range r.FixedAssignment {

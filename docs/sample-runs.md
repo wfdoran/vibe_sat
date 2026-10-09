@@ -27,7 +27,7 @@ Reading CNF file: benchmark/uf20-91/uf20-0100.cnf
 Number of variables: 20
 Number of clauses: 91
 Number of literals: 273
-preprocess: vars 20->20 clauses 91->90 (units=0 pure=0 subsumed=1 eliminated=0)
+preprocess: vars 20->20 clauses 91->90 (units=0 pure=0 subsumed=1 eliminated=0 added=0)
 dfs: select_var=0
 SAT
 s SATISFIABLE

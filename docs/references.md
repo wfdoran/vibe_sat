@@ -116,6 +116,11 @@ own restart scheme). See `reports/REPORT15.md` for the full story and
   simpler variable-elimination bound (never let elimination increase
   the clause count) `vibe_sat` actually uses, in place of SatELite's
   own more elaborate criterion. (`reports/REPORT8.md`)
+- Manthey, Heule & Biere, "Automated Reencoding of Boolean
+  Formulas," Haifa Verification Conference 2012. Bounded Variable Addition: the
+  SimpleBVA procedure `vibe_sat`'s optional `preprocess` pass
+  implements (`go_src/internal/preprocess/bva.go`, `rust_src/src/
+  preprocess.rs`). (`reports/REPORT61.md`)
 
 ## Parallel search and multi-threading
 

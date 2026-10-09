@@ -417,7 +417,10 @@ Options:
         elimination, subsumption elimination, and bounded variable
         elimination), and hand the CNF file to the chosen algorithm
         exactly as read. Preprocessing runs by default; this flag
-        takes no value.
+        takes no value. (Bounded Variable Addition, STAGE61.md, is
+        also part of preprocessing but is off by default; set
+        preprocess.bvaWorkBudgetFactor above 0 in the internal
+        parameters file to enable it.)
 
   --num-threads=<integer>, -z <integer>
         Number of concurrent worker threads to use (STAGE17.md,
@@ -493,7 +496,8 @@ Options:
           cdcl.rephaseIntervalRestarts,
             rephaseMaxFlips                   integer >= 1
           preprocess.subsumptionWorkBudgetFactor,
-            bveWorkBudgetFactor               integer, 0 to 1000000000
+            bveWorkBudgetFactor,
+            bvaWorkBudgetFactor               integer, 0 to 1000000000
         A work-budget factor of 0 effectively disables that bound or
         technique. The upper limit of 1000000000 (far beyond
         anything that ever binds) keeps these values, which get

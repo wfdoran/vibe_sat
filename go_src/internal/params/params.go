@@ -70,6 +70,12 @@ type CDCL struct {
 type Preprocess struct {
 	SubsumptionWorkBudgetFactor int `json:"subsumptionWorkBudgetFactor"`
 	BVEWorkBudgetFactor         int `json:"bveWorkBudgetFactor"`
+
+	// BVAWorkBudgetFactor sizes Bounded Variable Addition's work budget
+	// (STAGE61.md), as a multiple of the clause count; 0 turns BVA off,
+	// and 0 is the default: STAGE61.md's benchmarks found no solve-time
+	// benefit (reports/REPORT61.md), so BVA is opt-in.
+	BVAWorkBudgetFactor int `json:"bvaWorkBudgetFactor"`
 }
 
 // Params is the top-level shape of a .vibe_sat.json file.
@@ -108,6 +114,7 @@ func Default() Params {
 		Preprocess: Preprocess{
 			SubsumptionWorkBudgetFactor: 64,
 			BVEWorkBudgetFactor:         2000,
+			BVAWorkBudgetFactor:         0,
 		},
 	}
 }
@@ -186,6 +193,7 @@ func validate(p Params) error {
 		minInt("cdcl.rephaseMaxFlips", c.RephaseMaxFlips, 1),
 		rangeInt("preprocess.subsumptionWorkBudgetFactor", p.Preprocess.SubsumptionWorkBudgetFactor, 0, MaxScaleFactor),
 		rangeInt("preprocess.bveWorkBudgetFactor", p.Preprocess.BVEWorkBudgetFactor, 0, MaxScaleFactor),
+		rangeInt("preprocess.bvaWorkBudgetFactor", p.Preprocess.BVAWorkBudgetFactor, 0, MaxScaleFactor),
 	}
 	for _, err := range checks {
 		if err != nil {
