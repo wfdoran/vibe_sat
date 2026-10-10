@@ -107,10 +107,39 @@ per-branch snapshots — a persistent trail is what makes it possible to
 walk backward through *reasons* the way conflict analysis needs to.
 Plain, unmodified conflict-driven learning turned out to actually
 underperform `dfs` on this project's own hard instances until modern
-branching heuristics (VSIDS/LRB) and restarts were added on top —
+branching heuristics (VSIDS/LRB/VMTF) and restarts were added on top —
 "bare" CDCL is a known weak spot in the literature on structureless
 random instances specifically, and this project reproduced that
 finding directly before fixing it.
+
+### Variable-selection heuristics
+
+`cdcl` offers five ways to pick the next branching variable (`--alg-params`
+`val1`): the two it shares with `dfs` (a clause-weighted score, and a
+static lowest-index-first order), and three that need conflict-driven
+bookkeeping:
+
+- **VSIDS** adds to a variable's activity every time it takes part in a
+  conflict and decays all activities over time, so recent conflicts count
+  more. It is the single-thread default.
+- **LRB** treats the choice as a learning problem: a variable's score is a
+  moving average of how often it participated in a conflict per conflict it
+  stayed assigned for, with a bonus for variables that were part of the
+  *reason* for propagations.
+- **VMTF** (Variable Move-To-Front) keeps the variables in a linked list
+  ordered by when they last took part in a conflict. After each conflict, the
+  variables involved move to the front, keeping their relative order, and a
+  decision takes the first unassigned variable from the front. A cursor
+  remembers where the last decision stopped, so finding the next variable is
+  O(1) amortized. There are no scores to decay or rescale. VSIDS and LRB, as
+  implemented here, scan every variable on every decision, so VMTF is cheaper
+  per decision on large formulas. On this project's small random 3-SAT
+  benchmarks it was clearly weaker than VSIDS or LRB (`reports/REPORT64.md`
+  has the numbers).
+
+Before any conflict has happened, all three behave like the static order:
+no variable has been bumped yet, so decisions walk the variables from the
+lowest index up.
 
 ### A genuine watch-list, not just watched literals
 

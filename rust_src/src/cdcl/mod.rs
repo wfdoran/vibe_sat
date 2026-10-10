@@ -202,6 +202,54 @@ pub enum SelectVarVariant {
     /// STAGE13.md's (simplified) LRB heuristic (see the module doc
     /// comment).
     Lrb,
+    /// STAGE64.md's Variable Move-To-Front heuristic (introduced in the
+    /// Siege solver, L. Ryan, "Efficient Algorithms for Clause-Learning
+    /// SAT Solvers," MSc thesis, Simon Fraser University, 2004; compared
+    /// with other scoring schemes by Biere & Froehlich, "Evaluating CDCL
+    /// Variable Scoring Schemes," SAT 2015 -- both citations from
+    /// memory, not re-checked): variables sit in a linked list ordered
+    /// by when they were last involved in a conflict, and a decision
+    /// takes the first unassigned variable from the front. See
+    /// [`VmtfState`].
+    Vmtf,
+    /// STAGE64.md's portfolio choice, like `RestartStrategy::RoundRobin`
+    /// and `PhaseStrategy::RoundRobin`: worker `i` uses
+    /// `ROUND_ROBIN_VARIANTS[i % 5]`. It is the default whenever
+    /// `--num-threads` is above 1 and the caller gave no explicit
+    /// heuristic. With one thread it resolves to worker 0's choice,
+    /// VSIDS. Never reaches [`run_loop`] itself; see
+    /// [`resolve_select_var_variant`].
+    RoundRobin,
+}
+
+/// `SelectVarVariant::RoundRobin`'s resolution order: VSIDS, VMTF, LRB,
+/// then VSIDS and VMTF once more. Its length is 5 on purpose. The
+/// restart rotation has period 4 and the phase rotation period 3, and 5
+/// is coprime to both, so across enough workers every (heuristic,
+/// restart, phase) combination occurs, rather than a worker's heuristic
+/// always travelling with the same phase strategy (as it would with a
+/// period of 3). VSIDS, the best measured single-heuristic default, and
+/// VMTF, the cheapest per decision, get two slots each; LRB gets one.
+/// The weighted and static-order heuristics are left out: they are
+/// there for comparison, not as serious cdcl choices.
+const ROUND_ROBIN_VARIANTS: [SelectVarVariant; 5] = [
+    SelectVarVariant::Vsids,
+    SelectVarVariant::Vmtf,
+    SelectVarVariant::Lrb,
+    SelectVarVariant::Vsids,
+    SelectVarVariant::Vmtf,
+];
+
+/// Returns the concrete heuristic worker `thread_index` should use for
+/// `variant`: `ROUND_ROBIN_VARIANTS[thread_index % 5]` for
+/// `SelectVarVariant::RoundRobin`, and `variant` itself for every other
+/// value.
+fn resolve_select_var_variant(variant: SelectVarVariant, thread_index: usize) -> SelectVarVariant {
+    if variant == SelectVarVariant::RoundRobin {
+        ROUND_ROBIN_VARIANTS[thread_index % ROUND_ROBIN_VARIANTS.len()]
+    } else {
+        variant
+    }
 }
 
 /// Identifies which restart schedule [`maybe_restart`] applies for
@@ -644,6 +692,7 @@ fn maybe_restart<R: Rng>(
     variant: SelectVarVariant,
     num_conflicts: usize,
     lrb: &mut LrbState,
+    vmtf: &mut VmtfState,
     saved_phase: &mut [Value],
     glucose: &GlucoseState,
     p: &params::Cdcl,
@@ -676,6 +725,7 @@ fn maybe_restart<R: Rng>(
         variant,
         num_conflicts,
         lrb,
+        vmtf,
         saved_phase,
         lrb_current_alpha,
     );
@@ -850,6 +900,125 @@ impl LrbState {
     }
 }
 
+/// STAGE64.md's VMTF bookkeeping (`SelectVarVariant::Vmtf` only). The
+/// variables form a doubly linked list ordered by `stamp`, which grows
+/// toward the front: `front` is the most recently bumped variable
+/// (where decisions start), `back` the oldest. `prev[v]` is the next
+/// older variable and `next[v]` the next newer one; 0 means "none".
+/// `search` caches where the next decision starts looking: every
+/// variable newer than it is assigned. `counter` is the last stamp
+/// handed out, and `analyzed` is [`analyze`]'s scratch list of the
+/// variables to bump after a conflict.
+struct VmtfState {
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    stamp: Vec<usize>,
+    front: usize,
+    back: usize,
+    search: usize,
+    counter: usize,
+    analyzed: Vec<usize>,
+}
+
+impl VmtfState {
+    /// Builds the list in its initial order: variable 1 at the front, so
+    /// before any conflict has happened decisions walk the variables in
+    /// increasing index order, the same starting point `Fast` and the
+    /// activity heuristics (all scores 0) have. Every variable gets a
+    /// stamp, highest at the front.
+    fn new(num_vars: usize) -> Self {
+        let mut prev = vec![0; num_vars + 1];
+        let mut next = vec![0; num_vars + 1];
+        let mut stamp = vec![0; num_vars + 1];
+        for v in 1..=num_vars {
+            if v < num_vars {
+                prev[v] = v + 1;
+            }
+            if v > 1 {
+                next[v] = v - 1;
+            }
+            stamp[v] = num_vars - v + 1;
+        }
+        VmtfState {
+            prev,
+            next,
+            stamp,
+            front: 1,
+            back: num_vars,
+            search: 1,
+            counter: num_vars,
+            analyzed: Vec::new(),
+        }
+    }
+
+    /// Moves `v` to the front of the list with a fresh stamp. A variable
+    /// already at the front is left alone. `v` is normally assigned when
+    /// this runs ([`analyze`] bumps before backjumping), so the search
+    /// cursor stays valid; if `v` is somehow unassigned, the cursor moves
+    /// to it so no unassigned variable is ever hidden behind the cursor.
+    fn bump(&mut self, v: usize, x: &Assignment) {
+        if self.next[v] == 0 {
+            return; // already the newest
+        }
+        let older = self.prev[v];
+        let newer = self.next[v];
+        if older != 0 {
+            self.next[older] = newer;
+        } else {
+            self.back = newer;
+        }
+        self.prev[newer] = older;
+
+        self.prev[v] = self.front;
+        self.next[v] = 0;
+        self.next[self.front] = v;
+        self.front = v;
+        self.counter += 1;
+        self.stamp[v] = self.counter;
+        if x[v] == Value::Unassigned {
+            self.search = v;
+        }
+    }
+
+    /// Bumps every variable [`analyze`] recorded in `analyzed` (the
+    /// variables involved in the conflict just analyzed), in increasing
+    /// order of their current stamps, so that their relative order is
+    /// preserved at the front. Then empties the list.
+    fn bump_analyzed(&mut self, x: &Assignment) {
+        let mut analyzed = std::mem::take(&mut self.analyzed);
+        analyzed.sort_unstable_by_key(|&v| self.stamp[v]);
+        for &v in &analyzed {
+            self.bump(v, x);
+        }
+        analyzed.clear();
+        self.analyzed = analyzed;
+    }
+
+    /// Returns the first unassigned variable at or behind the search
+    /// cursor (walking toward older variables) and leaves the cursor on
+    /// it. The cursor only ever has assigned variables in front of it, an
+    /// invariant [`backtrack_to`] maintains by moving it forward whenever
+    /// a newer variable becomes unassigned, so each variable is skipped
+    /// at most once per descent and the walk costs O(1) amortized. Must
+    /// only be called while some variable is unassigned.
+    fn select(&mut self, x: &Assignment) -> usize {
+        let mut v = self.search;
+        while x[v] != Value::Unassigned {
+            v = self.prev[v];
+        }
+        self.search = v;
+        v
+    }
+
+    /// Called by [`backtrack_to`] as each variable becomes unassigned:
+    /// keeps "everything newer than the cursor is assigned" true.
+    fn on_unassign(&mut self, v: usize) {
+        if self.stamp[v] > self.stamp[self.search] {
+            self.search = v;
+        }
+    }
+}
+
 /// Returns the unassigned variable with the highest score in `scores`
 /// (a linear scan, same asymptotic cost class as `Weighted`'s clause
 /// scan; ties keep whichever variable was found first). `scores` is
@@ -969,7 +1138,7 @@ pub fn run<R: Rng>(
     let result = run_loop(
         problem,
         time_limit,
-        variant,
+        resolve_select_var_variant(variant, 0),
         resolve_restart_strategy(restart_strategy, 0),
         memory_limit_bytes,
         rng,
@@ -1097,6 +1266,7 @@ pub fn run_parallel<R: Rng>(
                 let peers = &peers_for_worker[i];
                 let stop = &stop;
                 let winner = &winner;
+                let thread_variant = resolve_select_var_variant(variant, i);
                 let thread_strategy = resolve_restart_strategy(restart_strategy, i);
                 let thread_phase_strategy = resolve_phase_strategy(phase_strategy, i);
 
@@ -1110,7 +1280,7 @@ pub fn run_parallel<R: Rng>(
                     let result = run_loop(
                         problem,
                         time_limit,
-                        variant,
+                        thread_variant,
                         thread_strategy,
                         memory_limit_bytes,
                         sub_rng,
@@ -1352,6 +1522,9 @@ fn run_loop<R: Rng>(
     // actually calls for it.
     let mut vsids = VsidsState::new(problem.num_vars);
     let mut lrb = LrbState::new(problem.num_vars);
+    // STAGE64.md's VMTF list; always allocated like vsids/lrb, but only
+    // ever read or written when variant is Vmtf.
+    let mut vmtf = VmtfState::new(problem.num_vars);
     // STAGE49.md: the annealed learning-rate weight, starting at
     // p.lrb_alpha and decayed once per conflict (see the
     // LRB_ALPHA_DECAY_STEP doc comment) down to LRB_ALPHA_FLOOR.
@@ -1465,6 +1638,7 @@ fn run_loop<R: Rng>(
                 variant,
                 &mut vsids,
                 &mut lrb,
+                &mut vmtf,
                 &mut lbd_scratch,
                 &mut min_state,
                 &mut min_touched,
@@ -1483,6 +1657,7 @@ fn run_loop<R: Rng>(
                 variant,
                 num_conflicts,
                 &mut lrb,
+                &mut vmtf,
                 &mut saved_phase,
                 lrb_current_alpha,
             );
@@ -1611,6 +1786,7 @@ fn run_loop<R: Rng>(
                 variant,
                 num_conflicts,
                 &mut lrb,
+                &mut vmtf,
                 &mut saved_phase,
                 &glucose,
                 p,
@@ -1676,6 +1852,10 @@ fn run_loop<R: Rng>(
                 select_var_by_activity(&vsids.activity, &x, problem.num_vars)
             }
             SelectVarVariant::Lrb => select_var_by_activity(&lrb.q, &x, problem.num_vars),
+            SelectVarVariant::Vmtf => vmtf.select(&x),
+            SelectVarVariant::RoundRobin => {
+                unreachable!("RoundRobin is resolved to a concrete heuristic before run_loop")
+            }
         };
         current_level += 1;
         trail_lim.push(trail.len());
@@ -2422,6 +2602,7 @@ fn analyze(
     variant: SelectVarVariant,
     vsids: &mut VsidsState,
     lrb: &mut LrbState,
+    vmtf: &mut VmtfState,
     lbd_scratch: &mut Vec<usize>,
     min_state: &mut [u8],
     min_touched: &mut Vec<usize>,
@@ -2457,6 +2638,7 @@ fn analyze(
             match variant {
                 SelectVarVariant::Vsids => vsids.activity[v] += vsids.increment,
                 SelectVarVariant::Lrb => lrb.participated[v] += 1,
+                SelectVarVariant::Vmtf => vmtf.analyzed.push(v),
                 _ => {}
             }
             if level[v] == current_level {
@@ -2482,6 +2664,10 @@ fn analyze(
         reason_clause = reason[v].expect(
             "cdcl: analyze reached a variable with no reason while literals of the current level remain unresolved",
         );
+    }
+
+    if variant == SelectVarVariant::Vmtf {
+        vmtf.bump_analyzed(x);
     }
 
     let asserting = -p.expect("p is always set by the time the loop above breaks");
@@ -2638,6 +2824,7 @@ fn backtrack_to(
     variant: SelectVarVariant,
     num_conflicts: usize,
     lrb: &mut LrbState,
+    vmtf: &mut VmtfState,
     saved_phase: &mut [Value],
     lrb_alpha: f64,
 ) {
@@ -2654,6 +2841,9 @@ fn backtrack_to(
         }
         saved_phase[v] = x[v];
         x[v] = Value::Unassigned;
+        if variant == SelectVarVariant::Vmtf {
+            vmtf.on_unassign(v); // keep "everything newer than the cursor is assigned"
+        }
     }
     trail.truncate(cut);
     trail_lim.truncate(level_target + 1);
@@ -2944,6 +3134,8 @@ fn describe_params(
         SelectVarVariant::Fast => 1,
         SelectVarVariant::Vsids => 2,
         SelectVarVariant::Lrb => 3,
+        SelectVarVariant::Vmtf => 4,
+        SelectVarVariant::RoundRobin => 5,
     };
     // STAGE44.md swaps which numeral is which (Glucose 5 -> 4,
     // RoundRobin 4 -> 5) to match cliargs' own --alg-params mapping.
@@ -3246,6 +3438,7 @@ mod tests {
         let mut seen = vec![false; 5];
         let mut vsids = VsidsState::new(4);
         let mut lrb = LrbState::new(4);
+        let mut vmtf = VmtfState::new(4);
 
         assign_literal(
             -1,
@@ -3299,6 +3492,7 @@ mod tests {
             SelectVarVariant::Weighted,
             &mut vsids,
             &mut lrb,
+            &mut vmtf,
             &mut lbd_scratch,
             &mut min_state,
             &mut min_touched,
@@ -3529,6 +3723,7 @@ mod tests {
         let mut seen = vec![false; 6];
         let mut vsids = VsidsState::new(5);
         let mut lrb = LrbState::new(5);
+        let mut vmtf = VmtfState::new(5);
         let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
         let mut lbd_scratch: Vec<usize> = Vec::new();
         let mut min_state = vec![MIN_UNDEF; 6];
@@ -3565,6 +3760,7 @@ mod tests {
             SelectVarVariant::Weighted,
             &mut vsids,
             &mut lrb,
+            &mut vmtf,
             &mut lbd_scratch,
             &mut min_state,
             &mut min_touched,
@@ -4221,6 +4417,7 @@ mod tests {
         let mut current_level = 0usize; // matches the state right after a level-0 learned unit clause
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut vmtf = VmtfState::new(2);
         let mut saved_phase = vec![Value::False; 3];
         let mut conflicts_since_restart = 0usize;
         let mut restart_count = 0usize;
@@ -4258,6 +4455,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             &glucose,
             &p,
@@ -4379,6 +4577,7 @@ mod tests {
         let mut seen = vec![false; 5];
         let mut vsids = VsidsState::new(4);
         let mut lrb = LrbState::new(4);
+        let mut vmtf = VmtfState::new(4);
 
         assign_literal(
             -1,
@@ -4431,6 +4630,7 @@ mod tests {
             SelectVarVariant::Vsids,
             &mut vsids,
             &mut lrb,
+            &mut vmtf,
             &mut lbd_scratch,
             &mut min_state,
             &mut min_touched,
@@ -4473,6 +4673,7 @@ mod tests {
         let mut current_level = 1usize;
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut vmtf = VmtfState::new(2);
         let mut saved_phase = vec![Value::False; 3];
 
         assign_literal(
@@ -4499,6 +4700,7 @@ mod tests {
             SelectVarVariant::Lrb,
             10,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             params::default().cdcl.lrb_alpha,
         );
@@ -4538,6 +4740,7 @@ mod tests {
         let mut current_level = 1usize;
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut vmtf = VmtfState::new(2);
         let mut saved_phase = vec![Value::False; 3];
 
         assign_literal(
@@ -4565,6 +4768,7 @@ mod tests {
             SelectVarVariant::Lrb,
             10,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             params::default().cdcl.lrb_alpha,
         );
@@ -4806,6 +5010,7 @@ mod tests {
         let mut current_level = 1usize;
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut vmtf = VmtfState::new(2);
         let mut saved_phase = vec![Value::False; 3];
 
         assign_literal(
@@ -4831,6 +5036,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             params::default().cdcl.lrb_alpha,
         );
@@ -5025,6 +5231,7 @@ mod tests {
         let mut current_level = 0usize;
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut vmtf = VmtfState::new(2);
         let mut saved_phase = vec![Value::False; 3];
         let mut conflicts_since_restart = 1_000_000usize;
         let mut restart_count = 0usize;
@@ -5044,6 +5251,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
@@ -5104,6 +5312,7 @@ mod tests {
         let mut current_level = 0usize;
         let mut q_head = 0usize;
         let mut lrb = LrbState::new(2);
+        let mut vmtf = VmtfState::new(2);
         let mut saved_phase = vec![Value::False; 3];
         let glucose = GlucoseState::new(params::default().cdcl.glucose_window_size);
 
@@ -5138,6 +5347,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
@@ -5167,6 +5377,7 @@ mod tests {
             SelectVarVariant::Weighted,
             0,
             &mut lrb,
+            &mut vmtf,
             &mut saved_phase,
             &glucose,
             &params::default().cdcl,
@@ -6650,6 +6861,393 @@ mod tests {
                     working_problem.clauses.len()
                 );
             }
+        }
+    }
+
+    // ---- STAGE64.md: VMTF ----
+
+    /// The variables from the front (newest) to the back (oldest) of the
+    /// VMTF list, checking along the way that the next/prev links agree
+    /// and that stamps strictly decrease toward the back.
+    fn vmtf_order(vmtf: &VmtfState, num_vars: usize) -> Vec<usize> {
+        let mut order = Vec::new();
+        let mut newer = 0usize;
+        let mut v = vmtf.front;
+        while v != 0 {
+            assert!(order.len() <= num_vars, "list has a cycle: {order:?}");
+            assert_eq!(vmtf.next[v], newer, "next[{v}]");
+            if newer != 0 {
+                assert!(vmtf.stamp[v] < vmtf.stamp[newer], "stamps not decreasing");
+            }
+            order.push(v);
+            newer = v;
+            v = vmtf.prev[v];
+        }
+        assert_eq!(order.len(), num_vars, "list length: {order:?}");
+        assert_eq!(*order.last().unwrap(), vmtf.back, "back");
+        order
+    }
+
+    /// The cursor invariant: every variable newer than the search
+    /// cursor is assigned.
+    fn check_vmtf_cursor(vmtf: &VmtfState, x: &Assignment, num_vars: usize) {
+        for (v, &value) in x.iter().enumerate().skip(1).take(num_vars) {
+            assert!(
+                vmtf.stamp[v] <= vmtf.stamp[vmtf.search] || value != Value::Unassigned,
+                "variable {v} is unassigned but newer than the cursor {}",
+                vmtf.search
+            );
+        }
+    }
+
+    /// The initial order puts variable 1 at the front, so decisions
+    /// before any conflict walk the variables in increasing index order.
+    #[test]
+    fn test_vmtf_starts_with_lowest_variable_first() {
+        let mut vmtf = VmtfState::new(5);
+        let x = assignment::new(5);
+        assert_eq!(vmtf_order(&vmtf, 5), vec![1, 2, 3, 4, 5]);
+        assert_eq!(vmtf.select(&x), 1);
+    }
+
+    /// A bump from the middle, from the back, and of the variable already
+    /// at the front (a no-op).
+    #[test]
+    fn test_vmtf_bump_moves_to_front() {
+        let mut vmtf = VmtfState::new(5);
+        let mut x = assignment::new(5);
+        x[3] = Value::True;
+        vmtf.bump(3, &x);
+        assert_eq!(vmtf_order(&vmtf, 5), vec![3, 1, 2, 4, 5]);
+        x[5] = Value::True;
+        vmtf.bump(5, &x);
+        assert_eq!(vmtf_order(&vmtf, 5), vec![5, 3, 1, 2, 4]);
+        let counter = vmtf.counter;
+        vmtf.bump(5, &x);
+        assert_eq!(vmtf.counter, counter, "bumping the front must not restamp");
+        assert_eq!(vmtf_order(&vmtf, 5), vec![5, 3, 1, 2, 4]);
+    }
+
+    /// The variables of one conflict keep their old relative order after
+    /// being bumped together, wherever they started.
+    #[test]
+    fn test_vmtf_bump_analyzed_keeps_relative_order() {
+        let mut vmtf = VmtfState::new(6);
+        let mut x = assignment::new(6);
+        for slot in x.iter_mut().skip(1) {
+            *slot = Value::True;
+        }
+        vmtf.analyzed = vec![5, 2, 6]; // listed out of order on purpose
+        vmtf.bump_analyzed(&x);
+        // Variable 2 was newer than 5, which was newer than 6. The oldest
+        // is bumped first, so the newest ends up in front and the three
+        // keep their relative order.
+        assert_eq!(vmtf_order(&vmtf, 6), vec![2, 5, 6, 1, 3, 4]);
+        assert!(vmtf.analyzed.is_empty());
+    }
+
+    /// Decisions skip assigned variables and the cursor follows them.
+    #[test]
+    fn test_vmtf_select_skips_assigned_and_moves_cursor() {
+        let mut vmtf = VmtfState::new(5);
+        let mut x = assignment::new(5);
+        x[1] = Value::True;
+        x[2] = Value::False;
+        assert_eq!(vmtf.select(&x), 3);
+        assert_eq!(vmtf.search, 3);
+        check_vmtf_cursor(&vmtf, &x, 5);
+    }
+
+    /// The cursor invariant across a decision, a bump while assigned,
+    /// and two backtracks: afterwards the next decision is the newest
+    /// unassigned variable.
+    #[test]
+    fn test_vmtf_cursor_follows_backtracking() {
+        let mut vmtf = VmtfState::new(6);
+        let mut x = assignment::new(6);
+        for v in 1..=3 {
+            assert_eq!(vmtf.select(&x), v);
+            x[v] = Value::True;
+        }
+        assert_eq!(vmtf.search, 3);
+        vmtf.bump(2, &x); // as a conflict would, while assigned
+        check_vmtf_cursor(&vmtf, &x, 6);
+
+        // Backjump: unassign 3 then 2 (trail order is reversed).
+        for v in [3usize, 2] {
+            x[v] = Value::Unassigned;
+            vmtf.on_unassign(v);
+        }
+        check_vmtf_cursor(&vmtf, &x, 6);
+        assert_eq!(vmtf.select(&x), 2, "the bumped variable comes first");
+        x[1] = Value::Unassigned;
+        vmtf.on_unassign(1);
+        check_vmtf_cursor(&vmtf, &x, 6);
+        assert_eq!(vmtf.select(&x), 2, "after a restart, still the bumped one");
+    }
+
+    /// The same hand-verified conflict as the VSIDS analyze test:
+    /// variables 2 and 4 take part in it, so both must end up ahead of
+    /// the untouched variable 3.
+    #[test]
+    fn test_analyze_bumps_vmtf_variables_to_front() {
+        let problem = Problem {
+            num_vars: 4,
+            clauses: vec![
+                vec![1, 2],
+                vec![-1, 3],
+                vec![-1, -3],
+                vec![-2, 4],
+                vec![-2, -4],
+            ],
+        };
+        let (working_problem, mut watch, mut x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+        let mut choose_watch_pos = vec![0usize; working_problem.clauses.len()];
+        let mut level = vec![0usize; 5];
+        let mut reason: Vec<Option<usize>> = vec![None; 5];
+        let mut trail: Vec<usize> = Vec::new();
+        let mut q_head = 0usize;
+        let mut seen = vec![false; 5];
+        let mut vsids = VsidsState::new(4);
+        let mut lrb = LrbState::new(4);
+        let mut vmtf = VmtfState::new(4);
+
+        assign_literal(
+            -1,
+            1,
+            None,
+            &mut x,
+            &mut level,
+            &mut reason,
+            &mut trail,
+            SelectVarVariant::Vmtf,
+            0,
+            &mut lrb,
+        );
+        let confl = propagate(
+            &working_problem.clauses,
+            &mut watchers_positive,
+            &mut watchers_negative,
+            &mut watch,
+            &mut x,
+            &mut trail,
+            &mut q_head,
+            1,
+            &mut level,
+            &mut reason,
+            SelectVarVariant::Vmtf,
+            0,
+            &mut lrb,
+            &mut choose_watch_pos,
+        )
+        .expect("expected clause {-2,-4} to be falsified");
+
+        let mut clause_activity = vec![0.0f64; working_problem.clauses.len()];
+        let mut lbd_scratch: Vec<usize> = Vec::new();
+        let mut min_state = vec![MIN_UNDEF; 5];
+        let mut min_touched: Vec<usize> = Vec::new();
+        let mut min_stack: Vec<MinimizeFrame> = Vec::new();
+        let mut min_work: usize = 0;
+        analyze(
+            confl,
+            &working_problem.clauses,
+            &trail,
+            &level,
+            &reason,
+            &x,
+            &mut seen,
+            1,
+            &mut clause_activity,
+            1.0,
+            working_problem.clauses.len(),
+            SelectVarVariant::Vmtf,
+            &mut vsids,
+            &mut lrb,
+            &mut vmtf,
+            &mut lbd_scratch,
+            &mut min_state,
+            &mut min_touched,
+            &mut min_stack,
+            &mut min_work,
+            params::default().cdcl.minimize_work_budget_factor,
+        );
+
+        let order = vmtf_order(&vmtf, 4);
+        let position = |v: usize| order.iter().position(|&o| o == v).unwrap();
+        assert!(
+            position(2) < position(3) && position(4) < position(3),
+            "order {order:?}: variables 2 and 4 took part in the conflict and must precede variable 3"
+        );
+    }
+
+    /// Whether `clauses` over `num_vars` variables has a model, by trying
+    /// every assignment.
+    fn vmtf_brute_force_satisfiable(num_vars: usize, clauses: &[Clause]) -> bool {
+        (0..(1usize << num_vars)).any(|mask| {
+            let mut a = assignment::new(num_vars);
+            for (v, slot) in a.iter_mut().enumerate().skip(1) {
+                *slot = if mask & (1 << (v - 1)) != 0 {
+                    Value::True
+                } else {
+                    Value::False
+                };
+            }
+            clauses.iter().all(|c| {
+                c.iter().any(|&lit| {
+                    let value = a[cnf::literal_var(lit)];
+                    (lit > 0 && value == Value::True) || (lit < 0 && value == Value::False)
+                })
+            })
+        })
+    }
+
+    /// Fuzzes VMTF (and the round-robin choice, which resolves to VSIDS
+    /// with one thread) against exhaustive enumeration on small random
+    /// 3-SAT formulas, including restarts, and checks every reported
+    /// model.
+    #[test]
+    fn test_run_with_vmtf_agrees_with_brute_force() {
+        let mut rng = StdRng::seed_from_u64(64);
+        for variant in [SelectVarVariant::Vmtf, SelectVarVariant::RoundRobin] {
+            for trial in 0..150u64 {
+                let num_vars = 8 + rng.random_range(0..5usize);
+                let num_clauses = (4.3 * num_vars as f64) as usize;
+                let mut clauses: Vec<Clause> = Vec::new();
+                while clauses.len() < num_clauses {
+                    let mut clause: Clause = Vec::new();
+                    while clause.len() < 3 {
+                        let v = 1 + rng.random_range(0..num_vars) as Literal;
+                        if clause.iter().any(|&l| l.abs() == v) {
+                            continue;
+                        }
+                        clause.push(if rng.random_range(0..2) == 0 { -v } else { v });
+                    }
+                    clauses.push(clause);
+                }
+                let problem = Problem {
+                    num_vars,
+                    clauses: clauses.clone(),
+                };
+                let want = vmtf_brute_force_satisfiable(num_vars, &clauses);
+                let mut run_rng = StdRng::seed_from_u64(trial);
+                let result = run(
+                    &problem,
+                    None,
+                    variant,
+                    RestartStrategy::Geometric,
+                    None,
+                    &mut run_rng,
+                    0,
+                    &params::default().cdcl,
+                    PhaseStrategy::Saving,
+                );
+                assert!(
+                    !result.timed_out && result.satisfiable == want,
+                    "variant {variant:?} trial {trial}: satisfiable={} timed_out={}, brute force says {want}\n{clauses:?}",
+                    result.satisfiable,
+                    result.timed_out
+                );
+                if result.satisfiable {
+                    for clause in &clauses {
+                        assert!(
+                            clause.iter().any(|&lit| {
+                                let value = result.assignment[cnf::literal_var(lit)];
+                                (lit > 0 && value == Value::True)
+                                    || (lit < 0 && value == Value::False)
+                            }),
+                            "variant {variant:?} trial {trial}: clause {clause:?} not satisfied"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// VMTF on a formula that needs many conflicts, with and without
+    /// restarts.
+    #[test]
+    fn test_run_with_vmtf_proves_unsatisfiable_pigeonhole() {
+        let problem = pigeonhole_problem(6, 5);
+        for strategy in [RestartStrategy::None, RestartStrategy::Polynomial] {
+            let mut rng = StdRng::seed_from_u64(9);
+            let result = run(
+                &problem,
+                None,
+                SelectVarVariant::Vmtf,
+                strategy,
+                None,
+                &mut rng,
+                0,
+                &params::default().cdcl,
+                PhaseStrategy::Saving,
+            );
+            assert!(!result.satisfiable && !result.timed_out, "{strategy:?}");
+        }
+    }
+
+    /// The round-robin mapping, and that a concrete heuristic passes
+    /// through unchanged.
+    #[test]
+    fn test_resolve_select_var_variant() {
+        use SelectVarVariant::*;
+        let want = [Vsids, Vmtf, Lrb, Vsids, Vmtf, Vsids, Vmtf];
+        for (i, &w) in want.iter().enumerate() {
+            assert_eq!(resolve_select_var_variant(RoundRobin, i), w, "worker {i}");
+        }
+        for v in [Weighted, Fast, Vsids, Lrb, Vmtf] {
+            assert_eq!(resolve_select_var_variant(v, 3), v);
+        }
+        let period = ROUND_ROBIN_VARIANTS.len();
+        assert!(
+            !period.is_multiple_of(4) && !period.is_multiple_of(3),
+            "period {period} must be coprime to the restart (4) and phase (3) periods"
+        );
+    }
+
+    /// Five workers cover every worker kind (VSIDS, VMTF, LRB) on an
+    /// UNSAT and a SAT formula.
+    #[test]
+    fn test_run_parallel_with_round_robin_heuristics() {
+        let unsat = pigeonhole_problem(6, 5);
+        let mut rng = StdRng::seed_from_u64(3);
+        let result = run_parallel(
+            &unsat,
+            None,
+            SelectVarVariant::RoundRobin,
+            RestartStrategy::RoundRobin,
+            None,
+            5,
+            &mut rng,
+            0,
+            &params::default().cdcl,
+            PhaseStrategy::RoundRobin,
+        );
+        assert!(!result.satisfiable && !result.timed_out);
+
+        let sat = pigeonhole_problem(5, 5);
+        let mut rng = StdRng::seed_from_u64(4);
+        let result = run_parallel(
+            &sat,
+            None,
+            SelectVarVariant::RoundRobin,
+            RestartStrategy::RoundRobin,
+            None,
+            5,
+            &mut rng,
+            0,
+            &params::default().cdcl,
+            PhaseStrategy::RoundRobin,
+        );
+        assert!(result.satisfiable, "5 pigeons in 5 holes");
+        for clause in &sat.clauses {
+            assert!(clause.iter().any(|&lit| {
+                let value = result.assignment[cnf::literal_var(lit)];
+                (lit > 0 && value == Value::True) || (lit < 0 && value == Value::False)
+            }));
         }
     }
 }

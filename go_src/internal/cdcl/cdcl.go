@@ -487,7 +487,45 @@ const (
 	// SelectVarLrb is STAGE13.md's (simplified) LRB heuristic (see
 	// the package doc comment).
 	SelectVarLrb SelectVarVariant = 3
+	// SelectVarVmtf is STAGE64.md's Variable Move-To-Front heuristic
+	// (introduced in the Siege solver, L. Ryan, "Efficient Algorithms for
+	// Clause-Learning SAT Solvers," MSc thesis, Simon Fraser University,
+	// 2004; compared with other scoring schemes by Biere & Froehlich,
+	// "Evaluating CDCL Variable Scoring Schemes," SAT 2015 -- both
+	// citations from memory, not re-checked): variables sit in a linked
+	// list ordered by when they were last involved in a conflict, and a
+	// decision takes the first unassigned variable from the front. See
+	// vmtfBump and selectVarVmtf.
+	SelectVarVmtf SelectVarVariant = 4
+	// SelectVarRoundRobin (STAGE64.md) is the portfolio choice, like
+	// RestartRoundRobin and PhaseRoundRobin: worker i uses
+	// roundRobinVariants[i%5]. It is the default whenever --num-threads
+	// is above 1 and the caller gave no explicit heuristic. With one
+	// thread it resolves to worker 0's choice, VSIDS.
+	SelectVarRoundRobin SelectVarVariant = 5
 )
+
+// roundRobinVariants is SelectVarRoundRobin's resolution order: VSIDS,
+// VMTF, LRB, then VSIDS and VMTF once more. Its length is 5 on purpose.
+// The restart rotation has period 4 and the phase rotation period 3, and
+// 5 is coprime to both, so across enough workers every (heuristic,
+// restart, phase) combination occurs, rather than a worker's heuristic
+// always travelling with the same phase strategy (as it would with a
+// period of 3). VSIDS, the best measured single-heuristic default, and
+// VMTF, the cheapest per decision, get two slots each; LRB gets one.
+// The weighted and static-order heuristics are left out: they are
+// there for comparison, not as serious cdcl choices.
+var roundRobinVariants = [5]SelectVarVariant{SelectVarVsids, SelectVarVmtf, SelectVarLrb, SelectVarVsids, SelectVarVmtf}
+
+// resolveSelectVarVariant returns the concrete heuristic worker
+// threadIndex should use for variant: roundRobinVariants[threadIndex%5]
+// for SelectVarRoundRobin, and variant itself for every other value.
+func resolveSelectVarVariant(variant SelectVarVariant, threadIndex int) SelectVarVariant {
+	if variant == SelectVarRoundRobin {
+		return roundRobinVariants[threadIndex%len(roundRobinVariants)]
+	}
+	return variant
+}
 
 // RestartStrategy identifies which restart schedule maybeRestart
 // applies for --algorithm=cdcl (STAGE15.md; see the package doc
@@ -823,6 +861,24 @@ type solver struct {
 	lrbAssignedAtConflict []int
 	lrbCurrentAlpha       float64
 
+	// STAGE64.md's VMTF state (SelectVarVmtf only; every slice is nil
+	// otherwise). The variables form a doubly linked list ordered by
+	// vmtfStamp, which grows toward the front: vmtfFront is the most
+	// recently bumped variable (where decisions start), vmtfBack the
+	// oldest. vmtfPrev[v] is the next older variable and vmtfNext[v] the
+	// next newer one; 0 means "none". vmtfSearch caches where the next
+	// decision starts looking: every variable newer than it is assigned.
+	// vmtfCounter is the last stamp handed out, and vmtfAnalyzed is
+	// analyze's scratch list of the variables to bump after a conflict.
+	vmtfPrev     []int
+	vmtfNext     []int
+	vmtfStamp    []int
+	vmtfFront    int
+	vmtfBack     int
+	vmtfSearch   int
+	vmtfCounter  int
+	vmtfAnalyzed []int
+
 	// savedPhase holds, for every variable, the value it last held
 	// before becoming unassigned (STAGE14.md), sized numVars+1;
 	// decide consults this to guess the same polarity again next time
@@ -1030,7 +1086,7 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		lrbReasonedEpoch[v] = -1
 	}
 
-	return &solver{
+	s = &solver{
 		numVars:                 problem.NumVars,
 		clauses:                 clauses,
 		watch:                   watch,
@@ -1065,7 +1121,11 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		minState:                make([]byte, problem.NumVars+1),
 		params:                  p,
 		lbdRecentBuf:            make([]int, p.GlucoseWindowSize),
-	}, true, false
+	}
+	if variant == SelectVarVmtf {
+		s.initVmtf()
+	}
+	return s, true, false
 }
 
 // Run performs a CDCL search: repeatedly propagate, and on a
@@ -1126,7 +1186,7 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 	if verbose >= 1 {
 		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy, phaseStrategy)+describeMemoryLimit(memoryLimitBytes))
 	}
-	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p, resolvePhaseStrategy(phaseStrategy, 0))
+	result := runLoop(problem, timeLimit, resolveSelectVarVariant(variant, 0), resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p, resolvePhaseStrategy(phaseStrategy, 0))
 	if verbose >= 1 {
 		fmt.Println(verdict(result))
 	}
@@ -1207,7 +1267,8 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 			defer wg.Done()
 			threadStrategy := resolveRestartStrategy(restartStrategy, i)
 			threadPhaseStrategy := resolvePhaseStrategy(phaseStrategy, i)
-			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
+			threadVariant := resolveSelectVarVariant(variant, i)
+			results[i] = runLoop(problem, timeLimit, threadVariant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
 			if !results[i].TimedOut && stop.CompareAndSwap(false, true) {
 				winner.Store(int32(i))
 			}
@@ -1389,6 +1450,8 @@ func (s *solver) decide(rng *rand.Rand) {
 		v = s.selectVarByActivity(s.varActivity)
 	case SelectVarLrb:
 		v = s.selectVarByActivity(s.lrbQ)
+	case SelectVarVmtf:
+		v = s.selectVarVmtf()
 	default: // SelectVarWeighted
 		// Rebuilding this on every decision (rather than caching it)
 		// keeps it trivially correct as s.clauses grows via learned
@@ -1429,6 +1492,89 @@ func (s *solver) selectVarByActivity(scores []float64) int {
 		}
 	}
 	return best
+}
+
+// initVmtf builds the VMTF list in its initial order: variable 1 at the
+// front, so before any conflict has happened decisions walk the
+// variables in increasing index order, the same starting point
+// SelectVarFast and the activity heuristics (all scores 0) have. Every
+// variable gets a stamp, highest at the front.
+func (s *solver) initVmtf() {
+	n := s.numVars
+	s.vmtfPrev = make([]int, n+1)
+	s.vmtfNext = make([]int, n+1)
+	s.vmtfStamp = make([]int, n+1)
+	for v := 1; v <= n; v++ {
+		if v < n {
+			s.vmtfPrev[v] = v + 1
+		}
+		if v > 1 {
+			s.vmtfNext[v] = v - 1
+		}
+		s.vmtfStamp[v] = n - v + 1
+	}
+	s.vmtfFront = 1
+	s.vmtfBack = n
+	s.vmtfSearch = 1
+	s.vmtfCounter = n
+}
+
+// vmtfBump moves v to the front of the VMTF list with a fresh stamp.
+// A variable already at the front is left alone. v is normally assigned
+// when this runs (analyze bumps before backjumping), so the search
+// cursor stays valid; if v is somehow unassigned, the cursor moves to it
+// so no unassigned variable is ever hidden behind the cursor.
+func (s *solver) vmtfBump(v int) {
+	if s.vmtfNext[v] == 0 {
+		return // already the newest
+	}
+	older, newer := s.vmtfPrev[v], s.vmtfNext[v]
+	if older != 0 {
+		s.vmtfNext[older] = newer
+	} else {
+		s.vmtfBack = newer
+	}
+	s.vmtfPrev[newer] = older
+
+	s.vmtfPrev[v] = s.vmtfFront
+	s.vmtfNext[v] = 0
+	s.vmtfNext[s.vmtfFront] = v
+	s.vmtfFront = v
+	s.vmtfCounter++
+	s.vmtfStamp[v] = s.vmtfCounter
+	if s.x[v] == assign.Unassigned {
+		s.vmtfSearch = v
+	}
+}
+
+// vmtfBumpAnalyzed bumps every variable analyze recorded in
+// s.vmtfAnalyzed (the variables involved in the conflict just
+// analyzed), in increasing order of their current stamps, so that their
+// relative order is preserved at the front. Then it empties the list.
+func (s *solver) vmtfBumpAnalyzed() {
+	slices.SortFunc(s.vmtfAnalyzed, func(a, b int) int {
+		return s.vmtfStamp[a] - s.vmtfStamp[b]
+	})
+	for _, v := range s.vmtfAnalyzed {
+		s.vmtfBump(v)
+	}
+	s.vmtfAnalyzed = s.vmtfAnalyzed[:0]
+}
+
+// selectVarVmtf returns the first unassigned variable at or behind the
+// search cursor (walking toward older variables) and leaves the cursor
+// on it. The cursor only ever has assigned variables in front of it, an
+// invariant backtrackTo maintains by moving it forward whenever a newer
+// variable becomes unassigned, so each variable is skipped at most once
+// per descent and the walk costs O(1) amortized. It must only be called
+// while some variable is unassigned.
+func (s *solver) selectVarVmtf() int {
+	v := s.vmtfSearch
+	for s.x[v] != assign.Unassigned {
+		v = s.vmtfPrev[v]
+	}
+	s.vmtfSearch = v
+	return v
 }
 
 // assignLiteral records lit as true (setting its variable's value,
@@ -2095,6 +2241,8 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd
 				s.varActivity[v] += s.varActivityIncrement
 			case SelectVarLrb:
 				s.lrbParticipated[v]++
+			case SelectVarVmtf:
+				s.vmtfAnalyzed = append(s.vmtfAnalyzed, v)
 			}
 			if s.level[v] == s.currentLevel {
 				counter++
@@ -2124,6 +2272,10 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd
 			panic("cdcl: analyze reached a variable with no reason while literals of the current level remain unresolved")
 		}
 		reasonClause = s.reason[v]
+	}
+
+	if s.variant == SelectVarVmtf {
+		s.vmtfBumpAnalyzed()
 	}
 
 	learned = append(cnf.Clause{-p}, learned...)
@@ -2319,6 +2471,9 @@ func (s *solver) backtrackTo(level int) {
 		}
 		s.savedPhase[v] = s.x[v] // STAGE14.md: remember this polarity for decide's next guess
 		s.x[v] = assign.Unassigned
+		if s.variant == SelectVarVmtf && s.vmtfStamp[v] > s.vmtfStamp[s.vmtfSearch] {
+			s.vmtfSearch = v // keep "everything newer than the cursor is assigned"
+		}
 	}
 	s.trail = s.trail[:cut]
 	s.trailLim = s.trailLim[:level+1]

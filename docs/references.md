@@ -63,6 +63,12 @@ flagged explicitly where that happened).
   clearly ahead of LRB** on its uniform random 3-SAT set, the opposite
   of this paper's headline SAT-Competition result — VSIDS, not LRB, is
   `cdcl`'s default. (`reports/REPORT13.md`)
+- Ryan, "Efficient Algorithms for Clause-Learning SAT Solvers," MSc
+  thesis, Simon Fraser University, 2004 (the Siege solver), and Biere &
+  Froehlich, "Evaluating CDCL Variable Scoring Schemes," SAT 2015. The
+  Variable Move-To-Front (VMTF) heuristic `cdcl` implements as
+  `--alg-params` `val1=4`. Both citations are from memory and were not
+  re-checked when added. (`reports/REPORT64.md`)
 - Cherif, "Combining VSIDS and CHB Using Restarts," CP 2021. Consulted
   for context on modern branching-heuristic combinations; not
   implemented directly. (`reports/REPORT7.md`)

@@ -300,8 +300,25 @@ Options:
                      often it has recently *participated* in producing
                      a learned clause, per conflict it has been
                      assigned for (a "learning rate").
-               Optional; defaults to 2 (VSIDS) if --alg-params is not
-               given -- unlike "dfs", which defaults to 0. STAGE13.md
+                 4 = VMTF, Variable Move-To-Front (STAGE64.md): keeps
+                     the variables in a list ordered by when they were
+                     last involved in a conflict, moves each variable
+                     involved in a new conflict to the front, and
+                     branches on the first unassigned variable from the
+                     front. No scores, no decay, and O(1) amortized per
+                     decision (VSIDS and LRB scan every variable). Before
+                     the first conflict it takes variables in increasing
+                     order.
+                 5 = round-robin (STAGE64.md, meaningful with
+                     --num-threads > 1): worker 0 uses VSIDS, worker 1
+                     VMTF, worker 2 LRB, worker 3 VSIDS, worker 4 VMTF,
+                     then the pattern repeats every 5 workers (5 is
+                     coprime to the 4 restart strategies and 3 phase
+                     strategies, so every combination eventually
+                     occurs). With one thread it means VSIDS.
+               Optional; defaults to 2 (VSIDS) with --num-threads=1 if
+               --alg-params is not given, and to 5 (round-robin) with
+               --num-threads > 1 -- unlike "dfs", which defaults to 0. STAGE13.md
                cites SAT Competition results where LRB outperforms
                VSIDS, but this project's own benchmark comparison
                (reports/REPORT13.md) found VSIDS clearly ahead of both
@@ -555,7 +572,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         if raw.algorithm == "cdcl" {
             if values.len() > 4 {
                 return Err(
-                    "for --algorithm=cdcl, --alg-params accepts at most four values (0-3 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)"
+                    "for --algorithm=cdcl, --alg-params accepts at most four values (0-5 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)"
                         .to_string(),
                 );
             }
@@ -818,10 +835,10 @@ fn validate(args: &Args) -> Result<(), String> {
             // cdcl::PhaseStrategy).
             if let Some(params) = &args.alg_params
                 && let Some(variant) = params[0]
-                && !(0..=3).contains(&variant)
+                && !(0..=5).contains(&variant)
             {
                 return Err(
-                    "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, or 3 (selecting which SelectVar heuristic to use)"
+                    "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, 3, 4, or 5 (selecting which SelectVar heuristic to use)"
                         .to_string(),
                 );
             }
@@ -1163,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_accepts_select_var_variant() {
-        for variant in [0i64, 1i64, 2i64, 3i64] {
+        for variant in [0i64, 1i64, 2i64, 3i64, 4i64, 5i64] {
             let args = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",
@@ -1180,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_rejects_out_of_range_alg_params() {
-        for variant in ["5", "-1", "4"] {
+        for variant in ["6", "-1", "7"] {
             let result = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",

@@ -393,11 +393,19 @@ fn run_cdcl(
     // benchmarks wins out over a priori literature reasoning, so
     // VSIDS is the default here (unlike dfs, which keeps its own
     // Weighted default).
+    //
+    // STAGE64.md adds VMTF (4) and a round-robin portfolio choice (5),
+    // which becomes the default once --num-threads > 1 and no explicit
+    // --alg-params heuristic overrides it, following the same pattern
+    // the restart and phase strategies below use.
     let variant = match args.alg_params.as_deref() {
         Some([Some(0), ..]) => cdcl::SelectVarVariant::Weighted,
         Some([Some(1), ..]) => cdcl::SelectVarVariant::Fast,
         Some([Some(2), ..]) => cdcl::SelectVarVariant::Vsids,
         Some([Some(3), ..]) => cdcl::SelectVarVariant::Lrb,
+        Some([Some(4), ..]) => cdcl::SelectVarVariant::Vmtf,
+        Some([Some(5), ..]) => cdcl::SelectVarVariant::RoundRobin,
+        _ if args.num_threads > 1 => cdcl::SelectVarVariant::RoundRobin,
         _ => cdcl::SelectVarVariant::Vsids,
     };
 
