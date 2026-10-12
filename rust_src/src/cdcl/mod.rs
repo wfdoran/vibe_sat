@@ -212,44 +212,6 @@ pub enum SelectVarVariant {
     /// takes the first unassigned variable from the front. See
     /// [`VmtfState`].
     Vmtf,
-    /// STAGE64.md's portfolio choice, like `RestartStrategy::RoundRobin`
-    /// and `PhaseStrategy::RoundRobin`: worker `i` uses
-    /// `ROUND_ROBIN_VARIANTS[i % 5]`. It is the default whenever
-    /// `--num-threads` is above 1 and the caller gave no explicit
-    /// heuristic. With one thread it resolves to worker 0's choice,
-    /// VSIDS. Never reaches [`run_loop`] itself; see
-    /// [`resolve_select_var_variant`].
-    RoundRobin,
-}
-
-/// `SelectVarVariant::RoundRobin`'s resolution order: VSIDS, VMTF, LRB,
-/// then VSIDS and VMTF once more. Its length is 5 on purpose. The
-/// restart rotation has period 4 and the phase rotation period 3, and 5
-/// is coprime to both, so across enough workers every (heuristic,
-/// restart, phase) combination occurs, rather than a worker's heuristic
-/// always travelling with the same phase strategy (as it would with a
-/// period of 3). VSIDS, the best measured single-heuristic default, and
-/// VMTF, the cheapest per decision, get two slots each; LRB gets one.
-/// The weighted and static-order heuristics are left out: they are
-/// there for comparison, not as serious cdcl choices.
-const ROUND_ROBIN_VARIANTS: [SelectVarVariant; 5] = [
-    SelectVarVariant::Vsids,
-    SelectVarVariant::Vmtf,
-    SelectVarVariant::Lrb,
-    SelectVarVariant::Vsids,
-    SelectVarVariant::Vmtf,
-];
-
-/// Returns the concrete heuristic worker `thread_index` should use for
-/// `variant`: `ROUND_ROBIN_VARIANTS[thread_index % 5]` for
-/// `SelectVarVariant::RoundRobin`, and `variant` itself for every other
-/// value.
-fn resolve_select_var_variant(variant: SelectVarVariant, thread_index: usize) -> SelectVarVariant {
-    if variant == SelectVarVariant::RoundRobin {
-        ROUND_ROBIN_VARIANTS[thread_index % ROUND_ROBIN_VARIANTS.len()]
-    } else {
-        variant
-    }
 }
 
 /// Identifies which restart schedule [`maybe_restart`] applies for
@@ -1138,7 +1100,7 @@ pub fn run<R: Rng>(
     let result = run_loop(
         problem,
         time_limit,
-        resolve_select_var_variant(variant, 0),
+        variant,
         resolve_restart_strategy(restart_strategy, 0),
         memory_limit_bytes,
         rng,
@@ -1266,7 +1228,6 @@ pub fn run_parallel<R: Rng>(
                 let peers = &peers_for_worker[i];
                 let stop = &stop;
                 let winner = &winner;
-                let thread_variant = resolve_select_var_variant(variant, i);
                 let thread_strategy = resolve_restart_strategy(restart_strategy, i);
                 let thread_phase_strategy = resolve_phase_strategy(phase_strategy, i);
 
@@ -1280,7 +1241,7 @@ pub fn run_parallel<R: Rng>(
                     let result = run_loop(
                         problem,
                         time_limit,
-                        thread_variant,
+                        variant,
                         thread_strategy,
                         memory_limit_bytes,
                         sub_rng,
@@ -1853,9 +1814,6 @@ fn run_loop<R: Rng>(
             }
             SelectVarVariant::Lrb => select_var_by_activity(&lrb.q, &x, problem.num_vars),
             SelectVarVariant::Vmtf => vmtf.select(&x),
-            SelectVarVariant::RoundRobin => {
-                unreachable!("RoundRobin is resolved to a concrete heuristic before run_loop")
-            }
         };
         current_level += 1;
         trail_lim.push(trail.len());
@@ -3135,7 +3093,6 @@ fn describe_params(
         SelectVarVariant::Vsids => 2,
         SelectVarVariant::Lrb => 3,
         SelectVarVariant::Vmtf => 4,
-        SelectVarVariant::RoundRobin => 5,
     };
     // STAGE44.md swaps which numeral is which (Glucose 5 -> 4,
     // RoundRobin 4 -> 5) to match cliargs' own --alg-params mapping.
@@ -7105,14 +7062,12 @@ mod tests {
         })
     }
 
-    /// Fuzzes VMTF (and the round-robin choice, which resolves to VSIDS
-    /// with one thread) against exhaustive enumeration on small random
-    /// 3-SAT formulas, including restarts, and checks every reported
-    /// model.
+    /// Fuzzes VMTF against exhaustive enumeration on small random 3-SAT
+    /// formulas, including restarts, and checks every reported model.
     #[test]
     fn test_run_with_vmtf_agrees_with_brute_force() {
         let mut rng = StdRng::seed_from_u64(64);
-        for variant in [SelectVarVariant::Vmtf, SelectVarVariant::RoundRobin] {
+        for variant in [SelectVarVariant::Vmtf] {
             for trial in 0..150u64 {
                 let num_vars = 8 + rng.random_range(0..5usize);
                 let num_clauses = (4.3 * num_vars as f64) as usize;
@@ -7189,38 +7144,20 @@ mod tests {
         }
     }
 
-    /// The round-robin mapping, and that a concrete heuristic passes
-    /// through unchanged.
+    /// VMTF in several threads on an UNSAT and a SAT formula (every
+    /// worker uses the same heuristic; restarts and phases still rotate
+    /// across the workers).
     #[test]
-    fn test_resolve_select_var_variant() {
-        use SelectVarVariant::*;
-        let want = [Vsids, Vmtf, Lrb, Vsids, Vmtf, Vsids, Vmtf];
-        for (i, &w) in want.iter().enumerate() {
-            assert_eq!(resolve_select_var_variant(RoundRobin, i), w, "worker {i}");
-        }
-        for v in [Weighted, Fast, Vsids, Lrb, Vmtf] {
-            assert_eq!(resolve_select_var_variant(v, 3), v);
-        }
-        let period = ROUND_ROBIN_VARIANTS.len();
-        assert!(
-            !period.is_multiple_of(4) && !period.is_multiple_of(3),
-            "period {period} must be coprime to the restart (4) and phase (3) periods"
-        );
-    }
-
-    /// Five workers cover every worker kind (VSIDS, VMTF, LRB) on an
-    /// UNSAT and a SAT formula.
-    #[test]
-    fn test_run_parallel_with_round_robin_heuristics() {
+    fn test_run_parallel_with_vmtf() {
         let unsat = pigeonhole_problem(6, 5);
         let mut rng = StdRng::seed_from_u64(3);
         let result = run_parallel(
             &unsat,
             None,
-            SelectVarVariant::RoundRobin,
+            SelectVarVariant::Vmtf,
             RestartStrategy::RoundRobin,
             None,
-            5,
+            4,
             &mut rng,
             0,
             &params::default().cdcl,
@@ -7233,10 +7170,10 @@ mod tests {
         let result = run_parallel(
             &sat,
             None,
-            SelectVarVariant::RoundRobin,
+            SelectVarVariant::Vmtf,
             RestartStrategy::RoundRobin,
             None,
-            5,
+            4,
             &mut rng,
             0,
             &params::default().cdcl,

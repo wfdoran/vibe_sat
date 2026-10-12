@@ -351,7 +351,7 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 		// just like the first.
 		if args.Algorithm == "cdcl" {
 			if len(values) > 4 {
-				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most four values (0-5 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)")
+				return nil, fmt.Errorf("for --algorithm=cdcl, --alg-params accepts at most four values (0-4 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)")
 			}
 			if len(values) >= 1 {
 				p, err := parseAlgParamValue(values[0])
@@ -530,8 +530,8 @@ func validate(args *Args, rawValues map[string][]string) error {
 		// STAGE43.md adds a fourth AlgParams element (phase strategy:
 		// 0 = saving, 1 = target, 2 = WalkSAT rephasing, 3 = round-robin
 		// across all three by worker index; see cdcl.PhaseStrategy).
-		if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil && (*args.AlgParams[0] < 0 || *args.AlgParams[0] > 5) {
-			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, 3, 4, or 5 (selecting which SelectVar heuristic to use)")
+		if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil && (*args.AlgParams[0] < 0 || *args.AlgParams[0] > 4) {
+			return fmt.Errorf("for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, 3, or 4 (selecting which SelectVar heuristic to use)")
 		}
 		if len(args.AlgParams) >= 2 && args.AlgParams[1] != nil && (*args.AlgParams[1] < 0 || *args.AlgParams[1] > 5) {
 			return fmt.Errorf("for --algorithm=cdcl, the second --alg-params value must be 0, 1, 2, 3, 4, or 5 (selecting the restart strategy)")

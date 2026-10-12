@@ -121,7 +121,7 @@ bookkeeping:
 
 - **VSIDS** adds to a variable's activity every time it takes part in a
   conflict and decays all activities over time, so recent conflicts count
-  more. It is the single-thread default.
+  more. It is the default.
 - **LRB** treats the choice as a learning problem: a variable's score is a
   moving average of how often it participated in a conflict per conflict it
   stayed assigned for, with a bonus for variables that were part of the

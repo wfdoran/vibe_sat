@@ -244,13 +244,12 @@ func vmtfBruteForceSatisfiable(numVars int, clauses []cnf.Clause) bool {
 	return false
 }
 
-// TestRunWithVmtfAgreesWithBruteForce fuzzes VMTF (and the round-robin
-// choice, which resolves to VSIDS with one thread) against exhaustive
+// TestRunWithVmtfAgreesWithBruteForce fuzzes VMTF against exhaustive
 // enumeration on small random 3-SAT formulas, including restarts, and
 // checks every reported model.
 func TestRunWithVmtfAgreesWithBruteForce(t *testing.T) {
 	rng := rand.New(rand.NewPCG(64, 64))
-	for _, variant := range []SelectVarVariant{SelectVarVmtf, SelectVarRoundRobin} {
+	for _, variant := range []SelectVarVariant{SelectVarVmtf} {
 		for trial := 0; trial < 150; trial++ {
 			numVars := 8 + rng.IntN(5)
 			numClauses := int(4.3 * float64(numVars))
@@ -308,36 +307,18 @@ func TestRunWithVmtfProvesUnsatisfiablePigeonhole(t *testing.T) {
 	}
 }
 
-// TestResolveSelectVarVariant checks the round-robin mapping and that a
-// concrete heuristic passes through unchanged.
-func TestResolveSelectVarVariant(t *testing.T) {
-	want := []SelectVarVariant{SelectVarVsids, SelectVarVmtf, SelectVarLrb, SelectVarVsids, SelectVarVmtf, SelectVarVsids, SelectVarVmtf}
-	for i, w := range want {
-		if got := resolveSelectVarVariant(SelectVarRoundRobin, i); got != w {
-			t.Errorf("worker %d: got %d, want %d", i, got, w)
-		}
-	}
-	for _, v := range []SelectVarVariant{SelectVarWeighted, SelectVarFast, SelectVarVsids, SelectVarLrb, SelectVarVmtf} {
-		if got := resolveSelectVarVariant(v, 3); got != v {
-			t.Errorf("resolveSelectVarVariant(%d, 3) = %d, want it unchanged", v, got)
-		}
-	}
-	if len(roundRobinVariants)%4 == 0 || len(roundRobinVariants)%3 == 0 {
-		t.Errorf("round-robin period %d must be coprime to the restart (4) and phase (3) periods", len(roundRobinVariants))
-	}
-}
-
-// TestRunParallelWithRoundRobinHeuristics runs every worker kind (five
-// threads cover VSIDS, VMTF and LRB) on an UNSAT and a SAT formula.
-func TestRunParallelWithRoundRobinHeuristics(t *testing.T) {
+// TestRunParallelWithVmtf runs VMTF in several threads on an UNSAT and a
+// SAT formula (every worker uses the same heuristic; restarts and phases
+// still rotate across the workers).
+func TestRunParallelWithVmtf(t *testing.T) {
 	unsat := pigeonholeProblem(6, 5)
-	result := RunParallel(unsat, nil, SelectVarRoundRobin, RestartRoundRobin, nil, 5, rand.New(rand.NewPCG(3, 3)), 0, params.Default().CDCL, PhaseRoundRobin)
+	result := RunParallel(unsat, nil, SelectVarVmtf, RestartRoundRobin, nil, 4, rand.New(rand.NewPCG(3, 3)), 0, params.Default().CDCL, PhaseRoundRobin)
 	if result.Satisfiable || result.TimedOut {
 		t.Fatalf("pigeonhole: satisfiable=%v timedOut=%v, want a proven UNSAT", result.Satisfiable, result.TimedOut)
 	}
 
 	sat := pigeonholeProblem(5, 5)
-	result = RunParallel(sat, nil, SelectVarRoundRobin, RestartRoundRobin, nil, 5, rand.New(rand.NewPCG(4, 4)), 0, params.Default().CDCL, PhaseRoundRobin)
+	result = RunParallel(sat, nil, SelectVarVmtf, RestartRoundRobin, nil, 4, rand.New(rand.NewPCG(4, 4)), 0, params.Default().CDCL, PhaseRoundRobin)
 	if !result.Satisfiable {
 		t.Fatalf("5 pigeons in 5 holes reported unsatisfiable")
 	}

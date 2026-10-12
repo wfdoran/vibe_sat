@@ -191,7 +191,7 @@ their defaults.
 
 | Value | Meaning |
 |---|---|
-| `val1` | Variable-selection heuristic. `0`/`1`: same as `dfs`'s `val1`. `2` (default): VSIDS — scores variables by how often they've recently appeared while resolving a conflict, decayed over time. `3`: LRB — scores variables by how often they've recently *participated* in producing a learned clause, per conflict they've been assigned for. `4`: VMTF (Variable Move-To-Front) — keeps the variables in a list ordered by when they were last involved in a conflict and branches on the first unassigned one from the front; no scores or decay, and O(1) amortized per decision. `5` (default with `--num-threads>1`): round-robin — worker `i` uses `{2, 4, 3, 2, 4}[i % 5]` (VSIDS, VMTF, LRB, VSIDS, VMTF); with one thread it means VSIDS. |
+| `val1` | Variable-selection heuristic. `0`/`1`: same as `dfs`'s `val1`. `2` (default): VSIDS — scores variables by how often they've recently appeared while resolving a conflict, decayed over time. `3`: LRB — scores variables by how often they've recently *participated* in producing a learned clause, per conflict they've been assigned for. `4`: VMTF (Variable Move-To-Front) — keeps the variables in a list ordered by when they were last involved in a conflict and branches on the first unassigned one from the front; no scores or decay, and O(1) amortized per decision. Every thread uses the same heuristic. |
 | `val2` | Restart strategy. `0`: no restarts. `1`: the Luby sequence. `2` (default with `--num-threads=1`): a quadratic "polynomial" growth sequence. `3`: a true geometric growth sequence (constant ratio between restart intervals). `4`: Glucose's data-driven policy — restart when a moving average of recent learned-clause LBDs looks close to or worse than the all-time average, rather than on a fixed conflict-count schedule. `5` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{2, 3, 1, 4}` in turn, so no two threads restart on the same cadence. |
 | `val3` | Learned-clause database memory limit. Either a plain integer (bytes) or an integer with a `k`/`kb`/`m`/`mb`/`g`/`gb` suffix (case-insensitive), e.g. `100MB`. Unbounded by default. |
 | `val4` | Phase-selection strategy: which technique to use for guessing a newly-decided variable's polarity. `0` (default with `--num-threads=1`): phase saving — guess the polarity the variable last held before becoming unassigned. `1`: target phase — guess the polarity recorded at the search's deepest trail so far, tracked separately from phase saving. `2`: periodic WalkSAT rephasing — like phase saving, except every so many restarts a short WalkSAT burst runs and its result overwrites the saved phase wholesale (if that burst happens to fully solve the problem on its own, that solution is reported directly). `3` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{0, 1, 2}` in turn. |
@@ -210,10 +210,8 @@ lengths, so with both defaulted in multi-threaded mode, every worker
 up to the twelfth (`lcm(4, 3)`) gets a genuinely unique combination of
 the two before any repeat, rather than the two rotations colliding on
 the same pairing every three workers (`reports/REPORT44.md`). The
-variable-selection round-robin (`val1=5`, `STAGE64.md`) cycles through
-5 entries for the same reason: 5 is coprime to both 4 and 3, so across
-60 workers every (heuristic, restart, phase) combination occurs. To get
-the earlier behavior of every worker using VSIDS, pass `--alg-params 2`.
+variable-selection heuristic (`val1`) is deliberately not rotated: every
+worker uses the same one (VSIDS unless you choose otherwise).
 
 ## Exit status
 

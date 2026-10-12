@@ -334,15 +334,13 @@ func runCDCL(problem *cnf.Problem, preResult *preprocess.Result, originalNumVars
 	// priori literature reasoning, so VSIDS is the default here
 	// (unlike dfs, which keeps its own Weighted default).
 	//
-	// STAGE64.md adds VMTF (4) and a round-robin portfolio choice (5),
-	// which becomes the default once --num-threads > 1 and no explicit
-	// --alg-params heuristic overrides it, following the same pattern
-	// the restart and phase strategies below use.
+	// STAGE65.md: VSIDS is the default for every thread count. Unlike the
+	// restart and phase strategies below, there is no per-worker rotation
+	// of heuristics: every worker uses the same one (STAGE64.md's
+	// brief round-robin choice was removed).
 	variant := cdcl.SelectVarVsids
 	if len(args.AlgParams) >= 1 && args.AlgParams[0] != nil {
 		variant = cdcl.SelectVarVariant(*args.AlgParams[0])
-	} else if args.NumThreads > 1 {
-		variant = cdcl.SelectVarRoundRobin
 	}
 
 	// STAGE15.md leaves the default restart strategy up to this

@@ -497,35 +497,7 @@ const (
 	// decision takes the first unassigned variable from the front. See
 	// vmtfBump and selectVarVmtf.
 	SelectVarVmtf SelectVarVariant = 4
-	// SelectVarRoundRobin (STAGE64.md) is the portfolio choice, like
-	// RestartRoundRobin and PhaseRoundRobin: worker i uses
-	// roundRobinVariants[i%5]. It is the default whenever --num-threads
-	// is above 1 and the caller gave no explicit heuristic. With one
-	// thread it resolves to worker 0's choice, VSIDS.
-	SelectVarRoundRobin SelectVarVariant = 5
 )
-
-// roundRobinVariants is SelectVarRoundRobin's resolution order: VSIDS,
-// VMTF, LRB, then VSIDS and VMTF once more. Its length is 5 on purpose.
-// The restart rotation has period 4 and the phase rotation period 3, and
-// 5 is coprime to both, so across enough workers every (heuristic,
-// restart, phase) combination occurs, rather than a worker's heuristic
-// always travelling with the same phase strategy (as it would with a
-// period of 3). VSIDS, the best measured single-heuristic default, and
-// VMTF, the cheapest per decision, get two slots each; LRB gets one.
-// The weighted and static-order heuristics are left out: they are
-// there for comparison, not as serious cdcl choices.
-var roundRobinVariants = [5]SelectVarVariant{SelectVarVsids, SelectVarVmtf, SelectVarLrb, SelectVarVsids, SelectVarVmtf}
-
-// resolveSelectVarVariant returns the concrete heuristic worker
-// threadIndex should use for variant: roundRobinVariants[threadIndex%5]
-// for SelectVarRoundRobin, and variant itself for every other value.
-func resolveSelectVarVariant(variant SelectVarVariant, threadIndex int) SelectVarVariant {
-	if variant == SelectVarRoundRobin {
-		return roundRobinVariants[threadIndex%len(roundRobinVariants)]
-	}
-	return variant
-}
 
 // RestartStrategy identifies which restart schedule maybeRestart
 // applies for --algorithm=cdcl (STAGE15.md; see the package doc
@@ -1186,7 +1158,7 @@ func Run(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVarian
 	if verbose >= 1 {
 		fmt.Println("cdcl:", describeParams(timeLimit, variant, restartStrategy, phaseStrategy)+describeMemoryLimit(memoryLimitBytes))
 	}
-	result := runLoop(problem, timeLimit, resolveSelectVarVariant(variant, 0), resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p, resolvePhaseStrategy(phaseStrategy, 0))
+	result := runLoop(problem, timeLimit, variant, resolveRestartStrategy(restartStrategy, 0), memoryLimitBytes, rng, nil, nil, nil, p, resolvePhaseStrategy(phaseStrategy, 0))
 	if verbose >= 1 {
 		fmt.Println(verdict(result))
 	}
@@ -1267,8 +1239,7 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 			defer wg.Done()
 			threadStrategy := resolveRestartStrategy(restartStrategy, i)
 			threadPhaseStrategy := resolvePhaseStrategy(phaseStrategy, i)
-			threadVariant := resolveSelectVarVariant(variant, i)
-			results[i] = runLoop(problem, timeLimit, threadVariant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
+			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
 			if !results[i].TimedOut && stop.CompareAndSwap(false, true) {
 				winner.Store(int32(i))
 			}
