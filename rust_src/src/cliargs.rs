@@ -311,8 +311,20 @@ Options:
                      (VSIDS and LRB scan every variable). Before the
                      first conflict it takes variables in increasing
                      order.
+                 5 = mode switching, after Kissat: alternates between
+                     a "focused" mode (VMTF with Glucose restarts) and
+                     a "stable" mode (VSIDS with quadratic restarts).
+                     With one thread, the search starts focused and
+                     switches mode at every restart. With more than
+                     one thread, each thread stays in one mode: a
+                     fraction of the threads (the internal parameter
+                     cdcl.vmtfThreadFraction, 0.5 by default) chosen at
+                     random run focused, the rest stable, with at least
+                     one thread of each. The restart strategy (val2) is
+                     ignored.
                Optional; defaults to 2 (VSIDS), unlike "dfs", which
-               defaults to 0, and the same for every thread.
+               defaults to 0, and the same for every thread (except
+               with val1 = 5).
                val2 = restart strategy: periodically abandons the
                      current decision stack and starts over from the
                      root, keeping every learned clause collected so
@@ -489,6 +501,7 @@ Options:
           cdcl.minimizeWorkBudgetFactor       integer, 0 to 1000000000
           cdcl.rephaseIntervalRestarts,
             rephaseMaxFlips                   integer >= 1
+          cdcl.vmtfThreadFraction             0 to 1
           preprocess.subsumptionWorkBudgetFactor,
             bveWorkBudgetFactor,
             bvaWorkBudgetFactor               integer, 0 to 1000000000
@@ -550,7 +563,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         if raw.algorithm == "cdcl" {
             if values.len() > 4 {
                 return Err(
-                    "for --algorithm=cdcl, --alg-params accepts at most four values (0-4 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)"
+                    "for --algorithm=cdcl, --alg-params accepts at most four values (0-5 selecting which SelectVar heuristic to use, 0-5 selecting the restart strategy, an optional learned-clause database memory limit, and 0-3 selecting the phase-selection strategy)"
                         .to_string(),
                 );
             }
@@ -813,10 +826,10 @@ fn validate(args: &Args) -> Result<(), String> {
             // cdcl::PhaseStrategy).
             if let Some(params) = &args.alg_params
                 && let Some(variant) = params[0]
-                && !(0..=4).contains(&variant)
+                && !(0..=5).contains(&variant)
             {
                 return Err(
-                    "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, 3, or 4 (selecting which SelectVar heuristic to use)"
+                    "for --algorithm=cdcl, the first --alg-params value must be 0, 1, 2, 3, 4, or 5 (selecting which SelectVar heuristic to use)"
                         .to_string(),
                 );
             }
@@ -1158,7 +1171,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_accepts_select_var_variant() {
-        for variant in [0i64, 1i64, 2i64, 3i64, 4i64] {
+        for variant in [0i64, 1i64, 2i64, 3i64, 4i64, 5i64] {
             let args = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",
@@ -1175,7 +1188,7 @@ mod tests {
 
     #[test]
     fn test_parse_cdcl_rejects_out_of_range_alg_params() {
-        for variant in ["5", "-1", "6"] {
+        for variant in ["6", "-1", "7"] {
             let result = Args::parse_from_args([
                 "vibe_sat",
                 "--input=problem.cnf",

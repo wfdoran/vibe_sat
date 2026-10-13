@@ -177,6 +177,8 @@ var rejectedParamCases = []paramCase{
 	{`{"cdcl":{"rephaseIntervalRestarts":0}}`, "cdcl.rephaseIntervalRestarts"},
 	{`{"cdcl":{"rephaseIntervalRestarts":-3}}`, "cdcl.rephaseIntervalRestarts"},
 	{`{"cdcl":{"rephaseMaxFlips":0}}`, "cdcl.rephaseMaxFlips"},
+	{`{"cdcl":{"vmtfThreadFraction":-0.1}}`, "cdcl.vmtfThreadFraction"},
+	{`{"cdcl":{"vmtfThreadFraction":1.5}}`, "cdcl.vmtfThreadFraction"},
 	{`{"preprocess":{"subsumptionWorkBudgetFactor":-1}}`, "preprocess.subsumptionWorkBudgetFactor"},
 	{`{"preprocess":{"bveWorkBudgetFactor":-1}}`, "preprocess.bveWorkBudgetFactor"},
 }
@@ -197,6 +199,8 @@ var acceptedParamCases = []string{
 	`{"cdcl":{"glucoseK":1000}}`,
 	`{"cdcl":{"minimizeWorkBudgetFactor":0}}`,
 	`{"cdcl":{"rephaseIntervalRestarts":1,"rephaseMaxFlips":1}}`,
+	`{"cdcl":{"vmtfThreadFraction":0}}`,
+	`{"cdcl":{"vmtfThreadFraction":1}}`,
 	`{"preprocess":{"subsumptionWorkBudgetFactor":0,"bveWorkBudgetFactor":0}}`,
 	`{}`,
 }

@@ -167,6 +167,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, RngExt, SeedableRng};
 
 use crate::assignment::{self, Assignment, Value};
@@ -212,6 +213,21 @@ pub enum SelectVarVariant {
     /// takes the first unassigned variable from the front. See
     /// [`VmtfState`].
     Vmtf,
+    /// STAGE66.md's Kissat-style mode switching (Chanseok Oh, "Between
+    /// SAT and UNSAT: The Fundamental Difference in CDCL SAT," SAT 2015,
+    /// is the usual origin cited for the idea of alternating between
+    /// modes; citation from memory, not re-checked). Like
+    /// [`RestartStrategy::RoundRobin`], it is meaningful only as a
+    /// request: a single-threaded run starts in a "focused" mode (VMTF
+    /// with Glucose restarts) and flips to a "stable" mode (VSIDS with
+    /// quadratic restarts) at every restart, and back again at the next
+    /// one; the solver's own `variant` always holds the active mode's
+    /// concrete heuristic ([`SelectVarVariant::Vmtf`] or
+    /// [`SelectVarVariant::Vsids`]), never this value. In
+    /// [`run_parallel`], each worker instead gets one fixed mode (see
+    /// [`switch_mode_assignment`]). The restart strategy argument is
+    /// ignored in either case.
+    Switch,
 }
 
 /// Identifies which restart schedule [`maybe_restart`] applies for
@@ -646,6 +662,7 @@ fn maybe_restart<R: Rng>(
     restart_strategy: RestartStrategy,
     conflicts_since_restart: &mut usize,
     restart_count: &mut usize,
+    schedule_index: usize,
     trail: &mut Vec<usize>,
     trail_lim: &mut Vec<usize>,
     x: &mut Assignment,
@@ -674,7 +691,7 @@ fn maybe_restart<R: Rng>(
         if !glucose_should_restart(glucose, p.glucose_k) {
             return None;
         }
-    } else if *conflicts_since_restart < restart_threshold(restart_strategy, *restart_count, p) {
+    } else if *conflicts_since_restart < restart_threshold(restart_strategy, schedule_index, p) {
         return None;
     }
     backtrack_to(
@@ -702,6 +719,43 @@ fn maybe_restart<R: Rng>(
         saved_phase,
         rng,
     )
+}
+
+/// STAGE66.md's mode switch: focused (VMTF, Glucose restarts) becomes
+/// stable (VSIDS, quadratic restarts) and vice versa. Only the active
+/// mode's structure is bumped, so the idle one simply goes stale until
+/// its next turn (Kissat does the same). Glucose's moving averages keep
+/// running through stable stretches ([`record_lbd`] always updates them).
+fn flip_mode(
+    variant: &mut SelectVarVariant,
+    restart_strategy: &mut RestartStrategy,
+    vsids_restarts: &mut usize,
+) {
+    if *variant == SelectVarVariant::Vmtf {
+        *variant = SelectVarVariant::Vsids;
+        *restart_strategy = RestartStrategy::Polynomial;
+    } else {
+        *vsids_restarts += 1;
+        *variant = SelectVarVariant::Vmtf;
+        *restart_strategy = RestartStrategy::Glucose;
+    }
+}
+
+/// STAGE66.md's multi-threaded mode split: returns, for each of
+/// `num_threads` workers, whether it runs the focused mode (`true`: VMTF
+/// with Glucose restarts) or the stable one (`false`: VSIDS with
+/// quadratic restarts). `round(fraction * num_threads)` workers are
+/// focused, clamped so that at least one worker has each mode, and which
+/// ones is chosen at random with `rng`. `num_threads` must be at least 2.
+fn switch_mode_assignment<R: Rng>(num_threads: usize, fraction: f64, rng: &mut R) -> Vec<bool> {
+    let num_focused = ((fraction * num_threads as f64).round() as usize).clamp(1, num_threads - 1);
+    let mut order: Vec<usize> = (0..num_threads).collect();
+    order.shuffle(rng);
+    let mut focused = vec![false; num_threads];
+    for &i in &order[..num_focused] {
+        focused[i] = true;
+    }
+    focused
 }
 
 /// STAGE43.md's hook into every restart: a no-op unless
@@ -880,6 +934,10 @@ struct VmtfState {
     search: usize,
     counter: usize,
     analyzed: Vec<usize>,
+    /// STAGE66.md: keep the search cursor valid in [`backtrack_to`] even
+    /// while `variant` is not `Vmtf` (the stable half of mode switching,
+    /// whose list is used again at the next flip).
+    keep_cursor: bool,
 }
 
 impl VmtfState {
@@ -910,6 +968,7 @@ impl VmtfState {
             search: 1,
             counter: num_vars,
             analyzed: Vec::new(),
+            keep_cursor: false,
         }
     }
 
@@ -1218,6 +1277,12 @@ pub fn run_parallel<R: Rng>(
     let stop = AtomicBool::new(false);
     let winner = AtomicI32::new(-1);
 
+    // STAGE66.md: with SelectVarVariant::Switch each worker gets one
+    // fixed mode (focused = VMTF + Glucose, stable = VSIDS + quadratic)
+    // and the restart strategy argument is ignored.
+    let focused: Option<Vec<bool>> = (variant == SelectVarVariant::Switch)
+        .then(|| switch_mode_assignment(num_threads, p.vmtf_thread_fraction, rng));
+
     let mut results: Vec<SolveResult> = Vec::new();
     thread::scope(|scope| {
         let handles: Vec<_> = sub_rngs
@@ -1228,8 +1293,18 @@ pub fn run_parallel<R: Rng>(
                 let peers = &peers_for_worker[i];
                 let stop = &stop;
                 let winner = &winner;
-                let thread_strategy = resolve_restart_strategy(restart_strategy, i);
+                let mut thread_strategy = resolve_restart_strategy(restart_strategy, i);
                 let thread_phase_strategy = resolve_phase_strategy(phase_strategy, i);
+                let mut thread_variant = variant;
+                if let Some(focused) = &focused {
+                    if focused[i] {
+                        thread_variant = SelectVarVariant::Vmtf;
+                        thread_strategy = RestartStrategy::Glucose;
+                    } else {
+                        thread_variant = SelectVarVariant::Vsids;
+                        thread_strategy = RestartStrategy::Polynomial;
+                    }
+                }
 
                 scope.spawn(move || {
                     // The winner CAS must happen here, inside this
@@ -1241,7 +1316,7 @@ pub fn run_parallel<R: Rng>(
                     let result = run_loop(
                         problem,
                         time_limit,
-                        variant,
+                        thread_variant,
                         thread_strategy,
                         memory_limit_bytes,
                         sub_rng,
@@ -1373,6 +1448,24 @@ fn run_loop<R: Rng>(
     // bootstrap time on top of the requested budget.
     let start_time = Instant::now();
 
+    // STAGE66.md: a switching solver starts in focused mode; `variant`
+    // and `restart_strategy` then always describe the active mode and
+    // are flipped at every restart (see flip_mode). `vsids_restarts`
+    // counts finished stable stretches and indexes the quadratic
+    // schedule, which would otherwise advance twice as fast.
+    let switching = variant == SelectVarVariant::Switch;
+    let mut variant = if switching {
+        SelectVarVariant::Vmtf
+    } else {
+        variant
+    };
+    let mut restart_strategy = if switching {
+        RestartStrategy::Glucose
+    } else {
+        restart_strategy
+    };
+    let mut vsids_restarts = 0usize;
+
     // A problem with no variables can only contain empty clauses (no
     // literal can reference a variable beyond num_vars), each of
     // which is unsatisfiable by construction; guard this degenerate
@@ -1486,6 +1579,8 @@ fn run_loop<R: Rng>(
     // STAGE64.md's VMTF list; always allocated like vsids/lrb, but only
     // ever read or written when variant is Vmtf.
     let mut vmtf = VmtfState::new(problem.num_vars);
+    // STAGE66.md: the cursor must stay valid through the stable mode.
+    vmtf.keep_cursor = switching;
     // STAGE49.md: the annealed learning-rate weight, starting at
     // p.lrb_alpha and decayed once per conflict (see the
     // LRB_ALPHA_DECAY_STEP doc comment) down to LRB_ALPHA_FLOOR.
@@ -1735,10 +1830,17 @@ fn run_loop<R: Rng>(
             );
 
             conflicts_since_restart += 1;
+            let restarts_before = restart_count;
+            let schedule_index = if switching {
+                vsids_restarts
+            } else {
+                restart_count
+            };
             if let Some(solution) = maybe_restart(
                 restart_strategy,
                 &mut conflicts_since_restart,
                 &mut restart_count,
+                schedule_index,
                 &mut trail,
                 &mut trail_lim,
                 &mut x,
@@ -1770,6 +1872,9 @@ fn run_loop<R: Rng>(
                     num_conflicts,
                     timed_out: false,
                 };
+            }
+            if switching && restart_count != restarts_before {
+                flip_mode(&mut variant, &mut restart_strategy, &mut vsids_restarts);
             }
             continue;
         }
@@ -1814,6 +1919,8 @@ fn run_loop<R: Rng>(
             }
             SelectVarVariant::Lrb => select_var_by_activity(&lrb.q, &x, problem.num_vars),
             SelectVarVariant::Vmtf => vmtf.select(&x),
+            // run_loop resolves Switch into Vmtf or Vsids before this.
+            SelectVarVariant::Switch => unreachable!("Switch is resolved by run_loop"),
         };
         current_level += 1;
         trail_lim.push(trail.len());
@@ -2799,7 +2906,7 @@ fn backtrack_to(
         }
         saved_phase[v] = x[v];
         x[v] = Value::Unassigned;
-        if variant == SelectVarVariant::Vmtf {
+        if variant == SelectVarVariant::Vmtf || vmtf.keep_cursor {
             vmtf.on_unassign(v); // keep "everything newer than the cursor is assigned"
         }
     }
@@ -3093,6 +3200,7 @@ fn describe_params(
         SelectVarVariant::Vsids => 2,
         SelectVarVariant::Lrb => 3,
         SelectVarVariant::Vmtf => 4,
+        SelectVarVariant::Switch => 5,
     };
     // STAGE44.md swaps which numeral is which (Glucose 5 -> 4,
     // RoundRobin 4 -> 5) to match cliargs' own --alg-params mapping.
@@ -3110,12 +3218,18 @@ fn describe_params(
         PhaseStrategy::RephaseWalkSAT => 2,
         PhaseStrategy::RoundRobin => 3,
     };
+    // STAGE66.md: mode switching ignores the restart strategy argument.
+    let restart_text = if variant == SelectVarVariant::Switch {
+        "auto".to_string()
+    } else {
+        restart_code.to_string()
+    };
     match time_limit {
         Some(limit) => format!(
-            "select_var={variant_code} restart={restart_code} phase={phase_code} time_limit_secs={}",
+            "select_var={variant_code} restart={restart_text} phase={phase_code} time_limit_secs={}",
             limit.as_secs()
         ),
-        None => format!("select_var={variant_code} restart={restart_code} phase={phase_code}"),
+        None => format!("select_var={variant_code} restart={restart_text} phase={phase_code}"),
     }
 }
 
@@ -4404,6 +4518,7 @@ mod tests {
             RestartStrategy::Glucose,
             &mut conflicts_since_restart,
             &mut restart_count,
+            0,
             &mut trail,
             &mut trail_lim,
             &mut x,
@@ -5200,6 +5315,7 @@ mod tests {
             RestartStrategy::None,
             &mut conflicts_since_restart,
             &mut restart_count,
+            0,
             &mut trail,
             &mut trail_lim,
             &mut x,
@@ -5296,6 +5412,7 @@ mod tests {
             RestartStrategy::Luby,
             &mut conflicts_since_restart,
             &mut restart_count,
+            0,
             &mut trail,
             &mut trail_lim,
             &mut x,
@@ -5326,6 +5443,7 @@ mod tests {
             RestartStrategy::Luby,
             &mut conflicts_since_restart,
             &mut restart_count,
+            0,
             &mut trail,
             &mut trail_lim,
             &mut x,
@@ -7185,6 +7303,206 @@ mod tests {
                 let value = result.assignment[cnf::literal_var(lit)];
                 (lit > 0 && value == Value::True) || (lit < 0 && value == Value::False)
             }));
+        }
+    }
+
+    /// STAGE66.md: `flip_mode` alternates VMTF/Glucose and
+    /// VSIDS/quadratic, and only finished stable stretches advance the
+    /// quadratic schedule's index.
+    #[test]
+    fn test_flip_mode_alternates_and_counts_stable_stretches() {
+        let mut variant = SelectVarVariant::Vmtf;
+        let mut strategy = RestartStrategy::Glucose;
+        let mut vsids_restarts = 0usize;
+        for i in 0..6usize {
+            let focused_before = i % 2 == 0;
+            assert_eq!(variant == SelectVarVariant::Vmtf, focused_before);
+            flip_mode(&mut variant, &mut strategy, &mut vsids_restarts);
+            if focused_before {
+                assert_eq!(variant, SelectVarVariant::Vsids);
+                assert_eq!(strategy, RestartStrategy::Polynomial);
+            } else {
+                assert_eq!(variant, SelectVarVariant::Vmtf);
+                assert_eq!(strategy, RestartStrategy::Glucose);
+            }
+            assert_eq!(vsids_restarts, i.div_ceil(2));
+        }
+    }
+
+    /// STAGE66.md: single-threaded mode switching agrees with brute
+    /// force, with restart parameters small enough that many mode flips
+    /// happen (and so the VMTF cursor is exercised across modes).
+    #[test]
+    fn test_run_switch_agrees_with_brute_force() {
+        let mut p = params::default().cdcl;
+        p.polynomial_base_conflicts = 1;
+        p.glucose_window_size = 2;
+        let mut rng = StdRng::seed_from_u64(66);
+        for trial in 0..150u64 {
+            let num_vars = 8 + rng.random_range(0..5usize);
+            let num_clauses = (4.3 * num_vars as f64) as usize;
+            let mut clauses: Vec<Clause> = Vec::new();
+            while clauses.len() < num_clauses {
+                let mut clause: Clause = Vec::new();
+                while clause.len() < 3 {
+                    let v = 1 + rng.random_range(0..num_vars) as Literal;
+                    if clause.iter().any(|&l| l.abs() == v) {
+                        continue;
+                    }
+                    clause.push(if rng.random_range(0..2) == 0 { -v } else { v });
+                }
+                clauses.push(clause);
+            }
+            let problem = Problem {
+                num_vars,
+                clauses: clauses.clone(),
+            };
+            let want = vmtf_brute_force_satisfiable(num_vars, &clauses);
+            let mut run_rng = StdRng::seed_from_u64(trial);
+            let result = run(
+                &problem,
+                None,
+                SelectVarVariant::Switch,
+                RestartStrategy::None,
+                None,
+                &mut run_rng,
+                0,
+                &p,
+                PhaseStrategy::Saving,
+            );
+            assert!(
+                !result.timed_out && result.satisfiable == want,
+                "trial {trial}: satisfiable={} timed_out={}, brute force says {want}\n{clauses:?}",
+                result.satisfiable,
+                result.timed_out
+            );
+            if result.satisfiable {
+                for clause in &clauses {
+                    assert!(
+                        clause.iter().any(|&lit| {
+                            let value = result.assignment[cnf::literal_var(lit)];
+                            (lit > 0 && value == Value::True) || (lit < 0 && value == Value::False)
+                        }),
+                        "trial {trial}: clause {clause:?} not satisfied"
+                    );
+                }
+            }
+        }
+    }
+
+    /// STAGE66.md: switching still proves a formula that needs many
+    /// conflicts UNSAT.
+    #[test]
+    fn test_run_switch_proves_unsatisfiable_pigeonhole() {
+        let mut p = params::default().cdcl;
+        p.polynomial_base_conflicts = 3;
+        let mut rng = StdRng::seed_from_u64(9);
+        let result = run(
+            &pigeonhole_problem(6, 5),
+            None,
+            SelectVarVariant::Switch,
+            RestartStrategy::None,
+            None,
+            &mut rng,
+            0,
+            &p,
+            PhaseStrategy::Saving,
+        );
+        assert!(!result.satisfiable && !result.timed_out);
+    }
+
+    /// STAGE66.md: the multi-threaded split has round(fraction * n)
+    /// focused workers clamped to [1, n - 1], and a seed fixes which.
+    #[test]
+    fn test_switch_mode_assignment() {
+        let cases: [(usize, f64, usize); 13] = [
+            (2, 0.5, 1),
+            (2, 0.0, 1),
+            (2, 1.0, 1),
+            (4, 0.5, 2),
+            (4, 0.25, 1),
+            (4, 0.75, 3),
+            (4, 0.01, 1),
+            (4, 0.99, 3),
+            (5, 0.5, 3),
+            (8, 0.5, 4),
+            (8, 1.0, 7),
+            (8, 0.0, 1),
+            (3, 0.5, 2),
+        ];
+        for (n, fraction, want) in cases {
+            let got = switch_mode_assignment(n, fraction, &mut StdRng::seed_from_u64(5));
+            let count = got.iter().filter(|&&f| f).count();
+            assert_eq!(got.len(), n);
+            assert_eq!(count, want, "n={n} fraction={fraction}");
+            let again = switch_mode_assignment(n, fraction, &mut StdRng::seed_from_u64(5));
+            assert_eq!(got, again, "same seed must pick the same threads");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..40u64 {
+            seen.insert(switch_mode_assignment(
+                6,
+                0.5,
+                &mut StdRng::seed_from_u64(seed),
+            ));
+        }
+        assert!(
+            seen.len() >= 5,
+            "only {} distinct assignments over 40 seeds",
+            seen.len()
+        );
+    }
+
+    /// STAGE66.md: multi-threaded switching on an UNSAT and a SAT
+    /// formula, including the extreme fractions.
+    #[test]
+    fn test_run_parallel_with_switch() {
+        for fraction in [0.0, 0.5, 1.0] {
+            let mut p = params::default().cdcl;
+            p.vmtf_thread_fraction = fraction;
+
+            let mut rng = StdRng::seed_from_u64(3);
+            let result = run_parallel(
+                &pigeonhole_problem(6, 5),
+                None,
+                SelectVarVariant::Switch,
+                RestartStrategy::RoundRobin,
+                None,
+                4,
+                &mut rng,
+                0,
+                &p,
+                PhaseStrategy::RoundRobin,
+            );
+            assert!(
+                !result.satisfiable && !result.timed_out,
+                "fraction {fraction}"
+            );
+
+            let sat = pigeonhole_problem(5, 5);
+            let mut rng = StdRng::seed_from_u64(4);
+            let result = run_parallel(
+                &sat,
+                None,
+                SelectVarVariant::Switch,
+                RestartStrategy::RoundRobin,
+                None,
+                4,
+                &mut rng,
+                0,
+                &p,
+                PhaseStrategy::RoundRobin,
+            );
+            assert!(
+                result.satisfiable,
+                "fraction {fraction}: 5 pigeons in 5 holes"
+            );
+            for clause in &sat.clauses {
+                assert!(clause.iter().any(|&lit| {
+                    let value = result.assignment[cnf::literal_var(lit)];
+                    (lit > 0 && value == Value::True) || (lit < 0 && value == Value::False)
+                }));
+            }
         }
     }
 }

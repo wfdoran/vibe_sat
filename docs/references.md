@@ -69,6 +69,11 @@ flagged explicitly where that happened).
   Variable Move-To-Front (VMTF) heuristic `cdcl` implements as
   `--alg-params` `val1=4`. Both citations are from memory and were not
   re-checked when added. (`reports/REPORT64.md`)
+- Chanseok Oh, "Between SAT and UNSAT: The Fundamental Difference in
+  CDCL SAT," SAT 2015. Cited for the idea of alternating a "focused" and
+  a "stable" search mode, which Kissat uses and `cdcl` approximates with
+  `--alg-params` `val1=5`. From memory, not re-checked when added.
+  (`reports/REPORT66.md`)
 - Cherif, "Combining VSIDS and CHB Using Restarts," CP 2021. Consulted
   for context on modern branching-heuristic combinations; not
   implemented directly. (`reports/REPORT7.md`)

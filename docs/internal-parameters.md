@@ -41,6 +41,7 @@ A parameter's JSON key (where it has one) is the name used inside
 | `minimizeWorkBudgetFactor` | `20` | same | Scales `minimizeClause`'s hard work-budget cap (`factor * n * (bits.Len(n)+1)`), bounding how much recursive-minimization work one learned clause can cost. |
 | `rephaseIntervalRestarts` | `50` | `cdcl.go` / `cdcl/mod.rs` | How many restarts elapse between periodic WalkSAT rephasing bursts (`--alg-params` val4=2, `STAGE43.md`); meaningless for every other phase strategy. |
 | `rephaseMaxFlips` | `1000` | same | Caps how many flips one WalkSAT rephasing burst may make, so the periodic "nudge" stays cheap relative to how rarely it fires. |
+| `vmtfThreadFraction` | `0.5` | `cdcl.go` / `cdcl/mod.rs` | With `--alg-params` val1=5 and more than one thread, the share of threads that run the focused mode (VMTF, Glucose restarts); the rest run the stable mode (VSIDS, quadratic restarts). The count is `round(fraction × threads)`, clamped so at least one thread has each mode; which threads is random. Meaningless for every other configuration (`STAGE66.md`). |
 
 ### `preprocess` section
 
@@ -79,6 +80,7 @@ exact wording of that message differs between the two languages).
 | `cdcl.minimizeWorkBudgetFactor` | integer, 0 to 1,000,000,000 | 0 leaves minimization no work budget. |
 | `cdcl.rephaseIntervalRestarts` | integer, at least 1 | |
 | `cdcl.rephaseMaxFlips` | integer, at least 1 | |
+| `cdcl.vmtfThreadFraction` | number, 0 to 1 | 0 and 1 are allowed; the thread count is still clamped to leave one thread of each mode. |
 | `preprocess.subsumptionWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
 | `preprocess.bveWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
 | `preprocess.bvaWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count; 0 turns Bounded Variable Addition off. |

@@ -497,6 +497,20 @@ const (
 	// decision takes the first unassigned variable from the front. See
 	// vmtfBump and selectVarVmtf.
 	SelectVarVmtf SelectVarVariant = 4
+	// SelectVarSwitch is STAGE66.md's Kissat-style mode switching
+	// (Chanseok Oh, "Between SAT and UNSAT: The Fundamental Difference
+	// in CDCL SAT," SAT 2015, is the usual origin cited for the idea of
+	// alternating between modes; citation from memory, not re-checked).
+	// Like RestartRoundRobin, it is meaningful only as a request: a
+	// single-threaded run starts in a "focused" mode (VMTF with Glucose
+	// restarts) and flips to a "stable" mode (VSIDS with quadratic
+	// restarts) at every restart, and back again at the next one; the
+	// solver's own variant field always holds the active mode's
+	// concrete heuristic (SelectVarVmtf or SelectVarVsids), never this
+	// value. In RunParallel, each worker instead gets one fixed mode
+	// (see switchModeVariants). The restart strategy argument is
+	// ignored in either case.
+	SelectVarSwitch SelectVarVariant = 5
 )
 
 // RestartStrategy identifies which restart schedule maybeRestart
@@ -791,6 +805,16 @@ type solver struct {
 	// (STAGE13.md); fixed for the lifetime of one solver/Run call.
 	variant SelectVarVariant
 
+	// switching is STAGE66.md's mode-switching flag: true when this
+	// solver was built with SelectVarSwitch, in which case variant and
+	// restartStrategy always describe the *active* mode and maybeRestart
+	// flips both at every restart. vsidsRestarts counts restarts that
+	// ended a stable (VSIDS) stretch; it, not restartCount, indexes the
+	// quadratic schedule, which would otherwise advance twice as fast
+	// as the stable stretches it is meant to space out.
+	switching     bool
+	vsidsRestarts int
+
 	// varActivity holds one VSIDS activity score per variable
 	// (SelectVarVsids only), sized numVars+1, bumped in analyze and
 	// decayed in learnAndBackjump exactly like clauseActivity, but
@@ -1058,7 +1082,16 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		lrbReasonedEpoch[v] = -1
 	}
 
+	// STAGE66.md: a switching solver starts in focused mode. initVmtf
+	// below runs for it too, and backtrackTo keeps the VMTF cursor
+	// valid while the stable (VSIDS) mode is the active one.
+	switching := variant == SelectVarSwitch
+	if switching {
+		variant = SelectVarVmtf
+		restartStrategy = RestartGlucose
+	}
 	s = &solver{
+		switching:               switching,
 		numVars:                 problem.NumVars,
 		clauses:                 clauses,
 		watch:                   watch,
@@ -1225,6 +1258,14 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 	var winner atomic.Int32
 	winner.Store(-1)
 
+	// STAGE66.md: with SelectVarSwitch each worker gets one fixed mode
+	// (focused = VMTF + Glucose, stable = VSIDS + quadratic) and the
+	// restart strategy argument is ignored.
+	var focused []bool
+	if variant == SelectVarSwitch {
+		focused = switchModeAssignment(numThreads, p.VmtfThreadFraction, rng)
+	}
+
 	results := make([]Result, numThreads)
 	var wg sync.WaitGroup
 	for i := 0; i < numThreads; i++ {
@@ -1239,7 +1280,15 @@ func RunParallel(problem *cnf.Problem, timeLimit *time.Duration, variant SelectV
 			defer wg.Done()
 			threadStrategy := resolveRestartStrategy(restartStrategy, i)
 			threadPhaseStrategy := resolvePhaseStrategy(phaseStrategy, i)
-			results[i] = runLoop(problem, timeLimit, variant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
+			threadVariant := variant
+			if focused != nil {
+				if focused[i] {
+					threadVariant, threadStrategy = SelectVarVmtf, RestartGlucose
+				} else {
+					threadVariant, threadStrategy = SelectVarVsids, RestartPolynomial
+				}
+			}
+			results[i] = runLoop(problem, timeLimit, threadVariant, threadStrategy, memoryLimitBytes, subRands[i], &stop, exportBuffers[i], peers, p, threadPhaseStrategy)
 			if !results[i].TimedOut && stop.CompareAndSwap(false, true) {
 				winner.Store(int32(i))
 			}
@@ -1354,6 +1403,23 @@ func runLoop(problem *cnf.Problem, timeLimit *time.Duration, variant SelectVarVa
 
 		s.decide(rng)
 	}
+}
+
+// switchModeAssignment is STAGE66.md's multi-threaded mode split: it
+// returns, for each of numThreads workers, whether it runs the focused
+// mode (true: VMTF with Glucose restarts) or the stable one (false: VSIDS
+// with quadratic restarts). round(fraction*numThreads) workers are
+// focused, clamped so that at least one worker has each mode, and which
+// ones is chosen at random with rng. numThreads must be at least 2.
+func switchModeAssignment(numThreads int, fraction float64, rng *rand.Rand) []bool {
+	numFocused := int(math.Round(fraction * float64(numThreads)))
+	numFocused = max(1, min(numThreads-1, numFocused))
+	order := rng.Perm(numThreads)
+	focused := make([]bool, numThreads)
+	for _, i := range order[:numFocused] {
+		focused[i] = true
+	}
+	return focused
 }
 
 // verdict formats a Result's outcome for the "SAT"/"UNSAT"/"UNKNOWN"
@@ -1890,19 +1956,52 @@ func (s *solver) maybeRestart(rng *rand.Rand) {
 		if !s.glucoseShouldRestart() {
 			return
 		}
-		s.backtrackTo(0)
-		s.conflictsSinceRestart = 0
-		s.restartCount++
-		s.maybeRephase(rng)
+		s.restart(rng)
 		return
 	}
 	if s.conflictsSinceRestart < s.restartThreshold() {
 		return
 	}
+	s.restart(rng)
+}
+
+// restart abandons the decision stack, bumps the restart counters and
+// rephases if due; under STAGE66.md's mode switching it also flips the
+// solver into the other mode (see flipMode).
+func (s *solver) restart(rng *rand.Rand) {
 	s.backtrackTo(0)
 	s.conflictsSinceRestart = 0
 	s.restartCount++
+	if s.switching {
+		s.flipMode()
+	}
 	s.maybeRephase(rng)
+}
+
+// flipMode is STAGE66.md's mode switch: focused (VMTF, Glucose restarts)
+// becomes stable (VSIDS, quadratic restarts) and vice versa. Only the
+// active mode's structure is bumped, so the idle one simply goes stale
+// until its next turn (Kissat does the same). Glucose's moving averages
+// keep running through stable stretches (recordLBD always updates them).
+func (s *solver) flipMode() {
+	if s.variant == SelectVarVmtf {
+		s.variant = SelectVarVsids
+		s.restartStrategy = RestartPolynomial
+		return
+	}
+	s.vsidsRestarts++
+	s.variant = SelectVarVmtf
+	s.restartStrategy = RestartGlucose
+}
+
+// scheduleIndex is the restart index the Luby/quadratic/geometric
+// schedules are evaluated at: restartCount, except in switching mode
+// where only stable stretches count (see solver.vsidsRestarts).
+func (s *solver) scheduleIndex() int {
+	if s.switching {
+		return s.vsidsRestarts
+	}
+	return s.restartCount
 }
 
 // maybeRephase is STAGE43.md's hook into every restart: a no-op
@@ -2059,12 +2158,12 @@ func (s *solver) glucoseShouldRestart() bool {
 func (s *solver) restartThreshold() int {
 	switch s.restartStrategy {
 	case RestartLuby:
-		return s.params.LubyBaseConflicts * lubyTerm(s.restartCount)
+		return s.params.LubyBaseConflicts * lubyTerm(s.scheduleIndex())
 	case RestartPolynomial:
-		k := s.restartCount + 1
+		k := s.scheduleIndex() + 1
 		return s.params.PolynomialBaseConflicts * k * k
 	case RestartGeometric:
-		return geometricRestartThreshold(s.params.GeometricBaseConflicts, s.params.GeometricGrowthFactor, s.restartCount)
+		return geometricRestartThreshold(s.params.GeometricBaseConflicts, s.params.GeometricGrowthFactor, s.scheduleIndex())
 	default: // RestartNone; never actually consulted (see maybeRestart)
 		return 0
 	}
@@ -2442,7 +2541,7 @@ func (s *solver) backtrackTo(level int) {
 		}
 		s.savedPhase[v] = s.x[v] // STAGE14.md: remember this polarity for decide's next guess
 		s.x[v] = assign.Unassigned
-		if s.variant == SelectVarVmtf && s.vmtfStamp[v] > s.vmtfStamp[s.vmtfSearch] {
+		if s.vmtfStamp != nil && s.vmtfStamp[v] > s.vmtfStamp[s.vmtfSearch] {
 			s.vmtfSearch = v // keep "everything newer than the cursor is assigned"
 		}
 	}
@@ -2715,6 +2814,9 @@ func isTrue(lit cnf.Literal, assignment assign.Assignment) bool {
 // variant for the "cdcl:" announcement printed at verbose level 1.
 func describeParams(timeLimit *time.Duration, variant SelectVarVariant, restartStrategy RestartStrategy, phaseStrategy PhaseStrategy) string {
 	description := fmt.Sprintf("select_var=%d restart=%d phase=%d", variant, restartStrategy, phaseStrategy)
+	if variant == SelectVarSwitch {
+		description = fmt.Sprintf("select_var=%d restart=auto phase=%d", variant, phaseStrategy)
+	}
 	if timeLimit != nil {
 		description += fmt.Sprintf(" time_limit_secs=%d", int(timeLimit.Seconds()))
 	}

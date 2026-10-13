@@ -136,6 +136,13 @@ bookkeeping:
   per decision on large formulas. On this project's small random 3-SAT
   benchmarks it was clearly weaker than VSIDS or LRB (`reports/REPORT64.md`
   has the numbers).
+- **Mode switching** (`val1=5`) combines two of the above the way Kissat does:
+  a *focused* mode (VMTF with fast, data-driven Glucose restarts) and a
+  *stable* mode (VSIDS with slow quadratic restarts). A single thread starts
+  focused and flips mode at every restart; with several threads, each thread
+  keeps one mode. Only the active mode's structure is updated, so the other
+  one is stale when its turn comes back. See `reports/REPORT66.md` for what it
+  measured.
 
 Before any conflict has happened, all three behave like the static order:
 no variable has been bumped yet, so decisions walk the variables from the

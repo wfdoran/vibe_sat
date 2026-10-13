@@ -63,6 +63,13 @@ type CDCL struct {
 	// other PhaseStrategy, which never read either field.
 	RephaseIntervalRestarts int `json:"rephaseIntervalRestarts"`
 	RephaseMaxFlips         int `json:"rephaseMaxFlips"`
+
+	// VmtfThreadFraction is STAGE66.md's share of a multi-threaded
+	// --alg-params val1=5 run's workers that run the focused mode (VMTF
+	// with Glucose restarts); the rest run the stable mode (VSIDS with
+	// quadratic restarts). The count is rounded and clamped to leave at
+	// least one worker of each kind. Read by no other configuration.
+	VmtfThreadFraction float64 `json:"vmtfThreadFraction"`
 }
 
 // Preprocess holds Stage-8 preprocessing's runtime-configurable
@@ -110,6 +117,7 @@ func Default() Params {
 			MinimizeWorkBudgetFactor: 20,
 			RephaseIntervalRestarts:  50,
 			RephaseMaxFlips:          1000,
+			VmtfThreadFraction:       0.5,
 		},
 		Preprocess: Preprocess{
 			SubsumptionWorkBudgetFactor: 64,
@@ -191,6 +199,7 @@ func validate(p Params) error {
 		rangeInt("cdcl.minimizeWorkBudgetFactor", c.MinimizeWorkBudgetFactor, 0, MaxScaleFactor),
 		minInt("cdcl.rephaseIntervalRestarts", c.RephaseIntervalRestarts, 1),
 		minInt("cdcl.rephaseMaxFlips", c.RephaseMaxFlips, 1),
+		closedUnitFloat("cdcl.vmtfThreadFraction", c.VmtfThreadFraction),
 		rangeInt("preprocess.subsumptionWorkBudgetFactor", p.Preprocess.SubsumptionWorkBudgetFactor, 0, MaxScaleFactor),
 		rangeInt("preprocess.bveWorkBudgetFactor", p.Preprocess.BVEWorkBudgetFactor, 0, MaxScaleFactor),
 		rangeInt("preprocess.bvaWorkBudgetFactor", p.Preprocess.BVAWorkBudgetFactor, 0, MaxScaleFactor),
@@ -242,6 +251,14 @@ func positiveFloat(key string, v float64) error {
 func unitFloat(key string, v float64) error {
 	if !(v > 0 && v <= 1) {
 		return fmt.Errorf("%s must be greater than 0 and at most 1 (got %v)", key, v)
+	}
+	return nil
+}
+
+// closedUnitFloat returns an error naming key unless 0 <= v <= 1.
+func closedUnitFloat(key string, v float64) error {
+	if !(v >= 0 && v <= 1) {
+		return fmt.Errorf("%s must be between 0 and 1 (got %v)", key, v)
 	}
 	return nil
 }

@@ -404,6 +404,7 @@ fn run_cdcl(
         Some([Some(2), ..]) => cdcl::SelectVarVariant::Vsids,
         Some([Some(3), ..]) => cdcl::SelectVarVariant::Lrb,
         Some([Some(4), ..]) => cdcl::SelectVarVariant::Vmtf,
+        Some([Some(5), ..]) => cdcl::SelectVarVariant::Switch,
         _ => cdcl::SelectVarVariant::Vsids,
     };
 

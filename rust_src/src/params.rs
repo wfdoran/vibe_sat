@@ -50,6 +50,12 @@ pub struct Cdcl {
     /// Meaningless for every other `PhaseStrategy`.
     pub rephase_interval_restarts: usize,
     pub rephase_max_flips: usize,
+    /// STAGE66.md's share of a multi-threaded `--alg-params` val1=5
+    /// run's workers that run the focused mode (VMTF with Glucose
+    /// restarts); the rest run the stable mode (VSIDS with quadratic
+    /// restarts). The count is rounded and clamped to leave at least
+    /// one worker of each kind. Read by no other configuration.
+    pub vmtf_thread_fraction: f64,
 }
 
 /// Runtime-configurable tuning constants for `preprocess` (STAGE39.md).
@@ -95,6 +101,7 @@ pub fn default() -> Params {
             minimize_work_budget_factor: 20,
             rephase_interval_restarts: 50,
             rephase_max_flips: 1000,
+            vmtf_thread_fraction: 0.5,
         },
         preprocess: Preprocess {
             subsumption_work_budget_factor: 64,
@@ -165,6 +172,7 @@ struct Fields {
     minimize_work_budget_factor: i64,
     rephase_interval_restarts: i64,
     rephase_max_flips: i64,
+    vmtf_thread_fraction: f64,
     subsumption_work_budget_factor: i64,
     bve_work_budget_factor: i64,
     bva_work_budget_factor: i64,
@@ -187,6 +195,7 @@ impl Fields {
             minimize_work_budget_factor: p.cdcl.minimize_work_budget_factor as i64,
             rephase_interval_restarts: p.cdcl.rephase_interval_restarts as i64,
             rephase_max_flips: p.cdcl.rephase_max_flips as i64,
+            vmtf_thread_fraction: p.cdcl.vmtf_thread_fraction,
             subsumption_work_budget_factor: p.preprocess.subsumption_work_budget_factor as i64,
             bve_work_budget_factor: p.preprocess.bve_work_budget_factor as i64,
             bva_work_budget_factor: p.preprocess.bva_work_budget_factor as i64,
@@ -211,6 +220,7 @@ impl Fields {
                 minimize_work_budget_factor: self.minimize_work_budget_factor as usize,
                 rephase_interval_restarts: self.rephase_interval_restarts as usize,
                 rephase_max_flips: self.rephase_max_flips as usize,
+                vmtf_thread_fraction: self.vmtf_thread_fraction,
             },
             preprocess: Preprocess {
                 subsumption_work_budget_factor: self.subsumption_work_budget_factor as usize,
@@ -274,6 +284,7 @@ fn validate(f: &Fields) -> Result<(), String> {
         1,
     )?;
     min_int("cdcl.rephaseMaxFlips", f.rephase_max_flips, 1)?;
+    closed_unit_float("cdcl.vmtfThreadFraction", f.vmtf_thread_fraction)?;
     range_int(
         "preprocess.subsumptionWorkBudgetFactor",
         f.subsumption_work_budget_factor,
@@ -333,6 +344,13 @@ fn positive_float(key: &str, v: f64) -> Result<(), String> {
 
 /// Errors naming `key` unless `0 < v <= 1` (NaN fails both comparisons
 /// and is rejected too).
+fn closed_unit_float(key: &str, v: f64) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("{key} must be between 0 and 1 (got {v})"));
+    }
+    Ok(())
+}
+
 fn unit_float(key: &str, v: f64) -> Result<(), String> {
     if !(v > 0.0 && v <= 1.0) {
         return Err(format!(
@@ -435,6 +453,7 @@ fn apply(f: &mut Fields, value: &json::Value) -> Result<(), String> {
             &mut f.rephase_interval_restarts,
         )?;
         read_int(c, "cdcl", "rephaseMaxFlips", &mut f.rephase_max_flips)?;
+        read_float(c, "cdcl", "vmtfThreadFraction", &mut f.vmtf_thread_fraction)?;
     }
     if let Some(pp) = section("preprocess")? {
         read_int(
@@ -483,7 +502,7 @@ fn format_f64(v: f64) -> String {
 /// `json.MarshalIndent(p, "", "  ")`), with a trailing newline.
 fn render(p: &Params) -> String {
     format!(
-        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {},\n    \"bvaWorkBudgetFactor\": {}\n  }}\n}}\n",
+        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {},\n    \"vmtfThreadFraction\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {},\n    \"bvaWorkBudgetFactor\": {}\n  }}\n}}\n",
         p.cdcl.luby_base_conflicts,
         p.cdcl.polynomial_base_conflicts,
         p.cdcl.geometric_base_conflicts,
@@ -497,6 +516,7 @@ fn render(p: &Params) -> String {
         p.cdcl.minimize_work_budget_factor,
         p.cdcl.rephase_interval_restarts,
         p.cdcl.rephase_max_flips,
+        format_f64(p.cdcl.vmtf_thread_fraction),
         p.preprocess.subsumption_work_budget_factor,
         p.preprocess.bve_work_budget_factor,
         p.preprocess.bva_work_budget_factor,
@@ -897,6 +917,7 @@ mod tests {
         assert_eq!(d.cdcl.minimize_work_budget_factor, 20);
         assert_eq!(d.cdcl.rephase_interval_restarts, 50);
         assert_eq!(d.cdcl.rephase_max_flips, 1000);
+        assert_eq!(d.cdcl.vmtf_thread_fraction, 0.5);
         assert_eq!(d.preprocess.subsumption_work_budget_factor, 64);
         assert_eq!(d.preprocess.bve_work_budget_factor, 2000);
         assert_eq!(d.preprocess.bva_work_budget_factor, 0);
@@ -1044,6 +1065,14 @@ mod tests {
         ),
         (r#"{"cdcl":{"rephaseMaxFlips":0}}"#, "cdcl.rephaseMaxFlips"),
         (
+            r#"{"cdcl":{"vmtfThreadFraction":-0.1}}"#,
+            "cdcl.vmtfThreadFraction",
+        ),
+        (
+            r#"{"cdcl":{"vmtfThreadFraction":1.5}}"#,
+            "cdcl.vmtfThreadFraction",
+        ),
+        (
             r#"{"preprocess":{"subsumptionWorkBudgetFactor":-1}}"#,
             "preprocess.subsumptionWorkBudgetFactor",
         ),
@@ -1069,6 +1098,8 @@ mod tests {
         r#"{"cdcl":{"glucoseK":1000}}"#,
         r#"{"cdcl":{"minimizeWorkBudgetFactor":0}}"#,
         r#"{"cdcl":{"rephaseIntervalRestarts":1,"rephaseMaxFlips":1}}"#,
+        r#"{"cdcl":{"vmtfThreadFraction":0}}"#,
+        r#"{"cdcl":{"vmtfThreadFraction":1}}"#,
         r#"{"preprocess":{"subsumptionWorkBudgetFactor":0,"bveWorkBudgetFactor":0}}"#,
         "{}",
     ];

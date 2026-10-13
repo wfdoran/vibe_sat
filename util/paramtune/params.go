@@ -36,6 +36,10 @@ type cdclParams struct {
 	// this copy in STAGE60.md so they can be swept).
 	RephaseIntervalRestarts int `json:"rephaseIntervalRestarts"`
 	RephaseMaxFlips         int `json:"rephaseMaxFlips"`
+
+	// STAGE66.md's share of workers in the focused mode with
+	// --alg-params val1=5 and several threads.
+	VmtfThreadFraction float64 `json:"vmtfThreadFraction"`
 }
 
 type preprocessParams struct {
@@ -69,6 +73,7 @@ func defaultParams() vibeSatParams {
 			MinimizeWorkBudgetFactor: 20,
 			RephaseIntervalRestarts:  50,
 			RephaseMaxFlips:          1000,
+			VmtfThreadFraction:       0.5,
 		},
 		Preprocess: preprocessParams{
 			SubsumptionWorkBudgetFactor: 64,

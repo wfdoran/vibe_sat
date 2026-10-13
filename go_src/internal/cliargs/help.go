@@ -106,8 +106,20 @@ Options:
                      (VSIDS and LRB scan every variable). Before the
                      first conflict it takes variables in increasing
                      order.
+                 5 = mode switching, after Kissat: alternates between
+                     a "focused" mode (VMTF with Glucose restarts) and
+                     a "stable" mode (VSIDS with quadratic restarts).
+                     With one thread, the search starts focused and
+                     switches mode at every restart. With more than
+                     one thread, each thread stays in one mode: a
+                     fraction of the threads (the internal parameter
+                     cdcl.vmtfThreadFraction, 0.5 by default) chosen at
+                     random run focused, the rest stable, with at least
+                     one thread of each. The restart strategy (val2) is
+                     ignored.
                Optional; defaults to 2 (VSIDS), unlike "dfs", which
-               defaults to 0, and the same for every thread.
+               defaults to 0, and the same for every thread (except
+               with val1 = 5).
                val2 = restart strategy: periodically abandons the
                      current decision stack and starts over from the
                      root, keeping every learned clause collected so
@@ -284,6 +296,7 @@ Options:
           cdcl.minimizeWorkBudgetFactor       integer, 0 to 1000000000
           cdcl.rephaseIntervalRestarts,
             rephaseMaxFlips                   integer >= 1
+          cdcl.vmtfThreadFraction             0 to 1
           preprocess.subsumptionWorkBudgetFactor,
             bveWorkBudgetFactor,
             bvaWorkBudgetFactor               integer, 0 to 1000000000
