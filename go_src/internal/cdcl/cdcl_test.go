@@ -566,7 +566,7 @@ func TestClauseByteCost(t *testing.T) {
 // lists) must still be correct afterward.
 func TestReduceClauseDatabaseKeepsLockedAndActiveClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 5, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.LegacyDatabasePolicy(params.Default().CDCL), PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1279,7 +1279,7 @@ func TestRunWithRestartsStillFindsSatisfiableFormula(t *testing.T) {
 // remaining, non-glue-eligible clauses -- is deleted instead.
 func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 6, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.LegacyDatabasePolicy(params.Default().CDCL), PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}
@@ -1318,7 +1318,7 @@ func TestReduceClauseDatabaseProtectsGlueClauses(t *testing.T) {
 // the primary sort key, activity only a tiebreak among equal LBDs.
 func TestReduceClauseDatabaseSortsByLBDBeforeActivity(t *testing.T) {
 	problem := &cnf.Problem{NumVars: 4, Clauses: []cnf.Clause{{cnf.Literal(1), cnf.Literal(2)}}}
-	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.Default().CDCL, PhaseSaving, nil, time.Time{})
+	s, ok, _ := newSolver(problem, nil, SelectVarWeighted, RestartNone, params.LegacyDatabasePolicy(params.Default().CDCL), PhaseSaving, nil, time.Time{})
 	if !ok {
 		t.Fatal("newSolver reported UNSAT unexpectedly")
 	}

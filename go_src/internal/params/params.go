@@ -70,6 +70,64 @@ type CDCL struct {
 	// quadratic restarts). The count is rounded and clamped to leave at
 	// least one worker of each kind. Read by no other configuration.
 	VmtfThreadFraction float64 `json:"vmtfThreadFraction"`
+
+	// STAGE67.md's learned-clause database reduction policy. A reduction
+	// runs every so many conflicts (ReduceFirstConflicts conflicts
+	// before the first, then each gap grows by ReduceIncrement; a
+	// ReduceFirstConflicts of 0 turns the schedule off, leaving only the
+	// optional --alg-params memory limit as a trigger). A learned clause
+	// is kept regardless of activity if its LBD is at most
+	// GlueClauseLBDThreshold (tier 1), or if it took part in conflict
+	// analysis within the last Tier2UsedReductions reductions (LBD at
+	// most Tier2LBD, tier 2) or Tier3UsedReductions reductions (any
+	// other LBD, tier 3). Of the rest, the worst ReduceFraction are
+	// deleted. Tier2LBD equal to GlueClauseLBDThreshold, both Used
+	// counts 0 and ReduceFraction 0.5 reproduce the pre-Stage-67
+	// policy. The -d / --database-toggle flag swaps between the two
+	// presets (see ToggleDatabasePolicy).
+	ReduceFirstConflicts int     `json:"reduceFirstConflicts"`
+	ReduceIncrement      int     `json:"reduceIncrement"`
+	Tier2LBD             int     `json:"tier2LBD"`
+	Tier2UsedReductions  int     `json:"tier2UsedReductions"`
+	Tier3UsedReductions  int     `json:"tier3UsedReductions"`
+	ReduceFraction       float64 `json:"reduceFraction"`
+}
+
+// ScheduledDatabasePolicy returns c with the Stage 67 scheduled,
+// tiered reduction policy's parameters set to their preset values.
+func ScheduledDatabasePolicy(c CDCL) CDCL {
+	c.ReduceFirstConflicts = 2000
+	c.ReduceIncrement = 300
+	c.Tier2LBD = 6
+	c.Tier2UsedReductions = 2
+	c.Tier3UsedReductions = 1
+	c.ReduceFraction = 0.5
+	return c
+}
+
+// LegacyDatabasePolicy returns c with the policy parameters set to
+// reproduce the pre-Stage-67 behaviour: no schedule (the memory limit
+// is the only trigger), glue clauses protected, and half of the rest
+// deleted by LBD then activity.
+func LegacyDatabasePolicy(c CDCL) CDCL {
+	c.ReduceFirstConflicts = 0
+	c.ReduceIncrement = 0
+	c.Tier2LBD = c.GlueClauseLBDThreshold
+	c.Tier2UsedReductions = 0
+	c.Tier3UsedReductions = 0
+	c.ReduceFraction = 0.5
+	return c
+}
+
+// ToggleDatabasePolicy implements -d / --database-toggle: if the
+// schedule is currently on (ReduceFirstConflicts > 0) it switches to
+// LegacyDatabasePolicy, otherwise to ScheduledDatabasePolicy. The six
+// policy parameters are overwritten with the preset either way.
+func ToggleDatabasePolicy(c CDCL) CDCL {
+	if c.ReduceFirstConflicts > 0 {
+		return LegacyDatabasePolicy(c)
+	}
+	return ScheduledDatabasePolicy(c)
 }
 
 // Preprocess holds Stage-8 preprocessing's runtime-configurable
@@ -118,6 +176,14 @@ func Default() Params {
 			RephaseIntervalRestarts:  50,
 			RephaseMaxFlips:          1000,
 			VmtfThreadFraction:       0.5,
+			// STAGE67.md: the default database policy; see
+			// ScheduledDatabasePolicy / LegacyDatabasePolicy.
+			ReduceFirstConflicts: 2000,
+			ReduceIncrement:      300,
+			Tier2LBD:             6,
+			Tier2UsedReductions:  2,
+			Tier3UsedReductions:  1,
+			ReduceFraction:       0.5,
 		},
 		Preprocess: Preprocess{
 			SubsumptionWorkBudgetFactor: 64,
@@ -200,6 +266,12 @@ func validate(p Params) error {
 		minInt("cdcl.rephaseIntervalRestarts", c.RephaseIntervalRestarts, 1),
 		minInt("cdcl.rephaseMaxFlips", c.RephaseMaxFlips, 1),
 		closedUnitFloat("cdcl.vmtfThreadFraction", c.VmtfThreadFraction),
+		rangeInt("cdcl.reduceFirstConflicts", c.ReduceFirstConflicts, 0, MaxScaleFactor),
+		rangeInt("cdcl.reduceIncrement", c.ReduceIncrement, 0, MaxScaleFactor),
+		minInt("cdcl.tier2LBD", c.Tier2LBD, 0),
+		rangeInt("cdcl.tier2UsedReductions", c.Tier2UsedReductions, 0, MaxScaleFactor),
+		rangeInt("cdcl.tier3UsedReductions", c.Tier3UsedReductions, 0, MaxScaleFactor),
+		closedUnitFloat("cdcl.reduceFraction", c.ReduceFraction),
 		rangeInt("preprocess.subsumptionWorkBudgetFactor", p.Preprocess.SubsumptionWorkBudgetFactor, 0, MaxScaleFactor),
 		rangeInt("preprocess.bveWorkBudgetFactor", p.Preprocess.BVEWorkBudgetFactor, 0, MaxScaleFactor),
 		rangeInt("preprocess.bvaWorkBudgetFactor", p.Preprocess.BVAWorkBudgetFactor, 0, MaxScaleFactor),

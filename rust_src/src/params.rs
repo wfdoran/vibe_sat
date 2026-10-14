@@ -56,6 +56,62 @@ pub struct Cdcl {
     /// restarts). The count is rounded and clamped to leave at least
     /// one worker of each kind. Read by no other configuration.
     pub vmtf_thread_fraction: f64,
+    /// STAGE67.md's learned-clause database reduction policy. A
+    /// reduction runs every so many conflicts (`reduce_first_conflicts`
+    /// before the first, then each gap grows by `reduce_increment`; a
+    /// `reduce_first_conflicts` of 0 turns the schedule off, leaving
+    /// only the optional `--alg-params` memory limit as a trigger). A
+    /// learned clause is kept regardless of activity if its LBD is at
+    /// most `glue_clause_lbd_threshold` (tier 1), or if it took part in
+    /// conflict analysis within the last `tier2_used_reductions`
+    /// reductions (LBD at most `tier2_lbd`, tier 2) or
+    /// `tier3_used_reductions` reductions (any other LBD, tier 3). Of the
+    /// rest, the worst `reduce_fraction` are deleted. The `-d` /
+    /// `--database-toggle` flag swaps between [`scheduled_database_policy`]
+    /// and [`legacy_database_policy`].
+    pub reduce_first_conflicts: usize,
+    pub reduce_increment: usize,
+    pub tier2_lbd: usize,
+    pub tier2_used_reductions: usize,
+    pub tier3_used_reductions: usize,
+    pub reduce_fraction: f64,
+}
+
+/// `c` with the Stage 67 scheduled, tiered reduction policy's
+/// parameters set to their preset values.
+pub fn scheduled_database_policy(mut c: Cdcl) -> Cdcl {
+    c.reduce_first_conflicts = 2000;
+    c.reduce_increment = 300;
+    c.tier2_lbd = 6;
+    c.tier2_used_reductions = 2;
+    c.tier3_used_reductions = 1;
+    c.reduce_fraction = 0.5;
+    c
+}
+
+/// `c` with the policy parameters set to reproduce the pre-Stage-67
+/// behaviour: no schedule (the memory limit is the only trigger), glue
+/// clauses protected, and half of the rest deleted by LBD then activity.
+pub fn legacy_database_policy(mut c: Cdcl) -> Cdcl {
+    c.reduce_first_conflicts = 0;
+    c.reduce_increment = 0;
+    c.tier2_lbd = c.glue_clause_lbd_threshold;
+    c.tier2_used_reductions = 0;
+    c.tier3_used_reductions = 0;
+    c.reduce_fraction = 0.5;
+    c
+}
+
+/// `-d` / `--database-toggle`: if the schedule is currently on
+/// (`reduce_first_conflicts > 0`) switches to [`legacy_database_policy`],
+/// otherwise to [`scheduled_database_policy`]. The six policy
+/// parameters are overwritten with the preset either way.
+pub fn toggle_database_policy(c: Cdcl) -> Cdcl {
+    if c.reduce_first_conflicts > 0 {
+        legacy_database_policy(c)
+    } else {
+        scheduled_database_policy(c)
+    }
 }
 
 /// Runtime-configurable tuning constants for `preprocess` (STAGE39.md).
@@ -102,6 +158,14 @@ pub fn default() -> Params {
             rephase_interval_restarts: 50,
             rephase_max_flips: 1000,
             vmtf_thread_fraction: 0.5,
+            // STAGE67.md: the default database policy; see
+            // `scheduled_database_policy` / `legacy_database_policy`.
+            reduce_first_conflicts: 2000,
+            reduce_increment: 300,
+            tier2_lbd: 6,
+            tier2_used_reductions: 2,
+            tier3_used_reductions: 1,
+            reduce_fraction: 0.5,
         },
         preprocess: Preprocess {
             subsumption_work_budget_factor: 64,
@@ -173,6 +237,12 @@ struct Fields {
     rephase_interval_restarts: i64,
     rephase_max_flips: i64,
     vmtf_thread_fraction: f64,
+    reduce_first_conflicts: i64,
+    reduce_increment: i64,
+    tier2_lbd: i64,
+    tier2_used_reductions: i64,
+    tier3_used_reductions: i64,
+    reduce_fraction: f64,
     subsumption_work_budget_factor: i64,
     bve_work_budget_factor: i64,
     bva_work_budget_factor: i64,
@@ -196,6 +266,12 @@ impl Fields {
             rephase_interval_restarts: p.cdcl.rephase_interval_restarts as i64,
             rephase_max_flips: p.cdcl.rephase_max_flips as i64,
             vmtf_thread_fraction: p.cdcl.vmtf_thread_fraction,
+            reduce_first_conflicts: p.cdcl.reduce_first_conflicts as i64,
+            reduce_increment: p.cdcl.reduce_increment as i64,
+            tier2_lbd: p.cdcl.tier2_lbd as i64,
+            tier2_used_reductions: p.cdcl.tier2_used_reductions as i64,
+            tier3_used_reductions: p.cdcl.tier3_used_reductions as i64,
+            reduce_fraction: p.cdcl.reduce_fraction,
             subsumption_work_budget_factor: p.preprocess.subsumption_work_budget_factor as i64,
             bve_work_budget_factor: p.preprocess.bve_work_budget_factor as i64,
             bva_work_budget_factor: p.preprocess.bva_work_budget_factor as i64,
@@ -221,6 +297,12 @@ impl Fields {
                 rephase_interval_restarts: self.rephase_interval_restarts as usize,
                 rephase_max_flips: self.rephase_max_flips as usize,
                 vmtf_thread_fraction: self.vmtf_thread_fraction,
+                reduce_first_conflicts: self.reduce_first_conflicts as usize,
+                reduce_increment: self.reduce_increment as usize,
+                tier2_lbd: self.tier2_lbd as usize,
+                tier2_used_reductions: self.tier2_used_reductions as usize,
+                tier3_used_reductions: self.tier3_used_reductions as usize,
+                reduce_fraction: self.reduce_fraction,
             },
             preprocess: Preprocess {
                 subsumption_work_budget_factor: self.subsumption_work_budget_factor as usize,
@@ -285,6 +367,32 @@ fn validate(f: &Fields) -> Result<(), String> {
     )?;
     min_int("cdcl.rephaseMaxFlips", f.rephase_max_flips, 1)?;
     closed_unit_float("cdcl.vmtfThreadFraction", f.vmtf_thread_fraction)?;
+    range_int(
+        "cdcl.reduceFirstConflicts",
+        f.reduce_first_conflicts,
+        0,
+        MAX_SCALE_FACTOR,
+    )?;
+    range_int(
+        "cdcl.reduceIncrement",
+        f.reduce_increment,
+        0,
+        MAX_SCALE_FACTOR,
+    )?;
+    min_int("cdcl.tier2LBD", f.tier2_lbd, 0)?;
+    range_int(
+        "cdcl.tier2UsedReductions",
+        f.tier2_used_reductions,
+        0,
+        MAX_SCALE_FACTOR,
+    )?;
+    range_int(
+        "cdcl.tier3UsedReductions",
+        f.tier3_used_reductions,
+        0,
+        MAX_SCALE_FACTOR,
+    )?;
+    closed_unit_float("cdcl.reduceFraction", f.reduce_fraction)?;
     range_int(
         "preprocess.subsumptionWorkBudgetFactor",
         f.subsumption_work_budget_factor,
@@ -454,6 +562,27 @@ fn apply(f: &mut Fields, value: &json::Value) -> Result<(), String> {
         )?;
         read_int(c, "cdcl", "rephaseMaxFlips", &mut f.rephase_max_flips)?;
         read_float(c, "cdcl", "vmtfThreadFraction", &mut f.vmtf_thread_fraction)?;
+        read_int(
+            c,
+            "cdcl",
+            "reduceFirstConflicts",
+            &mut f.reduce_first_conflicts,
+        )?;
+        read_int(c, "cdcl", "reduceIncrement", &mut f.reduce_increment)?;
+        read_int(c, "cdcl", "tier2LBD", &mut f.tier2_lbd)?;
+        read_int(
+            c,
+            "cdcl",
+            "tier2UsedReductions",
+            &mut f.tier2_used_reductions,
+        )?;
+        read_int(
+            c,
+            "cdcl",
+            "tier3UsedReductions",
+            &mut f.tier3_used_reductions,
+        )?;
+        read_float(c, "cdcl", "reduceFraction", &mut f.reduce_fraction)?;
     }
     if let Some(pp) = section("preprocess")? {
         read_int(
@@ -502,7 +631,7 @@ fn format_f64(v: f64) -> String {
 /// `json.MarshalIndent(p, "", "  ")`), with a trailing newline.
 fn render(p: &Params) -> String {
     format!(
-        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {},\n    \"vmtfThreadFraction\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {},\n    \"bvaWorkBudgetFactor\": {}\n  }}\n}}\n",
+        "{{\n  \"cdcl\": {{\n    \"lubyBaseConflicts\": {},\n    \"polynomialBaseConflicts\": {},\n    \"geometricBaseConflicts\": {},\n    \"geometricGrowthFactor\": {},\n    \"lrbAlpha\": {},\n    \"clauseActivityDecay\": {},\n    \"varActivityDecay\": {},\n    \"glueClauseLBDThreshold\": {},\n    \"glucoseWindowSize\": {},\n    \"glucoseK\": {},\n    \"minimizeWorkBudgetFactor\": {},\n    \"rephaseIntervalRestarts\": {},\n    \"rephaseMaxFlips\": {},\n    \"vmtfThreadFraction\": {},\n    \"reduceFirstConflicts\": {},\n    \"reduceIncrement\": {},\n    \"tier2LBD\": {},\n    \"tier2UsedReductions\": {},\n    \"tier3UsedReductions\": {},\n    \"reduceFraction\": {}\n  }},\n  \"preprocess\": {{\n    \"subsumptionWorkBudgetFactor\": {},\n    \"bveWorkBudgetFactor\": {},\n    \"bvaWorkBudgetFactor\": {}\n  }}\n}}\n",
         p.cdcl.luby_base_conflicts,
         p.cdcl.polynomial_base_conflicts,
         p.cdcl.geometric_base_conflicts,
@@ -517,6 +646,12 @@ fn render(p: &Params) -> String {
         p.cdcl.rephase_interval_restarts,
         p.cdcl.rephase_max_flips,
         format_f64(p.cdcl.vmtf_thread_fraction),
+        p.cdcl.reduce_first_conflicts,
+        p.cdcl.reduce_increment,
+        p.cdcl.tier2_lbd,
+        p.cdcl.tier2_used_reductions,
+        p.cdcl.tier3_used_reductions,
+        format_f64(p.cdcl.reduce_fraction),
         p.preprocess.subsumption_work_budget_factor,
         p.preprocess.bve_work_budget_factor,
         p.preprocess.bva_work_budget_factor,
@@ -918,6 +1053,19 @@ mod tests {
         assert_eq!(d.cdcl.rephase_interval_restarts, 50);
         assert_eq!(d.cdcl.rephase_max_flips, 1000);
         assert_eq!(d.cdcl.vmtf_thread_fraction, 0.5);
+        assert_eq!(d.cdcl.reduce_first_conflicts, 2000);
+        assert_eq!(d.cdcl.reduce_increment, 300);
+        assert_eq!(d.cdcl.tier2_lbd, 6);
+        assert_eq!(d.cdcl.tier2_used_reductions, 2);
+        assert_eq!(d.cdcl.tier3_used_reductions, 1);
+        assert_eq!(d.cdcl.reduce_fraction, 0.5);
+        // -d flips between the two presets and back.
+        let scheduled = scheduled_database_policy(d.cdcl);
+        let legacy = legacy_database_policy(d.cdcl);
+        assert_eq!(legacy.reduce_first_conflicts, 0);
+        assert_eq!(legacy.tier2_lbd, legacy.glue_clause_lbd_threshold);
+        assert_eq!(toggle_database_policy(scheduled), legacy);
+        assert_eq!(toggle_database_policy(legacy), scheduled);
         assert_eq!(d.preprocess.subsumption_work_budget_factor, 64);
         assert_eq!(d.preprocess.bve_work_budget_factor, 2000);
         assert_eq!(d.preprocess.bva_work_budget_factor, 0);
@@ -1073,6 +1221,26 @@ mod tests {
             "cdcl.vmtfThreadFraction",
         ),
         (
+            r#"{"cdcl":{"reduceFirstConflicts":-1}}"#,
+            "cdcl.reduceFirstConflicts",
+        ),
+        (
+            r#"{"cdcl":{"reduceFirstConflicts":1000000001}}"#,
+            "cdcl.reduceFirstConflicts",
+        ),
+        (r#"{"cdcl":{"reduceIncrement":-1}}"#, "cdcl.reduceIncrement"),
+        (r#"{"cdcl":{"tier2LBD":-1}}"#, "cdcl.tier2LBD"),
+        (
+            r#"{"cdcl":{"tier2UsedReductions":-1}}"#,
+            "cdcl.tier2UsedReductions",
+        ),
+        (
+            r#"{"cdcl":{"tier3UsedReductions":1000000001}}"#,
+            "cdcl.tier3UsedReductions",
+        ),
+        (r#"{"cdcl":{"reduceFraction":-0.1}}"#, "cdcl.reduceFraction"),
+        (r#"{"cdcl":{"reduceFraction":1.5}}"#, "cdcl.reduceFraction"),
+        (
             r#"{"preprocess":{"subsumptionWorkBudgetFactor":-1}}"#,
             "preprocess.subsumptionWorkBudgetFactor",
         ),
@@ -1100,6 +1268,8 @@ mod tests {
         r#"{"cdcl":{"rephaseIntervalRestarts":1,"rephaseMaxFlips":1}}"#,
         r#"{"cdcl":{"vmtfThreadFraction":0}}"#,
         r#"{"cdcl":{"vmtfThreadFraction":1}}"#,
+        r#"{"cdcl":{"reduceFirstConflicts":0,"reduceIncrement":0,"tier2LBD":0,"tier2UsedReductions":0,"tier3UsedReductions":0,"reduceFraction":0}}"#,
+        r#"{"cdcl":{"reduceFirstConflicts":1000000000,"reduceIncrement":1000000000,"tier2UsedReductions":1000000000,"tier3UsedReductions":1000000000,"reduceFraction":1}}"#,
         r#"{"preprocess":{"subsumptionWorkBudgetFactor":0,"bveWorkBudgetFactor":0}}"#,
         "{}",
     ];

@@ -40,6 +40,14 @@ type cdclParams struct {
 	// STAGE66.md's share of workers in the focused mode with
 	// --alg-params val1=5 and several threads.
 	VmtfThreadFraction float64 `json:"vmtfThreadFraction"`
+
+	// STAGE67.md's learned-clause database reduction policy.
+	ReduceFirstConflicts int     `json:"reduceFirstConflicts"`
+	ReduceIncrement      int     `json:"reduceIncrement"`
+	Tier2LBD             int     `json:"tier2LBD"`
+	Tier2UsedReductions  int     `json:"tier2UsedReductions"`
+	Tier3UsedReductions  int     `json:"tier3UsedReductions"`
+	ReduceFraction       float64 `json:"reduceFraction"`
 }
 
 type preprocessParams struct {
@@ -74,6 +82,12 @@ func defaultParams() vibeSatParams {
 			RephaseIntervalRestarts:  50,
 			RephaseMaxFlips:          1000,
 			VmtfThreadFraction:       0.5,
+			ReduceFirstConflicts:     2000,
+			ReduceIncrement:          300,
+			Tier2LBD:                 6,
+			Tier2UsedReductions:      2,
+			Tier3UsedReductions:      1,
+			ReduceFraction:           0.5,
 		},
 		Preprocess: preprocessParams{
 			SubsumptionWorkBudgetFactor: 64,

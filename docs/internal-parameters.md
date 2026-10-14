@@ -42,6 +42,17 @@ A parameter's JSON key (where it has one) is the name used inside
 | `rephaseIntervalRestarts` | `50` | `cdcl.go` / `cdcl/mod.rs` | How many restarts elapse between periodic WalkSAT rephasing bursts (`--alg-params` val4=2, `STAGE43.md`); meaningless for every other phase strategy. |
 | `rephaseMaxFlips` | `1000` | same | Caps how many flips one WalkSAT rephasing burst may make, so the periodic "nudge" stays cheap relative to how rarely it fires. |
 | `vmtfThreadFraction` | `0.5` | `cdcl.go` / `cdcl/mod.rs` | With `--alg-params` val1=5 and more than one thread, the share of threads that run the focused mode (VMTF, Glucose restarts); the rest run the stable mode (VSIDS, quadratic restarts). The count is `round(fraction × threads)`, clamped so at least one thread has each mode; which threads is random. Meaningless for every other configuration (`STAGE66.md`). |
+| `reduceFirstConflicts` | `2000` | `cdcl.go` / `cdcl/mod.rs` | Conflicts before the first scheduled learned-clause database reduction (`STAGE67.md`). **`0` turns the schedule off**, leaving only the `--alg-params` memory limit as a trigger. |
+| `reduceIncrement` | `300` | same | Each later gap between scheduled reductions is `reduceFirstConflicts + reduceIncrement × k` conflicts, `k` being the number of scheduled reductions so far. |
+| `tier2LBD` | `6` | same | Learned clauses with an LBD above `glueClauseLBDThreshold` (always kept) and at most this value are "tier 2"; the rest are "tier 3". |
+| `tier2UsedReductions` | `2` | same | A tier-2 clause is protected from deletion for this many reductions after it is learned or last takes part in conflict analysis. |
+| `tier3UsedReductions` | `1` | same | The same protection for a tier-3 clause. 0 means a tier-3 clause is always a deletion candidate. |
+| `reduceFraction` | `0.5` | same | The share of deletion candidates (not glue, not locked, not recently used) that a reduction deletes, worst LBD first and then lowest activity. |
+
+`-d` / `--database-toggle` replaces these six values with the other
+policy's: the legacy preset (`reduceFirstConflicts` 0, `tier2LBD` equal
+to `glueClauseLBDThreshold`, both used-counts 0, `reduceFraction` 0.5)
+reproduces the behaviour before `STAGE67.md`.
 
 ### `preprocess` section
 
@@ -81,6 +92,9 @@ exact wording of that message differs between the two languages).
 | `cdcl.rephaseIntervalRestarts` | integer, at least 1 | |
 | `cdcl.rephaseMaxFlips` | integer, at least 1 | |
 | `cdcl.vmtfThreadFraction` | number, 0 to 1 | 0 and 1 are allowed; the thread count is still clamped to leave one thread of each mode. |
+| `cdcl.reduceFirstConflicts`, `reduceIncrement`, `tier2UsedReductions`, `tier3UsedReductions` | integer, 0 to 1,000,000,000 | `reduceFirstConflicts` 0 turns the schedule off. |
+| `cdcl.tier2LBD` | integer, at least 0 | |
+| `cdcl.reduceFraction` | number, 0 to 1 | |
 | `preprocess.subsumptionWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
 | `preprocess.bveWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count. |
 | `preprocess.bvaWorkBudgetFactor` | integer, 0 to 1,000,000,000 | Multiplied by the clause count; 0 turns Bounded Variable Addition off. |

@@ -54,6 +54,9 @@ struct RawArgs {
 
     #[arg(long = "internal-params", short = 'c')]
     internal_params_path: Option<String>,
+
+    #[arg(long = "database-toggle", short = 'd')]
+    database_toggle: bool,
 }
 
 /// Command line arguments accepted by vibe_sat, after
@@ -137,6 +140,11 @@ pub struct Args {
     /// directory is used if it exists, else the built-in defaults are
     /// used; see [`params::resolve`].
     pub internal_params_path: Option<String>,
+
+    /// `--database-toggle`/`-d` (STAGE67.md): switch cdcl's
+    /// learned-clause database policy to the other preset (see
+    /// [`params::toggle_database_policy`]).
+    pub database_toggle: bool,
 }
 
 /// Returns true if `argv` contains a `--help` or `-h` token anywhere.
@@ -502,6 +510,12 @@ Options:
           cdcl.rephaseIntervalRestarts,
             rephaseMaxFlips                   integer >= 1
           cdcl.vmtfThreadFraction             0 to 1
+          cdcl.reduceFirstConflicts,
+            reduceIncrement,
+            tier2UsedReductions,
+            tier3UsedReductions               integer, 0 to 1000000000
+          cdcl.tier2LBD                       integer >= 0
+          cdcl.reduceFraction                 0 to 1
           preprocess.subsumptionWorkBudgetFactor,
             bveWorkBudgetFactor,
             bvaWorkBudgetFactor               integer, 0 to 1000000000
@@ -520,6 +534,29 @@ Options:
         requiring --input or --algorithm. Intended as a starting point
         to hand-edit: run this once, then change only the values you
         want different from the defaults it just wrote.
+
+  --database-toggle, -d
+        cdcl only. Switch the learned-clause database policy to the
+        other one. By default the database is reduced on a schedule:
+        after cdcl.reduceFirstConflicts conflicts, then after gaps that
+        each grow by cdcl.reduceIncrement. A reduction keeps every
+        clause with a literal block distance (LBD) of at most
+        cdcl.glueClauseLBDThreshold, and every clause used in
+        conflict analysis recently (within cdcl.tier2UsedReductions
+        reductions if its LBD is at most cdcl.tier2LBD, within
+        cdcl.tier3UsedReductions otherwise), and deletes the worst
+        cdcl.reduceFraction of the rest. With this flag the schedule
+        and the recency protection are turned off and the database is
+        only reduced when the memory limit (--alg-params val3) is
+        exceeded, deleting half of the clauses that are not glue
+        clauses. If an internal parameters file has already set
+        cdcl.reduceFirstConflicts to 0, the flag instead switches to
+        the scheduled policy. The flag overwrites the six parameters
+        cdcl.reduceFirstConflicts, reduceIncrement,
+        tier2LBD, tier2UsedReductions, tier3UsedReductions and
+        reduceFraction with the other policy's values, whatever an
+        internal parameters file says. The memory limit is an
+        additional trigger under both policies.
 
   --help, -h
         Print this help message and exit.
@@ -623,6 +660,7 @@ fn build_args(raw: RawArgs) -> Result<Args, String> {
         memory_limit_bytes,
         num_threads: raw.num_threads,
         internal_params_path: raw.internal_params_path,
+        database_toggle: raw.database_toggle,
     })
 }
 
@@ -1574,6 +1612,21 @@ mod tests {
         argv.push("-x");
         let args = Args::parse_from_args(argv).expect("expected successful parse");
         assert!(args.no_preprocessing);
+    }
+
+    #[test]
+    fn test_parse_database_toggle() {
+        let args = Args::parse_from_args(base_hc_args()).expect("expected successful parse");
+        assert!(!args.database_toggle);
+        for flag in ["--database-toggle", "-d"] {
+            let mut argv = base_hc_args();
+            argv.push(flag);
+            let args = Args::parse_from_args(argv).expect("expected successful parse");
+            assert!(args.database_toggle, "{flag}");
+        }
+        let mut argv = base_hc_args();
+        argv.push("--database-toggle=true");
+        assert!(Args::parse_from_args(argv).is_err());
     }
 
     #[test]

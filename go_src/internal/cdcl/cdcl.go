@@ -789,6 +789,17 @@ type solver struct {
 	lbdGlobalSum    int64
 	lbdGlobalCount  int64
 
+	// clauseUsed (STAGE67.md) is, per clause, how many more reductions
+	// the clause is protected from: set to the tier's window when the
+	// clause is learned or takes part in conflict analysis, and
+	// decremented by each reduction. Parallel to clauses; entries below
+	// numOriginalClauses are unused. nextReduceAt is the conflict count
+	// at which the next scheduled reduction runs; scheduledReductions
+	// counts the scheduled ones so far (it grows the gap).
+	clauseUsed          []int
+	nextReduceAt        int
+	scheduledReductions int
+
 	// estimatedBytes tracks clauseByteCost summed over every current
 	// clause, kept up to date incrementally as clauses are learned or
 	// deleted (rather than recomputed from scratch on every check) --
@@ -1103,6 +1114,8 @@ func newSolver(problem *cnf.Problem, memoryLimitBytes *int64, variant SelectVarV
 		clauseActivity:          make([]float64, len(clauses)),
 		clauseActivityIncrement: 1.0,
 		clauseLBD:               make([]int, len(clauses)),
+		clauseUsed:              make([]int, len(clauses)),
+		nextReduceAt:            p.ReduceFirstConflicts,
 		estimatedBytes:          estimatedBytes,
 		memoryLimitBytes:        memoryLimitBytes,
 		variant:                 variant,
@@ -1908,7 +1921,23 @@ func (s *solver) learnAndBackjump(confl int) {
 		s.reduceClauseDatabase()
 	}
 
+	s.maybeScheduledReduce()
+
 	s.maybeImport()
+}
+
+// maybeScheduledReduce is STAGE67.md's conflict-count trigger: once
+// s.numConflicts reaches s.nextReduceAt, reduce the database and push
+// the next reduction out by ReduceFirstConflicts plus ReduceIncrement
+// for every scheduled reduction so far. A no-op when ReduceFirstConflicts
+// is 0.
+func (s *solver) maybeScheduledReduce() {
+	if s.params.ReduceFirstConflicts == 0 || s.numConflicts < s.nextReduceAt {
+		return
+	}
+	s.reduceClauseDatabase()
+	s.scheduledReductions++
+	s.nextReduceAt = s.numConflicts + s.params.ReduceFirstConflicts + s.params.ReduceIncrement*s.scheduledReductions
 }
 
 // maybeRestart implements STAGE15.md's restart schedules (see the
@@ -2296,6 +2325,7 @@ func (s *solver) analyze(confl int) (learned cnf.Clause, backtrackLevel int, lbd
 	for {
 		if reasonClause >= s.numOriginalClauses {
 			s.clauseActivity[reasonClause] += s.clauseActivityIncrement
+			s.clauseUsed[reasonClause] = s.usedWindow(s.clauseLBD[reasonClause])
 		}
 		for _, lit := range s.clauses[reasonClause] {
 			if p != 0 && lit.Var() == p.Var() {
@@ -2583,6 +2613,7 @@ func (s *solver) addLearnedClause(learned cnf.Clause, lbd int) int {
 	s.clauses = append(s.clauses, learned)
 	s.clauseActivity = append(s.clauseActivity, 0.0)
 	s.clauseLBD = append(s.clauseLBD, lbd)
+	s.clauseUsed = append(s.clauseUsed, s.usedWindow(lbd))
 	s.chooseWatchPos = append(s.chooseWatchPos, 0)
 	s.estimatedBytes += clauseByteCost(learned)
 	for _, lit := range learned {
@@ -2611,6 +2642,17 @@ func (s *solver) addLearnedClause(learned cnf.Clause, lbd int) int {
 	*s.watchersFor(learned[0]) = append(*s.watchersFor(learned[0]), idx)
 	*s.watchersFor(learned[best]) = append(*s.watchersFor(learned[best]), idx)
 	return idx
+}
+
+// usedWindow is STAGE67.md's protection window, in reductions, for a
+// learned clause with the given LBD that was just learned or used: tier
+// 2 (LBD <= Tier2LBD) gets Tier2UsedReductions, everything else
+// Tier3UsedReductions.
+func (s *solver) usedWindow(lbd int) int {
+	if lbd <= s.params.Tier2LBD {
+		return s.params.Tier2UsedReductions
+	}
+	return s.params.Tier3UsedReductions
 }
 
 // reduceClauseDatabase deletes roughly the least active half of the
@@ -2653,8 +2695,15 @@ func (s *solver) reduceClauseDatabase() {
 
 	var eligible []int
 	for idx := s.numOriginalClauses; idx < len(s.clauses); idx++ {
-		if !locked[idx] && s.clauseLBD[idx] > s.params.GlueClauseLBDThreshold {
+		if !locked[idx] && s.clauseLBD[idx] > s.params.GlueClauseLBDThreshold && s.clauseUsed[idx] == 0 {
 			eligible = append(eligible, idx)
+		}
+	}
+	// STAGE67.md: age the "recently used" protection. Done before the
+	// early return below so the window counts reductions, not deletions.
+	for idx := s.numOriginalClauses; idx < len(s.clauses); idx++ {
+		if s.clauseUsed[idx] > 0 {
+			s.clauseUsed[idx]--
 		}
 	}
 	sort.Slice(eligible, func(i, j int) bool {
@@ -2665,7 +2714,7 @@ func (s *solver) reduceClauseDatabase() {
 		return s.clauseActivity[a] < s.clauseActivity[b]
 	})
 
-	numToDelete := len(eligible) / 2
+	numToDelete := int(float64(len(eligible)) * s.params.ReduceFraction)
 	if numToDelete == 0 {
 		return // nothing eligible to delete; not worth a full rebuild
 	}
@@ -2679,6 +2728,7 @@ func (s *solver) reduceClauseDatabase() {
 	newWatch := make([][2]cnf.Literal, 0, len(s.clauses)-numToDelete)
 	newActivity := make([]float64, 0, len(s.clauses)-numToDelete)
 	newLBD := make([]int, 0, len(s.clauses)-numToDelete)
+	newUsed := make([]int, 0, len(s.clauses)-numToDelete)
 	for idx, clause := range s.clauses {
 		if toDelete[idx] {
 			oldToNew[idx] = noReason
@@ -2689,6 +2739,7 @@ func (s *solver) reduceClauseDatabase() {
 		newWatch = append(newWatch, s.watch[idx])
 		newActivity = append(newActivity, s.clauseActivity[idx])
 		newLBD = append(newLBD, s.clauseLBD[idx])
+		newUsed = append(newUsed, s.clauseUsed[idx])
 	}
 
 	for v := 1; v <= s.numVars; v++ {
@@ -2701,6 +2752,7 @@ func (s *solver) reduceClauseDatabase() {
 	s.watch = newWatch
 	s.clauseActivity = newActivity
 	s.clauseLBD = newLBD
+	s.clauseUsed = newUsed
 	// chooseWatchPos is just a heuristic hint (see chooseWatch's doc
 	// comment), never required for correctness, so a fresh all-zero
 	// slice is simplest and safe -- no need to carry surviving clauses'

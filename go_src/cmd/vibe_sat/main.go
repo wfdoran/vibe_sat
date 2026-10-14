@@ -72,6 +72,9 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+	if args.DatabaseToggle {
+		internalParams.CDCL = params.ToggleDatabasePolicy(internalParams.CDCL)
+	}
 	if args.Verbose >= 1 && paramsSource != "built-in defaults" {
 		fmt.Println("internal parameters: loaded from", paramsSource)
 	}

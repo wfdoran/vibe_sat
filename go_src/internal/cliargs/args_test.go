@@ -589,6 +589,24 @@ func TestParseNoPreprocessingShortForm(t *testing.T) {
 	}
 }
 
+// TestParseDatabaseToggle verifies STAGE67.md's --database-toggle / -d:
+// off by default, set by either spelling, and it takes no value.
+func TestParseDatabaseToggle(t *testing.T) {
+	args, err := Parse(baseHCArgs())
+	if err != nil || args.DatabaseToggle {
+		t.Fatalf("default: err = %v, DatabaseToggle = %v, want nil and false", err, args.DatabaseToggle)
+	}
+	for _, flag := range []string{"--database-toggle", "-d"} {
+		args, err := Parse(baseHCArgs(flag))
+		if err != nil || !args.DatabaseToggle {
+			t.Errorf("%s: err = %v, DatabaseToggle = %v, want nil and true", flag, err, args.DatabaseToggle)
+		}
+	}
+	if _, err := Parse(baseHCArgs("--database-toggle=true")); err == nil {
+		t.Errorf("expected an error for --database-toggle=true (it takes no value)")
+	}
+}
+
 // TestParseNoPreprocessingRejectsValue verifies that
 // --no-preprocessing does not accept an inline value.
 func TestParseNoPreprocessingRejectsValue(t *testing.T) {

@@ -68,7 +68,7 @@ fn main() -> ExitCode {
 
     warn_if_oversubscribed(&args);
 
-    let (internal_params, internal_params_source) =
+    let (mut internal_params, internal_params_source) =
         match params::resolve(args.internal_params_path.as_deref()) {
             Ok(resolved) => resolved,
             Err(message) => {
@@ -76,6 +76,9 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
+    if args.database_toggle {
+        internal_params.cdcl = params::toggle_database_policy(internal_params.cdcl);
+    }
     if args.verbose >= 1 && internal_params_source != "built-in defaults" {
         println!("internal parameters: loaded from {internal_params_source}");
     }

@@ -1556,6 +1556,14 @@ fn run_loop<R: Rng>(
     // below but only consulted when restart_strategy actually calls
     // for it.
     let mut clause_lbd = vec![0usize; num_original_clauses];
+    // STAGE67.md: clause_used is, per clause, how many more reductions
+    // the clause is protected from (see used_window); parallel to
+    // clauses. next_reduce_at is the conflict count of the next
+    // scheduled reduction and scheduled_reductions counts those so far
+    // (see maybe_scheduled_reduce).
+    let mut clause_used = vec![0usize; num_original_clauses];
+    let mut next_reduce_at = p.reduce_first_conflicts;
+    let mut scheduled_reductions = 0usize;
     let mut lbd_scratch: Vec<usize> = Vec::new();
     let mut glucose = GlucoseState::new(p.glucose_window_size);
 
@@ -1701,6 +1709,9 @@ fn run_loop<R: Rng>(
                 &mut min_stack,
                 &mut min_work,
                 p.minimize_work_budget_factor,
+                &clause_lbd,
+                &mut clause_used,
+                p,
             );
             record_lbd(&mut glucose, lbd);
             backtrack_to(
@@ -1728,6 +1739,8 @@ fn run_loop<R: Rng>(
                 &level,
                 &mut clause_activity,
                 &mut clause_lbd,
+                &mut clause_used,
+                p,
                 &mut choose_watch_pos,
                 &mut estimated_bytes,
             );
@@ -1798,13 +1811,37 @@ fn run_loop<R: Rng>(
                     &mut watch,
                     &mut clause_activity,
                     &mut clause_lbd,
+                    &mut clause_used,
                     &mut choose_watch_pos,
                     &mut estimated_bytes,
                     &x,
                     &mut reason,
                     num_original_clauses,
-                    p.glue_clause_lbd_threshold,
+                    p,
                 );
+            }
+
+            // STAGE67.md: the conflict-count trigger (see
+            // Go's maybeScheduledReduce).
+            if p.reduce_first_conflicts != 0 && num_conflicts >= next_reduce_at {
+                reduce_clause_database(
+                    &mut working_problem.clauses,
+                    &mut lists,
+                    &mut watchers_positive,
+                    &mut watchers_negative,
+                    &mut watch,
+                    &mut clause_activity,
+                    &mut clause_lbd,
+                    &mut clause_used,
+                    &mut choose_watch_pos,
+                    &mut estimated_bytes,
+                    &x,
+                    &mut reason,
+                    num_original_clauses,
+                    p,
+                );
+                scheduled_reductions += 1;
+                next_reduce_at = next_scheduled_reduce(num_conflicts, p, scheduled_reductions);
             }
 
             // STAGE20.md/STAGE21.md's Option B: give this thread a
@@ -1825,6 +1862,8 @@ fn run_loop<R: Rng>(
                 &x,
                 &mut clause_activity,
                 &mut clause_lbd,
+                &mut clause_used,
+                p,
                 &mut choose_watch_pos,
                 &mut estimated_bytes,
             );
@@ -2674,6 +2713,9 @@ fn analyze(
     min_stack: &mut Vec<MinimizeFrame>,
     min_work: &mut usize,
     minimize_work_budget_factor: usize,
+    clause_lbd: &[usize],
+    clause_used: &mut [usize],
+    params: &params::Cdcl,
 ) -> (Clause, usize, usize) {
     for s in seen.iter_mut() {
         *s = false;
@@ -2688,6 +2730,7 @@ fn analyze(
     loop {
         if reason_clause >= num_original_clauses {
             clause_activity[reason_clause] += clause_activity_increment;
+            clause_used[reason_clause] = used_window(params, clause_lbd[reason_clause]);
         }
         for &lit in &clauses[reason_clause] {
             if let Some(pl) = p
@@ -2940,6 +2983,8 @@ fn add_learned_clause(
     level: &[usize],
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    clause_used: &mut Vec<usize>,
+    params: &params::Cdcl,
     choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) -> Option<usize> {
@@ -2951,6 +2996,7 @@ fn add_learned_clause(
     clauses.push(learned.clone());
     clause_activity.push(0.0);
     clause_lbd.push(lbd);
+    clause_used.push(used_window(params, lbd));
     choose_watch_pos.push(0);
     *estimated_bytes += clause_byte_cost(learned);
     for &lit in learned {
@@ -3021,12 +3067,13 @@ fn reduce_clause_database(
     watch: &mut Vec<[Literal; 2]>,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    clause_used: &mut Vec<usize>,
     choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
     x: &Assignment,
     reason: &mut [Option<usize>],
     num_original_clauses: usize,
-    glue_clause_lbd_threshold: usize,
+    params: &params::Cdcl,
 ) {
     let mut locked = vec![false; clauses.len()];
     for (v, &value) in x.iter().enumerate().skip(1) {
@@ -3038,14 +3085,23 @@ fn reduce_clause_database(
     }
 
     let mut eligible: Vec<usize> = (num_original_clauses..clauses.len())
-        .filter(|&idx| !locked[idx] && clause_lbd[idx] > glue_clause_lbd_threshold)
+        .filter(|&idx| {
+            !locked[idx]
+                && clause_lbd[idx] > params.glue_clause_lbd_threshold
+                && clause_used[idx] == 0
+        })
         .collect();
+    // STAGE67.md: age the "recently used" protection. Done before the
+    // early return below so the window counts reductions, not deletions.
+    for used in clause_used.iter_mut().skip(num_original_clauses) {
+        *used = used.saturating_sub(1);
+    }
     eligible.sort_by(|&a, &b| match clause_lbd[b].cmp(&clause_lbd[a]) {
         std::cmp::Ordering::Equal => clause_activity[a].partial_cmp(&clause_activity[b]).unwrap(),
         other => other,
     });
 
-    let num_to_delete = eligible.len() / 2;
+    let num_to_delete = (eligible.len() as f64 * params.reduce_fraction) as usize;
     if num_to_delete == 0 {
         return; // nothing eligible to delete; not worth a full rebuild
     }
@@ -3059,6 +3115,7 @@ fn reduce_clause_database(
     let mut new_watch = Vec::with_capacity(clauses.len() - num_to_delete);
     let mut new_activity = Vec::with_capacity(clauses.len() - num_to_delete);
     let mut new_lbd = Vec::with_capacity(clauses.len() - num_to_delete);
+    let mut new_used = Vec::with_capacity(clauses.len() - num_to_delete);
     for (idx, clause) in clauses.iter().enumerate() {
         if to_delete[idx] {
             continue;
@@ -3068,6 +3125,7 @@ fn reduce_clause_database(
         new_watch.push(watch[idx]);
         new_activity.push(clause_activity[idx]);
         new_lbd.push(clause_lbd[idx]);
+        new_used.push(clause_used[idx]);
     }
 
     for (v, &value) in x.iter().enumerate().skip(1) {
@@ -3100,11 +3158,36 @@ fn reduce_clause_database(
     *watchers_negative = new_watchers_negative;
     *clause_activity = new_activity;
     *clause_lbd = new_lbd;
+    *clause_used = new_used;
     // choose_watch_pos is just a heuristic hint (see choose_watch's
     // doc comment), never required for correctness, so a fresh
     // all-zero Vec is simplest and safe -- no need to carry surviving
     // clauses' old positions through old_to_new.
     *choose_watch_pos = vec![0; clauses.len()];
+}
+
+/// STAGE67.md: the conflict count of the next scheduled reduction,
+/// given that one just ran at `num_conflicts` and `scheduled_reductions`
+/// (counting it) have run so far: `reduce_first_conflicts` plus
+/// `reduce_increment` per scheduled reduction after `num_conflicts`.
+fn next_scheduled_reduce(
+    num_conflicts: usize,
+    params: &params::Cdcl,
+    scheduled_reductions: usize,
+) -> usize {
+    num_conflicts + params.reduce_first_conflicts + params.reduce_increment * scheduled_reductions
+}
+
+/// STAGE67.md's protection window, in reductions, for a learned clause
+/// with the given LBD that was just learned or used: tier 2 (LBD <=
+/// `tier2_lbd`) gets `tier2_used_reductions`, everything else
+/// `tier3_used_reductions`.
+fn used_window(params: &params::Cdcl, lbd: usize) -> usize {
+    if lbd <= params.tier2_lbd {
+        params.tier2_used_reductions
+    } else {
+        params.tier3_used_reductions
+    }
 }
 
 /// Scans `clause`, starting at index `start` and wrapping around
@@ -3570,6 +3653,9 @@ mod tests {
             &mut min_stack,
             &mut min_work,
             params::default().cdcl.minimize_work_budget_factor,
+            &vec![0usize; working_problem.clauses.len()],
+            &mut vec![0usize; working_problem.clauses.len()],
+            &params::default().cdcl,
         );
 
         assert_eq!(backtrack_level, 0);
@@ -3838,6 +3924,9 @@ mod tests {
             &mut min_stack,
             &mut min_work,
             params::default().cdcl.minimize_work_budget_factor,
+            &vec![0usize; working_problem.clauses.len()],
+            &mut vec![0usize; working_problem.clauses.len()],
+            &params::default().cdcl,
         );
 
         assert_eq!(
@@ -3885,6 +3974,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         );
@@ -3924,6 +4015,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4071,6 +4164,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4086,6 +4181,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4101,6 +4198,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4120,12 +4219,13 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut vec![0usize; 64],
             &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
             num_original_clauses,
-            params::default().cdcl.glue_clause_lbd_threshold,
+            &params::legacy_database_policy(params::default().cdcl),
         );
 
         assert_eq!(working_problem.clauses.len(), before - 1);
@@ -4185,6 +4285,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4201,12 +4303,13 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut vec![0usize; 64],
             &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
             num_original_clauses,
-            params::default().cdcl.glue_clause_lbd_threshold,
+            &params::legacy_database_policy(params::default().cdcl),
         );
 
         assert_eq!(working_problem.clauses.len(), before);
@@ -4250,6 +4353,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4265,6 +4370,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4280,6 +4387,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4297,12 +4406,13 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut vec![0usize; 64],
             &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
             num_original_clauses,
-            params::default().cdcl.glue_clause_lbd_threshold,
+            &params::legacy_database_policy(params::default().cdcl),
         );
 
         assert_eq!(working_problem.clauses.len(), before - 1);
@@ -4355,6 +4465,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4370,6 +4482,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -4386,12 +4500,13 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut vec![0usize; 64],
             &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
             num_original_clauses,
-            params::default().cdcl.glue_clause_lbd_threshold,
+            &params::legacy_database_policy(params::default().cdcl),
         );
 
         assert_eq!(working_problem.clauses.len(), before - 1);
@@ -4709,6 +4824,9 @@ mod tests {
             &mut min_stack,
             &mut min_work,
             params::default().cdcl.minimize_work_budget_factor,
+            &vec![0usize; working_problem.clauses.len()],
+            &mut vec![0usize; working_problem.clauses.len()],
+            &params::default().cdcl,
         );
 
         assert!(
@@ -5373,6 +5491,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -6093,6 +6213,8 @@ mod tests {
                 &self.x,
                 &mut self.clause_activity,
                 &mut self.clause_lbd,
+                &mut Vec::new(),
+                &params::default().cdcl,
                 &mut self.choose_watch_pos,
                 &mut self.estimated_bytes,
             );
@@ -6176,6 +6298,8 @@ mod tests {
             &fx.x,
             &mut fx.clause_activity,
             &mut fx.clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut fx.choose_watch_pos,
             &mut fx.estimated_bytes,
         );
@@ -6842,6 +6966,8 @@ mod tests {
             &level,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut Vec::new(),
+            &params::default().cdcl,
             &mut choose_watch_pos,
             &mut estimated_bytes,
         )
@@ -6900,6 +7026,8 @@ mod tests {
                 &level,
                 &mut clause_activity,
                 &mut clause_lbd,
+                &mut Vec::new(),
+                &params::default().cdcl,
                 &mut choose_watch_pos,
                 &mut estimated_bytes,
             );
@@ -6912,12 +7040,13 @@ mod tests {
             &mut watch,
             &mut clause_activity,
             &mut clause_lbd,
+            &mut vec![0usize; 64],
             &mut choose_watch_pos,
             &mut estimated_bytes,
             &x,
             &mut reason,
             num_original_clauses,
-            glue_threshold,
+            &params::legacy_database_policy(params::default().cdcl),
         );
 
         for (c, w) in watch.iter().enumerate() {
@@ -7149,6 +7278,9 @@ mod tests {
             &mut min_stack,
             &mut min_work,
             params::default().cdcl.minimize_work_budget_factor,
+            &vec![0usize; working_problem.clauses.len()],
+            &mut vec![0usize; working_problem.clauses.len()],
+            &params::default().cdcl,
         );
 
         let order = vmtf_order(&vmtf, 4);
@@ -7409,6 +7541,198 @@ mod tests {
             PhaseStrategy::Saving,
         );
         assert!(!result.satisfiable && !result.timed_out);
+    }
+
+    /// STAGE67.md: a tier-2 clause is protected for
+    /// `tier2_used_reductions` reductions after it is learned or used, a
+    /// tier-3 clause for `tier3_used_reductions`, and the protection ages
+    /// by one per reduction; a glue clause is never deleted.
+    #[test]
+    fn test_reduce_tiers_protect_recently_used_clauses() {
+        let mut p = params::scheduled_database_policy(params::default().cdcl);
+        p.reduce_fraction = 1.0;
+        let problem = Problem {
+            num_vars: 8,
+            clauses: vec![vec![1, 2]],
+        };
+        let (mut working_problem, mut watch, x) = bootstrap(&problem, None, Instant::now())
+            .0
+            .expect("expected a valid bootstrap");
+        let mut lists = occurrence::build(&working_problem);
+        let (mut watchers_positive, mut watchers_negative) =
+            build_watchers(&watch, working_problem.num_vars);
+        let level = vec![0usize; 9];
+        let num_original_clauses = working_problem.clauses.len();
+        let mut clause_activity: Vec<f64> = vec![0.0; num_original_clauses];
+        let mut clause_lbd: Vec<usize> = vec![0; num_original_clauses];
+        let mut clause_used: Vec<usize> = vec![0; num_original_clauses];
+        let mut choose_watch_pos: Vec<usize> = vec![0; num_original_clauses];
+        let mut estimated_bytes: i64 = 0;
+        let mut reason: Vec<Option<usize>> = vec![None; 9];
+
+        let learned = [
+            (vec![-1, 3], p.glue_clause_lbd_threshold),
+            (vec![-2, 4], p.tier2_lbd),
+            (vec![-5, 6], p.tier2_lbd + 1),
+        ];
+        for (clause, lbd) in &learned {
+            add_learned_clause(
+                clause,
+                *lbd,
+                &mut working_problem.clauses,
+                &mut lists,
+                &mut watchers_positive,
+                &mut watchers_negative,
+                &mut watch,
+                &level,
+                &mut clause_activity,
+                &mut clause_lbd,
+                &mut clause_used,
+                &p,
+                &mut choose_watch_pos,
+                &mut estimated_bytes,
+            );
+        }
+        // index 0 is the original clause; 1 is glue (tier 1), 2 tier 2, 3 tier 3
+        assert_eq!(clause_used[2], p.tier2_used_reductions);
+        assert_eq!(clause_used[3], p.tier3_used_reductions);
+
+        let mut reduce = |working_problem: &mut Problem| {
+            reduce_clause_database(
+                &mut working_problem.clauses,
+                &mut lists,
+                &mut watchers_positive,
+                &mut watchers_negative,
+                &mut watch,
+                &mut clause_activity,
+                &mut clause_lbd,
+                &mut clause_used,
+                &mut choose_watch_pos,
+                &mut estimated_bytes,
+                &x,
+                &mut reason,
+                num_original_clauses,
+                &p,
+            );
+        };
+        // first: tier 3 had window 1, tier 2 window 2: nothing deleted
+        reduce(&mut working_problem);
+        assert_eq!(working_problem.clauses.len(), 4);
+        // second: tier 3 unprotected and deleted, tier 2 still has 1
+        reduce(&mut working_problem);
+        assert!(working_problem.clauses.contains(&vec![-1, 3]));
+        assert!(working_problem.clauses.contains(&vec![-2, 4]));
+        assert!(!working_problem.clauses.contains(&vec![-5, 6]));
+        // third: tier 2 unprotected and deleted; the glue clause stays
+        reduce(&mut working_problem);
+        assert!(working_problem.clauses.contains(&vec![-1, 3]));
+        assert!(!working_problem.clauses.contains(&vec![-2, 4]));
+    }
+
+    /// STAGE67.md: the first scheduled reduction is at
+    /// `reduce_first_conflicts`, then gaps grow by `reduce_increment`.
+    #[test]
+    fn test_next_scheduled_reduce() {
+        let mut p = params::scheduled_database_policy(params::default().cdcl);
+        p.reduce_first_conflicts = 10;
+        p.reduce_increment = 5;
+        assert_eq!(next_scheduled_reduce(10, &p, 1), 25);
+        assert_eq!(next_scheduled_reduce(25, &p, 2), 45);
+    }
+
+    /// STAGE67.md: reducing after every conflict, with a partial and a
+    /// total deletion fraction, must not change any verdict.
+    #[test]
+    fn test_run_with_frequent_reduction_agrees_with_brute_force() {
+        let mut rng = StdRng::seed_from_u64(67);
+        for trial in 0..150u64 {
+            let num_vars = 8 + rng.random_range(0..5usize);
+            let num_clauses = (4.3 * num_vars as f64) as usize;
+            let mut clauses: Vec<Clause> = Vec::new();
+            while clauses.len() < num_clauses {
+                let mut clause: Clause = Vec::new();
+                while clause.len() < 3 {
+                    let v = 1 + rng.random_range(0..num_vars) as Literal;
+                    if clause.iter().any(|&l| l.abs() == v) {
+                        continue;
+                    }
+                    clause.push(if rng.random_range(0..2) == 0 { -v } else { v });
+                }
+                clauses.push(clause);
+            }
+            let problem = Problem {
+                num_vars,
+                clauses: clauses.clone(),
+            };
+            let want = vmtf_brute_force_satisfiable(num_vars, &clauses);
+            for fraction in [0.5, 1.0] {
+                let mut p = params::scheduled_database_policy(params::default().cdcl);
+                p.reduce_first_conflicts = 1;
+                p.reduce_increment = 0;
+                p.tier2_used_reductions = 1;
+                p.tier3_used_reductions = 0;
+                p.reduce_fraction = fraction;
+                let mut run_rng = StdRng::seed_from_u64(trial);
+                let result = run(
+                    &problem,
+                    None,
+                    SelectVarVariant::Vsids,
+                    RestartStrategy::None,
+                    None,
+                    &mut run_rng,
+                    0,
+                    &p,
+                    PhaseStrategy::Saving,
+                );
+                assert!(
+                    !result.timed_out && result.satisfiable == want,
+                    "trial {trial} fraction {fraction}: satisfiable={} timed_out={}, brute force says {want}\n{clauses:?}",
+                    result.satisfiable,
+                    result.timed_out
+                );
+                if result.satisfiable {
+                    for clause in &clauses {
+                        assert!(
+                            clause.iter().any(|&lit| {
+                                let value = result.assignment[cnf::literal_var(lit)];
+                                (lit > 0 && value == Value::True)
+                                    || (lit < 0 && value == Value::False)
+                            }),
+                            "trial {trial}: clause {clause:?} not satisfied"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// STAGE67.md: many scheduled reductions, single- and
+    /// multi-threaded, still prove a pigeonhole formula UNSAT.
+    #[test]
+    fn test_run_with_frequent_reduction_proves_unsatisfiable_pigeonhole() {
+        let mut p = params::scheduled_database_policy(params::default().cdcl);
+        p.reduce_first_conflicts = 5;
+        p.reduce_increment = 1;
+        p.reduce_fraction = 1.0;
+        for threads in [1usize, 3] {
+            let mut rng = StdRng::seed_from_u64(5);
+            let result = run_parallel(
+                &pigeonhole_problem(7, 6),
+                None,
+                SelectVarVariant::Vsids,
+                RestartStrategy::Polynomial,
+                None,
+                threads,
+                &mut rng,
+                0,
+                &p,
+                PhaseStrategy::Saving,
+            );
+            assert!(
+                !result.satisfiable && !result.timed_out,
+                "{threads} threads"
+            );
+        }
     }
 
     /// STAGE66.md: the multi-threaded split has round(fraction * n)

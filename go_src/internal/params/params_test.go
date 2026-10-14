@@ -179,6 +179,14 @@ var rejectedParamCases = []paramCase{
 	{`{"cdcl":{"rephaseMaxFlips":0}}`, "cdcl.rephaseMaxFlips"},
 	{`{"cdcl":{"vmtfThreadFraction":-0.1}}`, "cdcl.vmtfThreadFraction"},
 	{`{"cdcl":{"vmtfThreadFraction":1.5}}`, "cdcl.vmtfThreadFraction"},
+	{`{"cdcl":{"reduceFirstConflicts":-1}}`, "cdcl.reduceFirstConflicts"},
+	{`{"cdcl":{"reduceFirstConflicts":1000000001}}`, "cdcl.reduceFirstConflicts"},
+	{`{"cdcl":{"reduceIncrement":-1}}`, "cdcl.reduceIncrement"},
+	{`{"cdcl":{"tier2LBD":-1}}`, "cdcl.tier2LBD"},
+	{`{"cdcl":{"tier2UsedReductions":-1}}`, "cdcl.tier2UsedReductions"},
+	{`{"cdcl":{"tier3UsedReductions":1000000001}}`, "cdcl.tier3UsedReductions"},
+	{`{"cdcl":{"reduceFraction":-0.1}}`, "cdcl.reduceFraction"},
+	{`{"cdcl":{"reduceFraction":1.5}}`, "cdcl.reduceFraction"},
 	{`{"preprocess":{"subsumptionWorkBudgetFactor":-1}}`, "preprocess.subsumptionWorkBudgetFactor"},
 	{`{"preprocess":{"bveWorkBudgetFactor":-1}}`, "preprocess.bveWorkBudgetFactor"},
 }
@@ -201,6 +209,8 @@ var acceptedParamCases = []string{
 	`{"cdcl":{"rephaseIntervalRestarts":1,"rephaseMaxFlips":1}}`,
 	`{"cdcl":{"vmtfThreadFraction":0}}`,
 	`{"cdcl":{"vmtfThreadFraction":1}}`,
+	`{"cdcl":{"reduceFirstConflicts":0,"reduceIncrement":0,"tier2LBD":0,"tier2UsedReductions":0,"tier3UsedReductions":0,"reduceFraction":0}}`,
+	`{"cdcl":{"reduceFirstConflicts":1000000000,"reduceIncrement":1000000000,"tier2UsedReductions":1000000000,"tier3UsedReductions":1000000000,"reduceFraction":1}}`,
 	`{"preprocess":{"subsumptionWorkBudgetFactor":0,"bveWorkBudgetFactor":0}}`,
 	`{}`,
 }

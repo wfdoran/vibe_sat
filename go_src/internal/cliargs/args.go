@@ -41,6 +41,11 @@ type Args struct {
 	AlgParams       []*int64
 	NoPreprocessing bool // --no-preprocessing / -x : skip preprocessing (STAGE8.md); default is to run it
 
+	// DatabaseToggle is --database-toggle/-d (STAGE67.md): switch cdcl's
+	// learned-clause database policy to the other preset (see
+	// params.ToggleDatabasePolicy).
+	DatabaseToggle bool
+
 	// InternalParamsPath is --internal-params/-c (STAGE39.md): an
 	// explicit path to a JSON file of runtime-configurable internal
 	// tuning constants (see internal/params), overriding the implicit
@@ -108,6 +113,7 @@ var flagSpecs = []flagSpec{
 	{long: "num-threads", short: "z", maxValues: 1},
 	{long: "internal-params", short: "c", maxValues: 1},
 	{long: "reset-internal-params", short: "q", maxValues: 0},
+	{long: "database-toggle", short: "d", maxValues: 0},
 }
 
 // findSpec returns the flagSpec whose long or short spelling matches
@@ -423,6 +429,9 @@ func buildArgs(rawValues map[string][]string) (*Args, error) {
 	}
 	if _, ok := rawValues["reset-internal-params"]; ok {
 		args.ResetInternalParams = true
+	}
+	if _, ok := rawValues["database-toggle"]; ok {
+		args.DatabaseToggle = true
 	}
 
 	return args, nil

@@ -43,6 +43,12 @@ flagged explicitly where that happened).
   LBD-primary sort in its clause-deletion policy (`--alg-params
   val2=4`'s restart policy is also this paper's; see "Restarts"
   below). (`reports/REPORT33.md`, `reports/REPORT34.md`)
+- Kissat (Biere et al.), the "tier 1 / tier 2 / tier 3" learned-clause
+  classification by LBD, with recently used clauses protected and a
+  conflict-count reduction schedule. Not a paper: from the author's
+  knowledge of Kissat's behaviour, not re-checked against its source, so
+  the constants here are this project's own. `cdcl`'s scheduled
+  reduction follows the idea. (`reports/REPORT67.md`)
 - Sörensson & Biere, "Minimizing Learned Clauses," SAT 2009 (formalizing
   a heuristic MiniSat itself has used since 2005). Recursive
   self-subsumption minimization of a freshly learned clause, removing

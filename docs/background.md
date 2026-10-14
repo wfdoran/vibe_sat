@@ -500,16 +500,24 @@ question about phase round-robin's diversity value) — see
 ## Clause-database management
 
 Learned clauses accumulate without bound unless something prunes
-them, so once an optional memory limit (`--alg-params val3`) is
-exceeded, `cdcl` deletes roughly the least useful half of the
-clauses that are safe to delete (not currently locked as some
-variable's reason, and not part of the original problem). "Useful" is
-now judged by LBD first, MiniSat-style activity decay only as a
-tiebreak: a clause at or below an LBD of 2 ("glue," in Glucose's
-terminology) is never deleted regardless of activity, and among the
-rest, the least "compact" (highest-LBD) clauses go first. Before
+them. `cdcl` reduces its database on a conflict-count schedule
+(`STAGE67.md`): the first reduction after 2000 conflicts, then after
+gaps that grow by 300 each time. It also reduces whenever an optional
+memory limit (`--alg-params val3`) is exceeded. A reduction only
+considers clauses that are safe to delete (not currently locked as some
+variable's reason, and not part of the original problem). Among those,
+three groups are kept: **tier 1**, a clause at or below an LBD of 2
+("glue," in Glucose's terminology), is never deleted; **tier 2**
+(LBD up to 6) is kept for two reductions after it was learned or last
+took part in conflict analysis; **tier 3** (higher LBD) is kept for one.
+Of the rest, the worst half goes: the least "compact" (highest-LBD)
+clauses first, MiniSat-style activity decay only as a tiebreak. Before
 `reports/REPORT34.md` this was pure activity decay, with no notion of
-LBD anywhere in `cdcl`.
+LBD anywhere in `cdcl`, and before `STAGE67.md` the database was only
+reduced when a memory limit was set, so by default it grew without
+bound. `-d` / `--database-toggle` switches back to that older policy.
+The tiers are the idea Kissat uses; the constants here are this
+project's own and come from `reports/REPORT67.md`'s measurements.
 
 ## Learned-clause minimization
 

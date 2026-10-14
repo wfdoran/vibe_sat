@@ -297,6 +297,12 @@ Options:
           cdcl.rephaseIntervalRestarts,
             rephaseMaxFlips                   integer >= 1
           cdcl.vmtfThreadFraction             0 to 1
+          cdcl.reduceFirstConflicts,
+            reduceIncrement,
+            tier2UsedReductions,
+            tier3UsedReductions               integer, 0 to 1000000000
+          cdcl.tier2LBD                       integer >= 0
+          cdcl.reduceFraction                 0 to 1
           preprocess.subsumptionWorkBudgetFactor,
             bveWorkBudgetFactor,
             bvaWorkBudgetFactor               integer, 0 to 1000000000
@@ -315,6 +321,29 @@ Options:
         requiring --input or --algorithm. Intended as a starting point
         to hand-edit: run this once, then change only the values you
         want different from the defaults it just wrote.
+
+  --database-toggle, -d
+        cdcl only. Switch the learned-clause database policy to the
+        other one. By default the database is reduced on a schedule:
+        after cdcl.reduceFirstConflicts conflicts, then after gaps that
+        each grow by cdcl.reduceIncrement. A reduction keeps every
+        clause with a literal block distance (LBD) of at most
+        cdcl.glueClauseLBDThreshold, and every clause used in
+        conflict analysis recently (within cdcl.tier2UsedReductions
+        reductions if its LBD is at most cdcl.tier2LBD, within
+        cdcl.tier3UsedReductions otherwise), and deletes the worst
+        cdcl.reduceFraction of the rest. With this flag the schedule
+        and the recency protection are turned off and the database is
+        only reduced when the memory limit (--alg-params val3) is
+        exceeded, deleting half of the clauses that are not glue
+        clauses. If an internal parameters file has already set
+        cdcl.reduceFirstConflicts to 0, the flag instead switches to
+        the scheduled policy. The flag overwrites the six parameters
+        cdcl.reduceFirstConflicts, reduceIncrement,
+        tier2LBD, tier2UsedReductions, tier3UsedReductions and
+        reduceFraction with the other policy's values, whatever an
+        internal parameters file says. The memory limit is an
+        additional trigger under both policies.
 
   --help, -h
         Print this help message and exit.

@@ -148,6 +148,23 @@ $ cat .vibe_sat.json
 }
 ```
 
+### `--database-toggle`, `-d`
+
+`cdcl` only. Switch the learned-clause database policy to the other
+one. By default the database is reduced on a schedule (first after
+`cdcl.reduceFirstConflicts` conflicts, then after gaps that grow by
+`cdcl.reduceIncrement`), keeping low-LBD clauses and recently used ones
+and deleting half of the rest. With `-d` the schedule and the
+recency protection are off, and the database is reduced only when the
+memory limit (`--alg-params` val3) is exceeded — the behaviour before
+Stage 67. The flag overwrites the six policy parameters listed in
+[internal-parameters.md](internal-parameters.md) with the other
+policy's values, whatever an internal-parameters file says; if a file
+has already set `cdcl.reduceFirstConflicts` to 0, `-d` switches to the
+scheduled policy instead. The memory limit stays an additional trigger
+under both. See
+[background.md](background.md#clause-database-management).
+
 ### `--help`, `-h`
 
 Print the built-in help text and exit.
@@ -193,7 +210,7 @@ their defaults.
 |---|---|
 | `val1` | Variable-selection heuristic. `0`/`1`: same as `dfs`'s `val1`. `2` (default): VSIDS — scores variables by how often they've recently appeared while resolving a conflict, decayed over time. `3`: LRB — scores variables by how often they've recently *participated* in producing a learned clause, per conflict they've been assigned for. `4`: VMTF (Variable Move-To-Front) — keeps the variables in a list ordered by when they were last involved in a conflict and branches on the first unassigned one from the front; no scores or decay, and O(1) amortized per decision. `5`: mode switching, after Kissat — alternates a "focused" mode (VMTF with Glucose restarts) and a "stable" mode (VSIDS with quadratic restarts). With one thread the search starts focused and switches mode at every restart. With several threads each thread stays in one mode: the internal parameter `cdcl.vmtfThreadFraction` (default `0.5`) of the threads, chosen at random, run focused and the rest stable, with at least one of each. `val2` is ignored when `val1` is `5`. Otherwise every thread uses the same heuristic. |
 | `val2` | Restart strategy. `0`: no restarts. `1`: the Luby sequence. `2` (default with `--num-threads=1`): a quadratic "polynomial" growth sequence. `3`: a true geometric growth sequence (constant ratio between restart intervals). `4`: Glucose's data-driven policy — restart when a moving average of recent learned-clause LBDs looks close to or worse than the all-time average, rather than on a fixed conflict-count schedule. `5` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{2, 3, 1, 4}` in turn, so no two threads restart on the same cadence. |
-| `val3` | Learned-clause database memory limit. Either a plain integer (bytes) or an integer with a `k`/`kb`/`m`/`mb`/`g`/`gb` suffix (case-insensitive), e.g. `100MB`. Unbounded by default. |
+| `val3` | Learned-clause database memory limit. Either a plain integer (bytes) or an integer with a `k`/`kb`/`m`/`mb`/`g`/`gb` suffix (case-insensitive), e.g. `100MB`. No limit by default; the scheduled reduction (see `--database-toggle`) runs regardless, and a limit is an additional trigger. |
 | `val4` | Phase-selection strategy: which technique to use for guessing a newly-decided variable's polarity. `0` (default with `--num-threads=1`): phase saving — guess the polarity the variable last held before becoming unassigned. `1`: target phase — guess the polarity recorded at the search's deepest trail so far, tracked separately from phase saving. `2`: periodic WalkSAT rephasing — like phase saving, except every so many restarts a short WalkSAT burst runs and its result overwrites the saved phase wholesale (if that burst happens to fully solve the problem on its own, that solution is reported directly). `3` (default with `--num-threads>1`): round-robin — each worker thread gets a different one of `{0, 1, 2}` in turn. |
 
 `cdcl`'s defaults (VSIDS over LRB, the polynomial restart schedule over

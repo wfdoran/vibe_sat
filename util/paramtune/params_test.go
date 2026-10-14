@@ -83,8 +83,8 @@ func TestAllParamPathsCoversKnownFields(t *testing.T) {
 			t.Errorf("allParamPaths() missing %q", w)
 		}
 	}
-	if len(paths) != 16 {
-		t.Errorf("allParamPaths() returned %d paths, want 16 (13 cdcl + 3 preprocess)", len(paths))
+	if len(paths) != 23 {
+		t.Errorf("allParamPaths() returned %d paths, want 23 (20 cdcl + 3 preprocess)", len(paths))
 	}
 }
 

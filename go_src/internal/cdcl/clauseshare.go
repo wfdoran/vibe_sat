@@ -258,6 +258,7 @@ func (s *solver) importClause(lits cnf.Clause) {
 	s.clauses = append(s.clauses, clause)
 	s.clauseActivity = append(s.clauseActivity, 0.0)
 	s.clauseLBD = append(s.clauseLBD, len(clause))
+	s.clauseUsed = append(s.clauseUsed, s.usedWindow(len(clause)))
 	s.chooseWatchPos = append(s.chooseWatchPos, 0)
 	s.estimatedBytes += clauseByteCost(clause)
 	for _, lit := range clause {

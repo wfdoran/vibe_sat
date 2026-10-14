@@ -216,6 +216,8 @@ pub(crate) fn maybe_import(
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    clause_used: &mut Vec<usize>,
+    params: &crate::params::Cdcl,
     choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) {
@@ -244,6 +246,8 @@ pub(crate) fn maybe_import(
                     x,
                     clause_activity,
                     clause_lbd,
+                    clause_used,
+                    params,
                     choose_watch_pos,
                     estimated_bytes,
                 );
@@ -306,6 +310,8 @@ fn import_clause(
     x: &crate::assignment::Assignment,
     clause_activity: &mut Vec<f64>,
     clause_lbd: &mut Vec<usize>,
+    clause_used: &mut Vec<usize>,
+    params: &crate::params::Cdcl,
     choose_watch_pos: &mut Vec<usize>,
     estimated_bytes: &mut i64,
 ) {
@@ -320,6 +326,7 @@ fn import_clause(
     clauses.push(lits.clone());
     clause_activity.push(0.0);
     clause_lbd.push(lits.len());
+    clause_used.push(super::used_window(params, lits.len()));
     choose_watch_pos.push(0);
     *estimated_bytes += super::clause_byte_cost(lits);
     for &lit in lits {
