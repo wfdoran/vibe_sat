@@ -159,6 +159,11 @@ own restart scheme). See `reports/REPORT15.md` for the full story and
 - Le Frioux et al., "PaInleSS: a Framework for Parallel SAT Solving."
   Consulted alongside ManySAT for the shared-clause-pool design.
   (`reports/REPORT20.md`)
+- Schreiber & Sanders, "MallobSat: Scalable SAT Solving by Clause
+  Sharing," JAIR 2024. Surveyed (from search-result summaries, not read
+  in full) for volume-targeted clause sharing, imports at decision level
+  zero, and not trusting a sender's LBD; not implemented.
+  (`reports/REPORT69.md`)
 - "Community and LBD-Based Clause Sharing Policy for Parallel SAT
   Solving." Cited for the finding that clause sharing helps
   UNSAT-proving on random 3-SAT much more than it helps SAT-finding —
